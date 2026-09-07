@@ -143,10 +143,6 @@ function money(n: number) {
   return `₹${Math.round(Number(n) || 0).toLocaleString("en-IN")}`;
 }
 
-// Compact Indian-style formatting for chart data labels — under 1,000
-// stays as a plain number, 1,000–99,999 rounds to one decimal of "K"
-// (10000 -> 10K, 12345 -> 12.3K), and 1,00,000+ rounds to one decimal
-// of "L" (150000 -> 1.5L). Whole values drop the trailing ".0".
 function formatCompactNumber(
   n: number,
   isCurrency: boolean
@@ -459,8 +455,6 @@ function uniqueOrders(
 ) {
   const ordersById = new Map<string, Order>();
 
-  // Historical data includes today, so prefer the live version
-  // instead of counting the same order twice.
   [...historicalOrders, ...liveOrders].forEach(
     (order) =>
       ordersById.set(
@@ -497,9 +491,6 @@ const ORDER_SELECT = `
   )
 `;
 
-// Lightweight select for trend/aggregate charts — no order_items join.
-// Pulling the full item breakdown for months of history is what caused
-// the historical fetch to hit Postgres's statement timeout.
 const TREND_ORDER_SELECT = `
   id,
   order_number,
@@ -583,11 +574,6 @@ function Login({
       const row =
         data as unknown as UserRow;
 
-      // Block disabled accounts even though Supabase Auth itself
-      // accepted the password — this is enforced again server-side by
-      // the users.is_active flag, but sign the session back out here
-      // too so a disabled user's browser doesn't hold onto a live
-      // Supabase Auth session.
       if (row.is_active === false) {
         await supabase.auth.signOut();
         alert(
@@ -989,13 +975,11 @@ function NewOrder({
   const [saving, setSaving] =
     useState(false);
 
-  // Edit item price
   const [editingItem, setEditingItem] =
     useState<Product | null>(null);
   const [editPrice, setEditPrice] =
     useState("");
 
-  // Add new item
   const [showAddModal, setShowAddModal] =
     useState(false);
   const [newItemName, setNewItemName] =
@@ -1010,10 +994,6 @@ function NewOrder({
   const [disablingItem, setDisablingItem] =
     useState(false);
 
-  // Disabled items list — items with active:false don't come through
-  // in the `products` prop at all (they're filtered out before it
-  // reaches this component), so viewing them requires a separate,
-  // on-demand fetch rather than just re-using `products`.
   const [showDisabledModal, setShowDisabledModal] =
     useState(false);
   const [disabledItems, setDisabledItems] =
@@ -1092,8 +1072,6 @@ function NewOrder({
         )
       );
 
-      // Refresh the parent's active product list so the re-enabled
-      // item reappears on the ordering screen immediately.
       if (onMenuChanged) {
         await onMenuChanged();
       }
@@ -1132,9 +1110,6 @@ function NewOrder({
       setEditingItem(null);
       setEditPrice("");
 
-      // Refresh the parent's product list so the disabled item
-      // disappears from the ordering screen immediately, instead of
-      // staying visible until the next full reload.
       if (onMenuChanged) {
         await onMenuChanged();
       }
@@ -1300,8 +1275,8 @@ function NewOrder({
         ) === cat
     );
 
-    const displayNumber = (value: string | number) =>
-      isPoc ? "•••" : String(value);
+  // In New Order, cost, item prices, and quantities are always visible for POC
+  const displayNumber = (value: string | number) => String(value);
 
   async function placeOrder() {
     if (!cart.length) {
@@ -1878,7 +1853,7 @@ function NewOrder({
           "DINE_IN" && (
           <input
             className="table-input"
-            type={isPoc ? "password" : "text"}
+            type="text"
             value={table}
             onChange={(e) =>
               setTable(
@@ -2257,10 +2232,12 @@ function Orders({
   restaurantId,
   restaurantName,
   refreshKey,
+  isPoc = false,
 }: {
   restaurantId: string;
   restaurantName: string;
   refreshKey: number;
+  isPoc?: boolean;
 }) {
   const [q, setQ] =
     useState("");
@@ -2286,8 +2263,6 @@ function Orders({
     if (!restaurantId) return;
 
     loadOrders();
-
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     restaurantId,
     start,
@@ -2527,9 +2502,7 @@ function Orders({
           </h2>
 
           <span>
-            {orders.length}{" "}
-            orders ·{" "}
-            {money(revenue)}
+            {isPoc ? "••••••" : `${orders.length} orders · ${money(revenue)}`}
           </span>
 
         </div>
@@ -2550,29 +2523,33 @@ function Orders({
 
         </div>
 
-        <button
-          className="closing-report-btn"
-          onClick={printClosingReport}
-          disabled={loading}
-        >
-          Print Closing Report
-        </button>
+        {!isPoc && (
+          <>
+            <button
+              className="closing-report-btn"
+              onClick={printClosingReport}
+              disabled={loading}
+            >
+              Print Closing Report
+            </button>
 
-        <button
-          className="export-orders-btn"
-          onClick={exportOrdersCsv}
-          disabled={loading || !orders.length}
-        >
-          Export CSV
-        </button>
+            <button
+              className="export-orders-btn"
+              onClick={exportOrdersCsv}
+              disabled={loading || !orders.length}
+            >
+              Export CSV
+            </button>
+          </>
+        )}
 
       </div>
 
       <div className="closing-summary">
-        <div><span>Revenue</span><strong>{money(revenue)}</strong></div>
-        <div><span>Orders</span><strong>{orders.length}</strong></div>
-        <div><span>Items Sold</span><strong>{itemsSold}</strong></div>
-        <div><span>Avg Order Value</span><strong>{money(averageOrderValue)}</strong></div>
+        <div><span>Revenue</span><strong>{isPoc ? "••••••" : money(revenue)}</strong></div>
+        <div><span>Orders</span><strong>{isPoc ? "••••••" : orders.length}</strong></div>
+        <div><span>Items Sold</span><strong>{isPoc ? "••••••" : itemsSold}</strong></div>
+        <div><span>Avg Order Value</span><strong>{isPoc ? "••••••" : money(averageOrderValue)}</strong></div>
       </div>
 
       <div className="date-filter">
@@ -2783,18 +2760,8 @@ function Insights({
   const [loading, setLoading] =
     useState(false);
 
-  // Tracks which loadHistoricalData() call is the most recent one.
-  // The Number of Periods input fires onChange on every keystroke
-  // (typing "14" fires it once for "1" and once for "14"), and each
-  // change re-triggers the effect below with no cancellation of the
-  // previous in-flight fetch. Two overlapping paginated fetches can
-  // then resolve out of order — whichever finishes last wins and
-  // silently overwrites the other, even if it's the stale one. This
-  // ref lets a fetch check "am I still the latest request?" before
-  // committing its result to state.
   const latestRequestId = useRef(0);
 
-  // Get today's date info
   const today = new Date();
   const dayOfWeek = today.toLocaleDateString(
     "en-IN",
@@ -2809,19 +2776,11 @@ function Insights({
 
   useEffect(() => {
     if (!restaurantId) {
-      console.log(
-        "No restaurantId, skipping historical load"
-      );
       return;
     }
     loadHistoricalData();
   }, [restaurantId]);
 
-  // Live updates for the wider historical window (Day-wise Trend,
-  // Revenue Drivers). Debounced, since this fetch is a paginated
-  // 30–90 day query — refetching it on every single event during a
-  // burst of order activity would be wasteful. A short pause after
-  // the last change is enough to feel live without hammering Supabase.
   const historicalRefreshTimer =
     useRef<
       ReturnType<typeof setTimeout>
@@ -2874,23 +2833,13 @@ function Insights({
   }, [restaurantId]);
 
   async function loadHistoricalData() {
-    // Claim this call as the latest request. Any earlier call that
-    // resolves after this one started will see a mismatch below and
-    // bail out instead of overwriting fresher data with stale results.
     const requestId = ++latestRequestId.current;
 
     setLoading(true);
 
-    // Declared outside try{} so the catch block can still persist
-    // whatever pages were successfully fetched before a later page fails
-    // (e.g. a transient statement timeout deep into pagination).
     const allRows: any[] = [];
 
     try {
-      // This fetch feeds the KPI comparisons (Last Week / 7-wk avg)
-      // and the Day-wise trend graph. A fixed, modest lookback window
-      // keeps it fast regardless of what's selected elsewhere on the
-      // page.
       const lookbackDays = 60;
 
       const startDate = new Date();
@@ -2901,23 +2850,6 @@ function Insights({
       endDate.setDate(endDate.getDate() + 1);
       endDate.setHours(0, 0, 0, 0);
 
-      console.log(
-        "Loading orders from",
-        startDate.toISOString(),
-        "to",
-        endDate.toISOString(),
-        `(fixed lookback: ${lookbackDays} days)`
-      );
-
-      // Supabase/PostgREST caps a single request at 1000 rows by default,
-      // with no guaranteed ordering unless we ask for one, so we still
-      // page through everything in the range. But OFFSET-based paging
-      // (.range()) forces Postgres to rescan and discard everything
-      // before the offset on every page, which got slow enough with
-      // months of history plus the order_items join to hit the
-      // statement timeout. Two fixes: (1) use a lightweight select with
-      // no item join for this trend query, and (2) page by created_at
-      // cursor instead of OFFSET so every page is a fast indexed lookup.
       const PAGE_SIZE = 1000;
       let cursor = startDate.toISOString();
       const endIso = endDate.toISOString();
@@ -2934,40 +2866,22 @@ function Insights({
           .limit(PAGE_SIZE);
 
         if (error) {
-          console.error(
-            "Supabase query error:",
-            error
-          );
           throw error;
         }
 
         allRows.push(...(page || []));
 
-        console.log(
-          `Fetched page from ${cursor}, got ${
-            (page || []).length
-          } rows (running total: ${allRows.length})`
-        );
-
         if (!page || page.length < PAGE_SIZE) {
           break;
         }
 
-        // Move the cursor just past the last row's timestamp so the
-        // next page picks up an indexed range scan instead of an
-        // ever-growing OFFSET scan.
         const lastCreatedAt =
           page[page.length - 1].created_at;
         cursor = new Date(
           new Date(lastCreatedAt).getTime() + 1
         ).toISOString();
 
-        // Safety cap so a runaway loop can't hang the page if something
-        // unexpected happens with the data.
         if (allRows.length > 50000) {
-          console.warn(
-            "Historical orders exceeded 50,000 rows — stopping pagination early."
-          );
           break;
         }
       }
@@ -2975,31 +2889,8 @@ function Insights({
       const formatted = allRows.map(
         formatOrder
       );
-      console.log(
-        "Historical orders loaded:",
-        formatted.length,
-        "orders"
-      );
-      
-      if (formatted.length > 0) {
-        console.log(
-          "First order date:",
-          formatted[
-            formatted.length - 1
-          ].createdAt,
-          "Last order date:",
-          formatted[0].createdAt
-        );
-      }
 
-      // Only commit if a newer request hasn't started since this one
-      // began — otherwise a slow, now-stale fetch (e.g. from an
-      // intermediate keystroke like "1" while typing "14") could
-      // overwrite the correct, more recent result.
       if (requestId !== latestRequestId.current) {
-        console.log(
-          `Discarding stale historical data response (request ${requestId}, latest is ${latestRequestId.current})`
-        );
         return;
       }
 
@@ -3010,18 +2901,10 @@ function Insights({
         err.message || err
       );
 
-      // A later page can still fail (e.g. a transient timeout) after
-      // earlier pages succeeded — keep whatever was already fetched
-      // instead of throwing away the whole window, so the chart shows
-      // partial history rather than nothing at all. Still subject to
-      // the same staleness check as the success path.
       if (
         allRows.length > 0 &&
         requestId === latestRequestId.current
       ) {
-        console.warn(
-          `Falling back to ${allRows.length} partially-loaded rows after error.`
-        );
         setHistoricalOrders(allRows.map(formatOrder));
       }
     } finally {
@@ -3052,11 +2935,6 @@ function Insights({
         return false;
       }
 
-      // When a cutoff is given, only count orders up to the same
-      // time-of-day as "now" — otherwise a partial current day (e.g.
-      // 11 AM so far) gets compared against a full 24-hour historical
-      // day, which always makes today look artificially worse than it
-      // actually is at this point in the day.
       if (cutoffMs !== undefined) {
         const msIntoDay =
           oDateObj.getHours() *
@@ -3073,7 +2951,6 @@ function Insights({
     });
   }
 
-  // Calculate metrics for specific date
   function calculateMetrics(
     dateOrders: Order[]
   ) {
@@ -3103,15 +2980,9 @@ function Insights({
     };
   }
 
-  // Today's metrics
   const todayMetrics =
     calculateMetrics(orders);
 
-  // How far into today we currently are, in milliseconds since
-  // midnight — used so "Last week" and "7-wk avg" can each show both
-  // their full-day total (the bar) and their value up to this same
-  // clock time (the line overlay), which is the fairer comparison
-  // since today itself is necessarily still partial.
   const nowMsIntoDay =
     today.getHours() * 3600000 +
     today.getMinutes() * 60000 +
@@ -3138,11 +3009,6 @@ function Insights({
       )
     );
 
-  // True per-week average (not a sum) for each metric, over however
-  // many of the last 7 same-weekday occurrences have data — powers the
-  // "7-wk avg" bar in each KPI's compact comparison chart below. An
-  // optional cutoff computes the same-time-of-day version instead of
-  // the full-day version.
   function buildWeeklyAverage(
     metricKey:
       | "revenue"
@@ -3211,14 +3077,6 @@ function Insights({
       nowMsIntoDay
     );
 
-  // Day-wise trend graph: one bar per day over an admin-selected date
-  // range (Today / Last 7 Days / Last 30 Days / This Month / Last
-  // Month / This Year / Last Year / Custom). "This Year"/"Last Year"
-  // can span far beyond the 60-day window historicalOrders keeps
-  // client-side, so this fetches from the get_order_period_trends RPC
-  // instead — the same server-side aggregation used earlier for the
-  // long-range trend charts, which returns one row per day no matter
-  // how large the range is, rather than paging through raw orders.
   const REVENUE_HIGHLIGHT_GRADIENT_ID =
     "revenueHighlightGradient";
   const REVENUE_MUTED_GRADIENT_ID =
@@ -3266,9 +3124,6 @@ function Insights({
     return x;
   }
 
-  // Computes the [start, end) window for whichever preset is picked.
-  // `end` is always an exclusive midnight boundary so the RPC's
-  // `created_at < p_end` filter behaves consistently across presets.
   const analyticsRange = useMemo(() => {
     switch (analyticsRangePreset) {
       case "today":
@@ -3398,10 +3253,6 @@ function Insights({
     return `${startLabel} – ${endLabel}`;
   }
 
-  // Which metric the day-wise chart below is currently showing —
-  // toggled with the pill buttons so one chart can stand in for three,
-  // instead of stacking Revenue, Orders, and AOV as three separate
-  // always-visible charts.
   const [dayWiseMetric, setDayWiseMetric] =
     useState<
       "revenue" | "orderCount" | "aov"
@@ -3531,10 +3382,6 @@ function Insights({
     analyticsRange.end.getTime(),
   ]);
 
-  // Hourly Breakdown: same date range as above, but summed into 2-hour
-  // buckets (12–2am, 2–4am, ... 10pm–12am) instead of one bar per day —
-  // shows what time of day drives the numbers within the selected
-  // range, metric-switchable the same way as the day-wise chart above.
   const [hourlyBucketMetric, setHourlyBucketMetric] =
     useState<
       "revenue" | "orderCount" | "aov" | "items"
@@ -4091,10 +3938,6 @@ function Insights({
 
       </div>
 
-      {/* Date range selector — controls the Day-wise Trend and Hourly
-          Breakdown charts below. Deliberately does NOT affect the KPI
-          row above, since those are always anchored to "today" by
-          design (Revenue today, Last Week, 7-wk avg). */}
       <div className="card date-range-card">
 
         <div className="section-title">
@@ -4193,14 +4036,6 @@ function Insights({
 
       </div>
 
-      {/* Day-wise trend graph — placed above Orders for the Day so the
-          daily pattern is the first thing seen after the KPIs. A pill
-          selector switches the chart between Revenue, Orders, and Avg
-          Order Value instead of stacking three separate always-visible
-          charts. Bars matching today's weekday (e.g. every Monday, if
-          today is Monday) are highlighted; every other day is muted,
-          so the recurring pattern for today's weekday is easy to pick
-          out instead of competing with a different color per weekday. */}
       <div className="card">
 
         <div className="section-title">
@@ -4445,10 +4280,6 @@ function Insights({
 
       </div>
 
-      {/* Hourly Breakdown — same date range as the Day-wise Trend
-          chart above, but summed into 2-hour buckets instead of one
-          bar per day, so you can see what time of day drives the
-          numbers within the selected period. */}
       <div className="card">
 
         <div className="section-title">
@@ -4786,11 +4617,6 @@ function Kpi({
       ? valueFormatter(Number(v))
       : String(v);
 
-  // SVG gradient ids can't safely contain spaces or punctuation — a
-  // raw title like "Revenue today" produces `url(#...Revenue today...)`,
-  // which the browser can't resolve as a fragment reference, so the
-  // bar silently falls back to a solid black fill instead of erroring
-  // visibly. Strip it down to a safe identifier.
   const safeId = title.replace(
     /[^a-zA-Z0-9]/g,
     ""
@@ -5230,7 +5056,6 @@ function UsersPanel({
   const [loading, setLoading] =
     useState(true);
 
-  // Filters for the users table below
   const [filterSearch, setFilterSearch] =
     useState("");
   const [filterRestaurantId, setFilterRestaurantId] =
@@ -5242,9 +5067,6 @@ function UsersPanel({
       "ALL"
     );
 
-  // Tracks which user row currently has an enable/disable request
-  // in flight, so its button can show a per-row loading state instead
-  // of disabling every row in the table.
   const [togglingUserId, setTogglingUserId] =
     useState<string | null>(null);
 
@@ -5349,7 +5171,36 @@ function UsersPanel({
           }),
         }
       );
-      const result = await response.json();
+
+      const contentType =
+        response.headers.get(
+          "content-type"
+        ) || "";
+
+      let result: any = {};
+      if (
+        contentType.includes(
+          "application/json"
+        )
+      ) {
+        result = await response.json();
+      } else {
+        const rawText =
+          await response.text();
+        console.error(
+          "Non-JSON response from /api/admin/users — status:",
+          response.status,
+          "body:",
+          rawText.slice(0, 300)
+        );
+        if (!response.ok) {
+          throw new Error(
+            response.status === 404
+              ? "The user creation endpoint (/api/admin/users) was not found (404). Check that app/api/admin/users/route.ts exists and is deployed."
+              : `Server returned an unexpected response (status ${response.status}).`
+          );
+        }
+      }
 
       if (!response.ok) {
         throw new Error(
@@ -5396,8 +5247,6 @@ function UsersPanel({
 
     setTogglingUserId(user.id);
 
-    // Optimistic update so the row reflects the new state immediately;
-    // rolled back below if the request fails.
     setUsers((prev) =>
       prev.map((u) =>
         u.id === user.id
@@ -5431,11 +5280,6 @@ function UsersPanel({
         }
       );
 
-      // A missing/misconfigured API route returns an HTML error page
-      // (e.g. Next.js's 404), not JSON — calling .json() on that
-      // throws a confusing "Unexpected token '<'" SyntaxError instead
-      // of a clear message. Check the content type first so that
-      // case surfaces something actionable.
       const contentType =
         response.headers.get(
           "content-type"
@@ -5475,7 +5319,6 @@ function UsersPanel({
         err
       );
 
-      // Roll back the optimistic update.
       setUsers((prev) =>
         prev.map((u) =>
           u.id === user.id
@@ -6096,16 +5939,10 @@ export default function HomePage() {
         currentUser.restaurantId
       );
     }
-
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUser?.id]);
 
   /* =======================================================
      LIVE UPDATES — TODAY'S ORDERS
-     Mirrors the same-pattern subscription already used in the
-     Orders screen, so Admin/POC users see today's KPIs and charts
-     update as soon as an order is placed, edited, or cancelled —
-     without needing to reload the page or switch tabs.
   ======================================================= */
 
   useEffect(() => {
@@ -6228,11 +6065,6 @@ export default function HomePage() {
         throw menuError;
       }
 
-      console.log(
-        "RAW MENU FROM SUPABASE:",
-        rawMenu
-      );
-
       const formattedMenu: Product[] =
         (rawMenu || [])
           .filter(
@@ -6270,11 +6102,6 @@ export default function HomePage() {
               item.price >=
                 0
           );
-
-      console.log(
-        "FORMATTED MENU:",
-        formattedMenu
-      );
 
       setProducts(
         formattedMenu
@@ -6649,6 +6476,9 @@ export default function HomePage() {
               }
               refreshKey={
                 refreshKey
+              }
+              isPoc={
+                currentUser.role === "POC"
               }
             />
           )}
