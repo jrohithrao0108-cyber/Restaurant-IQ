@@ -2980,12 +2980,48 @@ function Insights({
   const dateDisplay = `${dayOfWeek}, ${date}`;
   const currentDayOfWeek = today.getDay();
 
-  useEffect(() => {
-    if (!restaurantId) {
-      return;
-    }
+  type AnalyticsRangePreset =
+    | "today"
+    | "yesterday"
+    | "last7"
+    | "last30"
+    | "thisMonth"
+    | "lastMonth"
+    | "thisYear"
+    | "lastYear"
+    | "custom";
+
+  const [
+    analyticsRangePreset,
+    setAnalyticsRangePreset,
+  ] = useState<AnalyticsRangePreset>(
+    "last7"
+  );
+  const [customRangeStart, setCustomRangeStart] =
+    useState(() => {
+      const d = new Date(today);
+      d.setDate(d.getDate() - 6);
+      return d.toISOString().split(
+        "T"
+      )[0];
+    });
+  const [customRangeEnd, setCustomRangeEnd] =
+    useState(
+      today.toISOString().split("T")[0]
+    );
+
+  // Helper function to refresh all insights charts and data concurrently
+  function refreshAllAnalytics() {
+    if (!restaurantId) return;
     loadHistoricalData();
-  }, [restaurantId]);
+    loadDayWiseTrend();
+    loadHourlyBuckets();
+  }
+
+  // Trigger data refresh on component mount / tab switch / filter change
+  useEffect(() => {
+    refreshAllAnalytics();
+  }, [restaurantId, analyticsRangePreset, customRangeStart, customRangeEnd]);
 
   const historicalRefreshTimer =
     useRef<
@@ -3018,7 +3054,7 @@ function Insights({
           }
           historicalRefreshTimer.current =
             setTimeout(() => {
-              loadHistoricalData();
+              refreshAllAnalytics();
             }, 800);
         }
       )
@@ -3036,7 +3072,7 @@ function Insights({
         channel
       );
     };
-  }, [restaurantId]);
+  }, [restaurantId, analyticsRangePreset, customRangeStart, customRangeEnd]);
 
   async function loadHistoricalData() {
     const requestId = ++latestRequestId.current;
@@ -3288,36 +3324,6 @@ function Insights({
   const REVENUE_MUTED_GRADIENT_ID =
     "revenueMutedGradient";
   const REVENUE_TODAY_STROKE = "#c2410c";
-
-  type AnalyticsRangePreset =
-    | "today"
-    | "yesterday"
-    | "last7"
-    | "last30"
-    | "thisMonth"
-    | "lastMonth"
-    | "thisYear"
-    | "lastYear"
-    | "custom";
-
-  const [
-    analyticsRangePreset,
-    setAnalyticsRangePreset,
-  ] = useState<AnalyticsRangePreset>(
-    "last7"
-  );
-  const [customRangeStart, setCustomRangeStart] =
-    useState(() => {
-      const d = new Date(today);
-      d.setDate(d.getDate() - 6);
-      return d.toISOString().split(
-        "T"
-      )[0];
-    });
-  const [customRangeEnd, setCustomRangeEnd] =
-    useState(
-      today.toISOString().split("T")[0]
-    );
 
   function startOfDay(d: Date) {
     const x = new Date(d);
