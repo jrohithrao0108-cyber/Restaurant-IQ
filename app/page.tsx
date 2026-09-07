@@ -582,16 +582,18 @@ function Login({
         return;
       }
 
-      onLogin({
+      const userObj: CurrentUser = {
         id: row.id,
         name: row.name,
         phone: row.phone || "",
         role: row.role,
-        restaurantId:
-          row.restaurant_id,
-        restaurantName:
-          row.restaurants?.name || "",
-      });
+        restaurantId: row.restaurant_id,
+        restaurantName: row.restaurants?.name || "",
+      };
+      try {
+        localStorage.setItem("restaurant_iq_user", JSON.stringify(userObj));
+      } catch (e) {}
+      onLogin(userObj);
     } catch (err: any) {
       console.error(
         "LOGIN ERROR:",
@@ -1514,21 +1516,123 @@ function NewOrder({
           <title>Restaurant bill</title>
           <meta name="viewport" content="width=device-width, initial-scale=1" />
           <style>
-            * { box-sizing: border-box; }
-            body { margin: 0; padding: 24px; color: #2b2013; font: 14px Arial, sans-serif; }
-            .receipt { max-width: 360px; margin: 0 auto; }
-            header { text-align: center; border-bottom: 1px dashed #8c6a3f; padding-bottom: 16px; }
-            h1 { margin: 0 0 4px; font: 700 25px Georgia, serif; }
-            header p, .meta { margin: 4px 0; color: #6b5d48; font-size: 12px; }
-            .meta { display: flex; justify-content: space-between; gap: 12px; margin: 16px 0; }
-            table { width: 100%; border-collapse: collapse; }
-            td { padding: 9px 0; border-bottom: 1px solid #ede4d3; vertical-align: top; }
-            td:last-child { text-align: right; white-space: nowrap; }
-            small { display: block; color: #6b5d48; margin-top: 3px; }
-            .total { display: flex; justify-content: space-between; padding-top: 14px; margin-top: 6px; border-top: 2px solid #2b2013; font-size: 19px; font-weight: 700; }
-            footer { text-align: center; margin-top: 22px; color: #8c6a3f; font-size: 11px; }
-            @media print { body { padding: 8px; } }
-          </style>
+  @page {
+    size: auto;
+    margin: 4mm 2mm;
+  }
+  * {
+    box-sizing: border-box;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #fff;
+    color: #000;
+    font-family: "Courier New", Courier, monospace, system-ui, -apple-system, sans-serif;
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .receipt {
+    width: 100%;
+    max-width: 80mm;
+    margin: 0 auto;
+    padding: 6px 4px;
+  }
+  header {
+    text-align: center;
+    border-bottom: 1px dashed #000;
+    padding-bottom: 6px;
+    margin-bottom: 6px;
+  }
+  h1 {
+    margin: 0 0 3px;
+    font-size: 16px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    word-break: break-word;
+  }
+  header p {
+    margin: 2px 0;
+    font-size: 11px;
+    color: #000;
+  }
+  .meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 6px;
+    margin: 6px 0;
+    padding-bottom: 5px;
+    border-bottom: 1px dashed #000;
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .meta span {
+    word-break: break-word;
+  }
+  table {
+    width: 100%;
+    table-layout: fixed;
+    border-collapse: collapse;
+    margin: 4px 0;
+  }
+  td {
+    padding: 4px 0;
+    border-bottom: 1px dotted #bbb;
+    vertical-align: top;
+    font-size: 11.5px;
+  }
+  td:first-child {
+    width: 68%;
+    word-break: break-word;
+    padding-right: 4px;
+  }
+  td:last-child {
+    width: 32%;
+    text-align: right;
+    white-space: nowrap;
+    font-weight: 700;
+  }
+  small {
+    display: block;
+    color: #222;
+    margin-top: 2px;
+    font-size: 10px;
+    font-weight: normal;
+  }
+  .total {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 0;
+    margin-top: 4px;
+    border-top: 2px solid #000;
+    border-bottom: 2px solid #000;
+    font-size: 14px;
+    font-weight: 900;
+  }
+  footer {
+    text-align: center;
+    margin-top: 10px;
+    padding-top: 4px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  @media print {
+    body {
+      padding: 0;
+    }
+    .receipt {
+      width: 100%;
+      max-width: 80mm;
+      padding: 0;
+    }
+  }
+</style>
         </head>
         <body>
           <main class="receipt">
@@ -2188,21 +2292,123 @@ function printExistingBill(order: Order, restaurantName: string) {
         <title>Reprint bill ${escapeHtml(order.id)}</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
-          * { box-sizing: border-box; }
-          body { margin: 0; padding: 24px; color: #2b2013; font: 14px Arial, sans-serif; }
-          .receipt { max-width: 360px; margin: 0 auto; }
-          header { text-align: center; border-bottom: 1px dashed #8c6a3f; padding-bottom: 16px; }
-          h1 { margin: 0 0 4px; font: 700 25px Georgia, serif; }
-          header p, .meta { margin: 4px 0; color: #6b5d48; font-size: 12px; }
-          .meta { display: flex; justify-content: space-between; gap: 12px; margin: 16px 0; }
-          table { width: 100%; border-collapse: collapse; }
-          td { padding: 9px 0; border-bottom: 1px solid #ede4d3; vertical-align: top; }
-          td:last-child { text-align: right; white-space: nowrap; }
-          small { display: block; color: #6b5d48; margin-top: 3px; }
-          .total { display: flex; justify-content: space-between; padding-top: 14px; margin-top: 6px; border-top: 2px solid #2b2013; font-size: 19px; font-weight: 700; }
-          footer { text-align: center; margin-top: 22px; color: #8c6a3f; font-size: 11px; }
-          @media print { body { padding: 8px; } }
-        </style>
+  @page {
+    size: auto;
+    margin: 4mm 2mm;
+  }
+  * {
+    box-sizing: border-box;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #fff;
+    color: #000;
+    font-family: "Courier New", Courier, monospace, system-ui, -apple-system, sans-serif;
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .receipt {
+    width: 100%;
+    max-width: 80mm;
+    margin: 0 auto;
+    padding: 6px 4px;
+  }
+  header {
+    text-align: center;
+    border-bottom: 1px dashed #000;
+    padding-bottom: 6px;
+    margin-bottom: 6px;
+  }
+  h1 {
+    margin: 0 0 3px;
+    font-size: 16px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    word-break: break-word;
+  }
+  header p {
+    margin: 2px 0;
+    font-size: 11px;
+    color: #000;
+  }
+  .meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 6px;
+    margin: 6px 0;
+    padding-bottom: 5px;
+    border-bottom: 1px dashed #000;
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .meta span {
+    word-break: break-word;
+  }
+  table {
+    width: 100%;
+    table-layout: fixed;
+    border-collapse: collapse;
+    margin: 4px 0;
+  }
+  td {
+    padding: 4px 0;
+    border-bottom: 1px dotted #bbb;
+    vertical-align: top;
+    font-size: 11.5px;
+  }
+  td:first-child {
+    width: 68%;
+    word-break: break-word;
+    padding-right: 4px;
+  }
+  td:last-child {
+    width: 32%;
+    text-align: right;
+    white-space: nowrap;
+    font-weight: 700;
+  }
+  small {
+    display: block;
+    color: #222;
+    margin-top: 2px;
+    font-size: 10px;
+    font-weight: normal;
+  }
+  .total {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 0;
+    margin-top: 4px;
+    border-top: 2px solid #000;
+    border-bottom: 2px solid #000;
+    font-size: 14px;
+    font-weight: 900;
+  }
+  footer {
+    text-align: center;
+    margin-top: 10px;
+    padding-top: 4px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  @media print {
+    body {
+      padding: 0;
+    }
+    .receipt {
+      width: 100%;
+      max-width: 80mm;
+      padding: 0;
+    }
+  }
+</style>
       </head>
       <body>
         <main class="receipt">
@@ -5832,13 +6038,8 @@ function UsersPanel({
 
 export default function HomePage() {
 
-  const [
-    currentUser,
-    setCurrentUser,
-  ] =
-    useState<
-      CurrentUser | null
-    >(null);
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [mounted, setMounted] = useState(false);
 
   const [tab, setTab] =
     useState<Tab>("new");
@@ -5910,6 +6111,111 @@ export default function HomePage() {
     }, [products]);
 
   void categoryCounts;
+
+  /* =======================================================
+     SESSION RECOVERY ON MOUNT / MOBILE RESUME
+  ======================================================= */
+  useEffect(() => {
+    setMounted(true);
+    let isCurrent = true;
+
+    async function checkExistingSession() {
+      // 1. Immediately read cached user from localStorage on client mount
+      try {
+        const saved = localStorage.getItem("restaurant_iq_user");
+        if (saved && isCurrent) {
+          setCurrentUser(JSON.parse(saved));
+        }
+      } catch (e) {}
+
+      // 2. Verify active session with Supabase
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+
+        if (!session?.user) {
+          if (isCurrent) {
+            setCurrentUser(null);
+            try {
+              localStorage.removeItem("restaurant_iq_user");
+            } catch (e) {}
+          }
+          return;
+        }
+
+        const { data, error } = await supabase
+          .from("users")
+          .select(`
+            id,
+            name,
+            phone,
+            email,
+            role,
+            restaurant_id,
+            is_active,
+            restaurants (
+              name
+            )
+          `)
+          .eq("auth_user_id", session.user.id)
+          .maybeSingle();
+
+        if (error || !data || data.is_active === false) {
+          if (data?.is_active === false) {
+            await supabase.auth.signOut();
+          }
+          if (isCurrent) {
+            setCurrentUser(null);
+            try {
+              localStorage.removeItem("restaurant_iq_user");
+            } catch (e) {}
+          }
+          return;
+        }
+
+        const row = data as unknown as UserRow;
+        const restoredUser: CurrentUser = {
+          id: row.id,
+          name: row.name,
+          phone: row.phone || "",
+          role: row.role,
+          restaurantId: row.restaurant_id,
+          restaurantName: row.restaurants?.name || "",
+        };
+
+        if (isCurrent) {
+          setCurrentUser(restoredUser);
+          try {
+            localStorage.setItem(
+              "restaurant_iq_user",
+              JSON.stringify(restoredUser)
+            );
+          } catch (e) {}
+        }
+      } catch (err) {
+        console.error("SESSION RESTORE ERROR:", err);
+      }
+    }
+
+    checkExistingSession();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!session && isCurrent) {
+        setCurrentUser(null);
+        try {
+          localStorage.removeItem("restaurant_iq_user");
+        } catch (e) {}
+      }
+    });
+
+    return () => {
+      isCurrent = false;
+      subscription.unsubscribe();
+    };
+  }, []);
 
   /* =======================================================
      LOAD DATA AFTER LOGIN
@@ -6234,6 +6540,9 @@ export default function HomePage() {
   ======================================================= */
 
   async function handleLogout() {
+    try {
+      localStorage.removeItem("restaurant_iq_user");
+    } catch (e) {}
     await supabase.auth.signOut();
     setCurrentUser(null);
     setProducts([]);
@@ -6244,8 +6553,28 @@ export default function HomePage() {
   }
 
   /* =======================================================
-     LOGIN SCREEN
+     HYDRATION & AUTH CHECKING SCREEN
   ======================================================= */
+
+  if (!mounted) {
+    return (
+      <div
+        style={{
+          padding: 50,
+          fontFamily: "Arial, sans-serif",
+          background: "#f6f1e7",
+          minHeight: "100vh",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <h2>RestaurantIQ</h2>
+        <p>Connecting...</p>
+      </div>
+    );
+  }
 
   if (!currentUser) {
     return (
