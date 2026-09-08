@@ -48,6 +48,7 @@ type Role = "SUPER_ADMIN" | "ADMIN" | "POC";
 type Tab =
   | "new"
   | "orders"
+  | "tables"
   | "insights"
   | "restaurants"
   | "users";
@@ -88,11 +89,19 @@ type Order = {
   total: number;
   payment: string;
   createdAt: string;
+  closedAt?: string | null;
 };
 
 type RestaurantRow = {
   id: string;
   name: string;
+};
+
+type RestaurantTable = {
+  id: string;
+  tableNumber: string;
+  capacity: number;
+  isActive: boolean;
 };
 
 type UserRow = {
@@ -220,20 +229,6 @@ function initials(name: string) {
   const b = parts[1]?.[0] || "";
 
   return (a + b).toUpperCase() || "U";
-}
-
-function toAuthPhone(value: string) {
-  const digits = value.replace(/\D/g, "");
-
-  if (digits.length === 10) {
-    return `+91${digits}`;
-  }
-
-  if (digits.length === 12 && digits.startsWith("91")) {
-    return `+${digits}`;
-  }
-
-  return value.trim();
 }
 
 /* =========================================================
@@ -409,6 +404,38 @@ function deriveSource(o: any): OrderSource {
 }
 
 function formatOrder(o: any): Order {
+  // Aggregate order_items rows by (menu item + price) instead of a raw
+  // 1:1 map. When a dish is ordered again in a later round on the same
+  // table order, the DB legitimately has two order_items rows for it —
+  // mapping those 1:1 produced two Items sharing the same id, which
+  // both duplicated the bill line and broke React keys wherever items
+  // are rendered (e.g. "duplicate key" warnings in the Orders list).
+  const itemMap = new Map<string, Item>();
+
+  (o.order_items || []).forEach((i: any) => {
+    const id = i.menu_item_id || i.id;
+    const price = Number(i.price_snapshot) || 0;
+    const key = `${id}-${price}`;
+    const qty = Number(i.qty) || 0;
+    const existing = itemMap.get(key);
+
+    if (existing) {
+      existing.qty += qty;
+    } else {
+      itemMap.set(key, {
+        id,
+        name: i.name_snapshot || "Unknown item",
+        price,
+        category: getMenuCategory(
+          Array.isArray(i.menu_items)
+            ? i.menu_items[0]
+            : i.menu_items
+        ),
+        qty,
+      });
+    }
+  });
+
   return {
     id: o.order_number,
     databaseId: o.id,
@@ -424,20 +451,7 @@ function formatOrder(o: any): Order {
 
     table: o.table_number || undefined,
 
-    items: (o.order_items || []).map(
-      (i: any) => ({
-        id: i.menu_item_id || i.id,
-        name: i.name_snapshot || "Unknown item",
-        price:
-          Number(i.price_snapshot) || 0,
-        category: getMenuCategory(
-          Array.isArray(i.menu_items)
-            ? i.menu_items[0]
-            : i.menu_items
-        ),
-        qty: Number(i.qty) || 0,
-      })
-    ),
+    items: Array.from(itemMap.values()),
 
     total: Number(o.total) || 0,
 
@@ -446,24 +460,10 @@ function formatOrder(o: any): Order {
 
     createdAt:
       o.created_at,
+
+    closedAt:
+      o.closed_at || null,
   };
-}
-
-function uniqueOrders(
-  liveOrders: Order[],
-  historicalOrders: Order[]
-) {
-  const ordersById = new Map<string, Order>();
-
-  [...historicalOrders, ...liveOrders].forEach(
-    (order) =>
-      ordersById.set(
-        order.databaseId || order.id,
-        order
-      )
-  );
-
-  return Array.from(ordersById.values());
 }
 
 const ORDER_SELECT = `
@@ -479,6 +479,7 @@ const ORDER_SELECT = `
   total,
   status,
   created_at,
+  closed_at,
   order_items (
     id,
     menu_item_id,
@@ -624,8 +625,8 @@ function Login({
         </div>
 
         <p className="login-sub">
-          AI-powered business intelligence
-          for restaurants
+          AI-Powered Business Intelligence
+          For Restaurants
         </p>
 
         <label>Email</label>
@@ -655,7 +656,7 @@ function Login({
             setPassword(e.target.value)
           }
           suppressHydrationWarning
-          placeholder="Enter your password"
+          placeholder="Enter Your Password"
           onKeyDown={(e) =>
             e.key === "Enter" &&
             handleLogin()
@@ -674,7 +675,7 @@ function Login({
         </button>
 
         <small>
-          Access is managed by your
+          Access Is Managed By Your
           Super Admin
         </small>
 
@@ -834,6 +835,20 @@ function Sidebar({
 
             <a
               className={
+                tab === "tables"
+                  ? "active"
+                  : ""
+              }
+              onClick={() =>
+                go("tables")
+              }
+            >
+              <Calendar size={18} />
+              Table View
+            </a>
+
+            <a
+              className={
                 tab === "orders"
                   ? "active"
                   : ""
@@ -946,6 +961,9 @@ function NewOrder({
   restaurantName,
   isPoc,
   createdByUserId,
+  initialTable,
+  restaurantTables,
+  orders,
   onPlaced,
   onMenuChanged,
 }: {
@@ -954,6 +972,9 @@ function NewOrder({
   restaurantName: string;
   isPoc: boolean;
   createdByUserId: string;
+  initialTable?: string;
+  restaurantTables: RestaurantTable[];
+  orders?: Order[];
   onPlaced: (o: Order) => void;
   onMenuChanged?: () => Promise<void> | void;
 }) {
@@ -974,8 +995,17 @@ function NewOrder({
   const [table, setTable] =
     useState("");
 
+  useEffect(() => {
+    if (initialTable) {
+      setSource("DINE_IN");
+      setTable(initialTable);
+    }
+  }, [initialTable]);
+
   const [saving, setSaving] =
     useState(false);
+
+  const placingOrderRef = useRef(false);
 
   const [editingItem, setEditingItem] =
     useState<Product | null>(null);
@@ -1277,198 +1307,226 @@ function NewOrder({
         ) === cat
     );
 
-  // In New Order, cost, item prices, and quantities are always visible for POC
+  // Tables available for the dine-in dropdown: every active table, with
+  // currently occupied ones flagged so the POC can still pick one to add
+  // more items to an ongoing order (occupied orders auto-merge on save).
+  const activeRestaurantTables = restaurantTables
+    .filter((t) => t.isActive)
+    .sort((a, b) =>
+      a.tableNumber.localeCompare(b.tableNumber, undefined, {
+        numeric: true,
+      })
+    );
+
+  const occupiedTableNumbers = new Set(
+    (orders || [])
+      .filter(
+        (o) =>
+          o.source === "DINE_IN" &&
+          o.table &&
+          !o.closedAt
+      )
+      .map((o) => (o.table as string).trim())
+  );
+
   const displayNumber = (value: string | number) => String(value);
 
   async function placeOrder() {
+    if (placingOrderRef.current) return;
+
     if (!cart.length) {
-      alert(
-        "Please select at least one item."
-      );
+      alert("Please select at least one item.");
       return;
     }
 
     if (!source) {
-      alert(
-        "Choose an order source."
-      );
+      alert("Choose an order source.");
       return;
     }
 
-    if (
-      source === "DINE_IN" &&
-      !table.trim()
-    ) {
-      alert(
-        "Enter a table number."
-      );
+    if (source === "DINE_IN" && !table.trim()) {
+      alert("Enter a table number.");
       return;
     }
 
     if (!restaurantId) {
-      alert(
-        "Restaurant is not mapped."
-      );
+      alert("Restaurant is not mapped.");
       return;
     }
 
+    placingOrderRef.current = true;
     setSaving(true);
 
     try {
-      const orderNumber =
-        `S${Date.now()
-          .toString()
-          .slice(-6)}`;
+      const cleanTable = table.trim();
+      let targetOrderId: string | null = null;
+      let targetOrderNumber: string = "";
+      let existingTotal = 0;
 
-      const orderType =
-        source ===
-        "DINE_IN"
-          ? "DINE_IN"
-          : source ===
-            "TAKEAWAY"
-          ? "TAKEAWAY"
-          : "DELIVERY";
+      // 1. Check for an open dine-in order on this table
+      if (source === "DINE_IN") {
+        const { data: existingOpenOrder, error: fetchError } = await supabase
+          .from("orders")
+          .select("id, order_number, total")
+          .eq("restaurant_id", restaurantId)
+          .eq("table_number", cleanTable)
+          .is("closed_at", null)
+          .neq("status", "CANCELLED")
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
 
-      const {
-        data: order,
-        error: orderError,
-      } = await supabase
-        .from("orders")
-        .insert({
-          restaurant_id:
-            restaurantId,
+        if (fetchError) throw fetchError;
 
-          created_by:
-            createdByUserId ||
-            null,
-
-          order_number:
-            orderNumber,
-
-          order_type:
-            orderType,
-
-          table_number:
-            source ===
-            "DINE_IN"
-              ? table.trim()
-              : null,
-
-          channel:
-            source,
-
-          payment_mode:
-            paymentMode,
-
-          subtotal:
-            total,
-
-          discount: 0,
-
-          tax: 0,
-
-          total,
-
-          status:
-            "COMPLETED",
-        })
-        .select()
-        .single();
-
-      if (orderError) {
-        throw orderError;
+        if (existingOpenOrder) {
+          targetOrderId = existingOpenOrder.id;
+          targetOrderNumber = existingOpenOrder.order_number;
+          existingTotal = Number(existingOpenOrder.total) || 0;
+        }
       }
 
-      const orderItems =
-        cart.map(
-          (item) => ({
-            order_id:
-              order.id,
+      let orderRecord;
+      let finalItems: Item[] = cart;
+      let finalTotal = total;
 
-            menu_item_id:
-              item.id,
+      if (targetOrderId) {
+        // 2. APPEND ITEMS TO EXISTING ORDER
+        const updatedTotal = existingTotal + total;
 
-            name_snapshot:
-              item.name,
+        const { data: updatedOrder, error: updateError } = await supabase
+          .from("orders")
+          .update({ total: updatedTotal })
+          .eq("id", targetOrderId)
+          .select()
+          .maybeSingle();
 
-            price_snapshot:
-              item.price,
+        if (updateError) throw updateError;
+        orderRecord = updatedOrder;
 
-            qty:
-              item.qty,
+        const orderItems = cart.map((item) => ({
+          order_id: targetOrderId,
+          menu_item_id: item.id,
+          name_snapshot: item.name,
+          price_snapshot: item.price,
+          qty: item.qty,
+        }));
+
+        const { error: itemError } = await supabase
+          .from("order_items")
+          .insert(orderItems);
+
+        if (itemError) throw itemError;
+
+        // Local state should mirror the DB row exactly — one Order per
+        // databaseId — so merge this round's items into whatever we
+        // already have locally for that order instead of only keeping
+        // this round's items. Without this, appending to an occupied
+        // table used to leave two separate Order entries in state for
+        // the same order (inflating order counts/AOV until a reload).
+        const previousOrder = (orders || []).find(
+          (o) => o.databaseId === targetOrderId
+        );
+
+        const mergedItemsMap = new Map<string, Item>();
+
+        (previousOrder?.items || []).forEach((item) => {
+          mergedItemsMap.set(`${item.id}-${item.price}`, { ...item });
+        });
+
+        cart.forEach((item) => {
+          const key = `${item.id}-${item.price}`;
+          const existing = mergedItemsMap.get(key);
+
+          mergedItemsMap.set(
+            key,
+            existing
+              ? { ...existing, qty: existing.qty + item.qty }
+              : { ...item }
+          );
+        });
+
+        finalItems = Array.from(mergedItemsMap.values());
+        finalTotal = updatedTotal;
+      } else {
+        // 3. CREATE NEW ORDER
+        const orderNumber = `S${Date.now().toString().slice(-6)}`;
+        const orderType =
+          source === "DINE_IN"
+            ? "DINE_IN"
+            : source === "TAKEAWAY"
+            ? "TAKEAWAY"
+            : "DELIVERY";
+
+        const { data: order, error: orderError } = await supabase
+          .from("orders")
+          .insert({
+            restaurant_id: restaurantId,
+            created_by: createdByUserId || null,
+            order_number: orderNumber,
+            order_type: orderType,
+            table_number: source === "DINE_IN" ? cleanTable : null,
+            channel: source,
+            payment_mode: paymentMode,
+            total,
+            status: "COMPLETED",
           })
-        );
+          .select()
+          .maybeSingle();
 
-      const {
-        error: itemError,
-      } = await supabase
-        .from("order_items")
-        .insert(
-          orderItems
-        );
+        if (orderError) throw orderError;
+        orderRecord = order;
 
-      if (itemError) {
-        throw itemError;
+        const orderItems = cart.map((item) => ({
+          order_id: order.id,
+          menu_item_id: item.id,
+          name_snapshot: item.name,
+          price_snapshot: item.price,
+          qty: item.qty,
+        }));
+
+        const { error: itemError } = await supabase
+          .from("order_items")
+          .insert(orderItems);
+
+        if (itemError) throw itemError;
+        targetOrderNumber = orderNumber;
       }
 
       const newOrder: Order = {
-        id:
-          order.order_number,
-        databaseId: order.id,
-
-        time:
-          new Date(
-            order.created_at
-          ).toLocaleTimeString(
-            "en-IN",
-            {
-              hour: "numeric",
-              minute: "2-digit",
-            }
-          ),
-
+        id: targetOrderNumber,
+        databaseId: orderRecord.id,
+        time: new Date(orderRecord.created_at).toLocaleTimeString("en-IN", {
+          hour: "numeric",
+          minute: "2-digit",
+        }),
         source,
-
-        table:
-          source ===
-          "DINE_IN"
-            ? table.trim()
-            : undefined,
-
-        items: cart,
-
-        total,
-
-        payment:
-          paymentMode,
-
-        createdAt:
-          order.created_at,
+        table: source === "DINE_IN" ? cleanTable : undefined,
+        items: finalItems,
+        total: finalTotal,
+        payment: paymentMode,
+        createdAt: orderRecord.created_at,
+        closedAt: null,
       };
 
-      onPlaced(
-        newOrder
-      );
+      onPlaced(newOrder);
 
       setCart([]);
       setSource("");
       setPaymentMode("UPI");
       setTable("");
 
-      alert(
-        `Order ${orderNumber} saved successfully.`
-      );
+      alert(`Order ${targetOrderNumber} saved successfully.`);
     } catch (error: any) {
-      console.error(
-        "ORDER ERROR:",
-        error
-      );
+      console.error("FULL ORDER ERROR:", {
+        message: error?.message,
+        details: error?.details,
+        hint: error?.hint,
+        code: error?.code,
+      });
 
-      alert(
-        error?.message ||
-          "Could not save order."
-      );
+      alert(error?.message || error?.details || "Could not save order.");
     } finally {
+      placingOrderRef.current = false;
       setSaving(false);
     }
   }
@@ -1954,19 +2012,43 @@ function NewOrder({
         </div>
 
         {source ===
-          "DINE_IN" && (
-          <input
-            className="table-input"
-            type="text"
-            value={table}
-            onChange={(e) =>
-              setTable(
-                e.target.value
-              )
-            }
-            placeholder="Table number"
-          />
-        )}
+          "DINE_IN" &&
+          (activeRestaurantTables.length > 0 ? (
+            <select
+              className="table-input"
+              value={table}
+              onChange={(e) =>
+                setTable(
+                  e.target.value
+                )
+              }
+            >
+              <option value="">
+                Select a table
+              </option>
+
+              {activeRestaurantTables.map((t) => (
+                <option key={t.id} value={t.tableNumber}>
+                  Table {t.tableNumber}
+                  {occupiedTableNumbers.has(t.tableNumber)
+                    ? " · Occupied"
+                    : ""}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className="table-input"
+              type="text"
+              value={table}
+              onChange={(e) =>
+                setTable(
+                  e.target.value
+                )
+              }
+              placeholder="Table number"
+            />
+          ))}
 
         <div className="payment-pills">
           {PAYMENT_MODES.map((mode) => (
@@ -2251,10 +2333,13 @@ function NewOrder({
 }
 
 /* =========================================================
-   ORDERS
+   ORDERS & TABLE VIEW
 ========================================================= */
 
-function printExistingBill(order: Order, restaurantName: string) {
+function printExistingBill(
+  order: Order,
+  restaurantName: string
+): boolean {
   const escapeHtml = (value: string) =>
     value
       .replace(/&/g, "&amp;")
@@ -2271,7 +2356,7 @@ function printExistingBill(order: Order, restaurantName: string) {
 
   if (!billWindow) {
     alert("Allow pop-ups to reprint the bill.");
-    return;
+    return false;
   }
 
   const itemRows = order.items
@@ -2432,6 +2517,364 @@ function printExistingBill(order: Order, restaurantName: string) {
   billWindow.focus();
   billWindow.onafterprint = () => billWindow.close();
   window.setTimeout(() => billWindow.print(), 250);
+
+  return true;
+}
+
+function TableView({
+  tables,
+  orders,
+  restaurantId,
+  restaurantName,
+  onAddOrder,
+  onCloseTable,
+  onTableAdded,
+}: {
+  tables: RestaurantTable[];
+  orders: Order[];
+  restaurantId: string;
+  restaurantName: string;
+  onAddOrder: (table?: string) => void;
+  onCloseTable: (table: string) => Promise<void> | void;
+  onTableAdded: () => Promise<void> | void;
+}) {
+  const [closingTable, setClosingTable] = useState<string | null>(null);
+  const [showAddTableModal, setShowAddTableModal] = useState(false);
+  const [newTableNumber, setNewTableNumber] = useState("");
+  const [newTableCapacity, setNewTableCapacity] = useState("4");
+  const [addingTable, setAddingTable] = useState(false);
+  const [expandedTable, setExpandedTable] = useState<string | null>(null);
+
+  const activeTables = tables.filter((table) => table.isActive);
+
+  // Combine every open order's items for a table into one item-level
+  // list (item, qty, price) so the POC can see everything ordered at a
+  // glance, even if it came in across multiple rounds/orders.
+  function aggregateTableItems(tableOrders: Order[]) {
+    const map = new Map<
+      string,
+      { name: string; qty: number; price: number }
+    >();
+
+    tableOrders.forEach((order) => {
+      order.items.forEach((item) => {
+        const key = `${item.id}-${item.price}`;
+        const existing = map.get(key);
+
+        if (existing) {
+          existing.qty += item.qty;
+        } else {
+          map.set(key, {
+            name: item.name,
+            qty: item.qty,
+            price: item.price,
+          });
+        }
+      });
+    });
+
+    return Array.from(map.values()).sort((a, b) =>
+      a.name.localeCompare(b.name)
+    );
+  }
+
+  // Filter only open/unclosed dine-in orders
+  const dineInOrders = orders.filter(
+    (order) =>
+      order.source === "DINE_IN" &&
+      order.table &&
+      !order.closedAt
+  );
+
+  async function handleCloseTable(tableNumber: string) {
+    const cleanTable = tableNumber.trim();
+    const confirmed = window.confirm(
+      `Close out Table ${cleanTable}? This marks the table Available again.`
+    );
+    if (!confirmed) return;
+
+    setClosingTable(tableNumber);
+    try {
+      // Find all open orders matching this exact table number
+      const openOrderIds = orders
+        .filter(
+          (order) =>
+            order.source === "DINE_IN" &&
+            order.table?.trim() === cleanTable &&
+            !order.closedAt &&
+            order.databaseId
+        )
+        .map((order) => order.databaseId as string);
+
+      if (openOrderIds.length === 0) {
+        alert(`No open orders found for Table ${cleanTable}.`);
+        return;
+      }
+
+      const closedAtIso = new Date().toISOString();
+
+      const { error } = await supabase
+        .from("orders")
+        .update({ closed_at: closedAtIso })
+        .in("id", openOrderIds);
+
+      if (error) throw error;
+
+      // Call parent close handler or trigger state update
+      await onCloseTable(cleanTable);
+
+      alert(`Table ${cleanTable} closed successfully.`);
+    } catch (err: any) {
+      console.error("CLOSE TABLE ERROR:", err);
+      alert(err?.message || "Could not close this table's order.");
+    } finally {
+      setClosingTable(null);
+    }
+  }
+
+  async function handleCreateRealtimeTable() {
+    if (!newTableNumber.trim()) {
+      alert("Enter a table number.");
+      return;
+    }
+
+    const capacity = Number(newTableCapacity);
+    if (isNaN(capacity) || capacity <= 0) {
+      alert("Enter a valid seating capacity.");
+      return;
+    }
+
+    setAddingTable(true);
+    try {
+      const { error } = await supabase.from("restaurant_tables").insert({
+        restaurant_id: restaurantId,
+        table_number: newTableNumber.trim(),
+        capacity,
+        is_active: true,
+      });
+
+      if (error) throw error;
+
+      alert(`Table ${newTableNumber.trim()} added successfully.`);
+      setNewTableNumber("");
+      setNewTableCapacity("4");
+      setShowAddTableModal(false);
+      await onTableAdded();
+    } catch (err: any) {
+      console.error("ADD TABLE ERROR:", err);
+      alert(err?.message || "Could not add table.");
+    } finally {
+      setAddingTable(false);
+    }
+  }
+
+  return (
+    <section className="card table-view-card">
+      <div className="section-title">
+        <div>
+          <h2>Table View</h2>
+          <span>Live status for today&apos;s restaurant tables</span>
+        </div>
+
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            className="secondary-btn"
+            onClick={() => setShowAddTableModal(true)}
+          >
+            <Plus size={16} />
+            Add Table
+          </button>
+
+          <button className="primary-btn" onClick={() => onAddOrder()}>
+            <Plus size={16} />
+            Add Order
+          </button>
+        </div>
+      </div>
+
+      <div className="table-view-summary" style={{ gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
+        <div>
+          <span>Occupied</span>
+          <strong>
+            {activeTables.filter((table) =>
+              dineInOrders.some(
+                (order) => order.table === table.tableNumber
+              )
+            ).length}
+          </strong>
+        </div>
+        <div>
+          <span>Available</span>
+          <strong>
+            {activeTables.filter((table) =>
+              !dineInOrders.some(
+                (order) => order.table === table.tableNumber
+              )
+            ).length}
+          </strong>
+        </div>
+      </div>
+
+      {activeTables.length === 0 ? (
+        <div className="empty table-view-empty">
+          No active restaurant tables found.
+        </div>
+      ) : (
+        <div className="table-grid">
+          {activeTables.map((table) => {
+            const tableOrders = dineInOrders.filter(
+              (order) => order.table === table.tableNumber
+            );
+            const tableTotal = tableOrders.reduce(
+              (sum, order) => sum + order.total,
+              0
+            );
+            const occupied = tableOrders.length > 0;
+            const isClosing = closingTable === table.tableNumber;
+            const isExpanded = expandedTable === table.tableNumber;
+            const itemizedList = occupied
+              ? aggregateTableItems(tableOrders)
+              : [];
+
+            return (
+              <article className="table-card" key={table.id}>
+                <div className="table-card-top">
+                  <div>
+                    <span className="table-label">TABLE</span>
+                    <h3>{table.tableNumber}</h3>
+                  </div>
+                  <span className={`table-status ${occupied ? "occupied" : "available"}`}>
+                    {occupied ? "Occupied" : "Available"}
+                  </span>
+                </div>
+
+                <div className="table-card-meta">
+                  <span>Seats {table.capacity}</span>
+                  <span>{tableOrders.length} order{tableOrders.length === 1 ? "" : "s"}</span>
+                </div>
+
+                {occupied && (
+                  <div className="table-card-total-row">
+                    <strong className="table-total">{money(tableTotal)}</strong>
+
+                    <button
+                      type="button"
+                      className="table-items-toggle"
+                      onClick={() =>
+                        setExpandedTable(
+                          isExpanded ? null : table.tableNumber
+                        )
+                      }
+                    >
+                      {isExpanded ? "Hide items" : "View items"}
+                      <ChevronDown
+                        size={14}
+                        className={isExpanded ? "rot" : ""}
+                      />
+                    </button>
+                  </div>
+                )}
+
+                {occupied && isExpanded && (
+                  <div className="table-items-detail">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Item</th>
+                          <th>Qty</th>
+                          <th>Amount</th>
+                        </tr>
+                      </thead>
+
+                      <tbody>
+                        {itemizedList.map((item) => (
+                          <tr key={`${item.name}-${item.price}`}>
+                            <td>{item.name}</td>
+                            <td>{item.qty}</td>
+                            <td>{money(item.price * item.qty)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                <div className="table-card-actions">
+                  <button className="primary-btn" onClick={() => onAddOrder(table.tableNumber)}>
+                    <Plus size={15} />
+                    Add Order
+                  </button>
+
+                  {occupied && (
+                    <>
+                      <button
+                        className="secondary-btn"
+                        onClick={() =>
+                          printExistingBill(
+                            tableOrders[tableOrders.length - 1],
+                            restaurantName
+                          )
+                        }
+                      >
+                        Print Bill
+                      </button>
+
+                      <button
+                        className="secondary-btn close-table-btn"
+                        disabled={isClosing}
+                        onClick={() => handleCloseTable(table.tableNumber)}
+                      >
+                        {isClosing ? "Closing..." : "Close Order"}
+                      </button>
+                    </>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+
+      {showAddTableModal && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h3>Add New Table</h3>
+            <label>Table Number / Name</label>
+            <input
+              type="text"
+              value={newTableNumber}
+              onChange={(e) => setNewTableNumber(e.target.value)}
+              placeholder="e.g. 12 or Patio 1"
+            />
+
+            <label>Seating Capacity</label>
+            <input
+              type="number"
+              value={newTableCapacity}
+              onChange={(e) => setNewTableCapacity(e.target.value)}
+              placeholder="4"
+            />
+
+            <div className="modal-actions">
+              <button
+                className="primary-btn"
+                disabled={addingTable}
+                onClick={handleCreateRealtimeTable}
+              >
+                {addingTable ? "Creating..." : "Save Table"}
+              </button>
+              <button
+                className="secondary-btn"
+                onClick={() => setShowAddTableModal(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
 }
 
 function Orders({
@@ -2880,10 +3323,10 @@ function Orders({
                   <div className="order-detail">
 
                     {o.items.map(
-                      (i) => (
+                      (i, idx) => (
                         <div
                           key={
-                            i.id
+                            `${i.id}-${i.price}-${idx}`
                           }
                         >
 
@@ -3010,7 +3453,6 @@ function Insights({
       today.toISOString().split("T")[0]
     );
 
-  // Helper function to refresh all insights charts and data concurrently
   function refreshAllAnalytics() {
     if (!restaurantId) return;
     loadHistoricalData();
@@ -3018,7 +3460,6 @@ function Insights({
     loadHourlyBuckets();
   }
 
-  // Trigger data refresh on component mount / tab switch / filter change
   useEffect(() => {
     refreshAllAnalytics();
   }, [restaurantId, analyticsRangePreset, customRangeStart, customRangeEnd]);
@@ -6050,6 +6491,9 @@ export default function HomePage() {
   const [tab, setTab] =
     useState<Tab>("new");
 
+  const [selectedTable, setSelectedTable] =
+    useState("");
+
   const [
     mobileNav,
     setMobileNav,
@@ -6068,6 +6512,9 @@ export default function HomePage() {
   ] = useState<Order[]>(
     []
   );
+
+  const [restaurantTables, setRestaurantTables] =
+    useState<RestaurantTable[]>([]);
 
   const [
     restaurants,
@@ -6118,15 +6565,11 @@ export default function HomePage() {
 
   void categoryCounts;
 
-  /* =======================================================
-     SESSION RECOVERY ON MOUNT / MOBILE RESUME
-  ======================================================= */
   useEffect(() => {
     setMounted(true);
     let isCurrent = true;
 
     async function checkExistingSession() {
-      // 1. Immediately read cached user from localStorage on client mount
       try {
         const saved = localStorage.getItem("restaurant_iq_user");
         if (saved && isCurrent) {
@@ -6134,7 +6577,6 @@ export default function HomePage() {
         }
       } catch (e) {}
 
-      // 2. Verify active session with Supabase
       try {
         const {
           data: { session },
@@ -6223,10 +6665,6 @@ export default function HomePage() {
     };
   }, []);
 
-  /* =======================================================
-     LOAD DATA AFTER LOGIN
-  ======================================================= */
-
   useEffect(() => {
     if (!currentUser) {
       return;
@@ -6252,10 +6690,6 @@ export default function HomePage() {
       );
     }
   }, [currentUser?.id]);
-
-  /* =======================================================
-     LIVE UPDATES — TODAY'S ORDERS
-  ======================================================= */
 
   useEffect(() => {
     if (
@@ -6297,10 +6731,6 @@ export default function HomePage() {
     };
   }, [currentUser?.restaurantId]);
 
-  /* =======================================================
-     LOAD RESTAURANTS
-  ======================================================= */
-
   async function loadRestaurants() {
     setLoading(true);
     setDatabaseError(null);
@@ -6337,10 +6767,6 @@ export default function HomePage() {
       setLoading(false);
     }
   }
-
-  /* =======================================================
-     LOAD RESTAURANT DATA
-  ======================================================= */
 
   async function loadRestaurantData(
     restaurantId: string | null
@@ -6419,6 +6845,28 @@ export default function HomePage() {
         formattedMenu
       );
 
+      const {
+        data: rawTables,
+        error: tablesError,
+      } = await supabase
+        .from("restaurant_tables")
+        .select("id, table_number, capacity, is_active")
+        .eq("restaurant_id", restaurantId)
+        .order("table_number");
+
+      if (tablesError) {
+        throw tablesError;
+      }
+
+      setRestaurantTables(
+        (rawTables || []).map((table: any) => ({
+          id: String(table.id),
+          tableNumber: String(table.table_number),
+          capacity: Number(table.capacity) || 0,
+          isActive: table.is_active !== false,
+        }))
+      );
+
       await loadTodayOrders(
         restaurantId
       );
@@ -6436,10 +6884,6 @@ export default function HomePage() {
       setLoading(false);
     }
   }
-
-  /* =======================================================
-     LOAD TODAY ORDERS
-  ======================================================= */
 
   async function loadTodayOrders(
     restaurantId: string
@@ -6499,30 +6943,88 @@ export default function HomePage() {
     );
   }
 
-  /* =======================================================
-     ORDER PLACED
-  ======================================================= */
-
   function handlePlaced(
     order: Order
   ) {
-    setTodayOrders(
-      (current) => [
-        order,
-        ...current,
-      ]
-    );
+    setTodayOrders((current) => {
+      // Upsert by databaseId: a re-used/appended order (same DB row)
+      // replaces its existing entry instead of adding a second, partial
+      // one alongside it — that duplication was inflating order counts
+      // and AOV in Insights/Table View for occupied tables.
+      const existingIndex = current.findIndex(
+        (o) =>
+          order.databaseId &&
+          o.databaseId === order.databaseId
+      );
+
+      if (existingIndex !== -1) {
+        const next = [...current];
+        next[existingIndex] = order;
+        return next;
+      }
+
+      return [order, ...current];
+    });
 
     setRefreshKey(
       (k) => k + 1
     );
 
+    setSelectedTable("");
+
     setTab("orders");
   }
 
-  /* =======================================================
-     RESTAURANT CREATED
-  ======================================================= */
+  function handleTableOrder(table?: string) {
+    setSelectedTable(table || "");
+    setTab("new");
+  }
+
+  async function handleCloseTable(
+    tableNumber: string
+  ) {
+    const openOrderIds = todayOrders
+      .filter(
+        (order) =>
+          order.source === "DINE_IN" &&
+          order.table === tableNumber &&
+          !order.closedAt &&
+          order.databaseId
+      )
+      .map((order) => order.databaseId as string);
+
+    if (openOrderIds.length === 0) return;
+
+    const closedAtIso = new Date().toISOString();
+
+    try {
+      const { error } = await supabase
+        .from("orders")
+        .update({ closed_at: closedAtIso })
+        .in("id", openOrderIds);
+
+      if (error) throw error;
+
+      setTodayOrders((current) =>
+        current.map((order) =>
+          openOrderIds.includes(
+            order.databaseId as string
+          )
+            ? { ...order, closedAt: closedAtIso }
+            : order
+        )
+      );
+    } catch (err: any) {
+      console.error(
+        "CLOSE TABLE ERROR:",
+        err
+      );
+      alert(
+        err?.message ||
+          "Could not close this table's order."
+      );
+    }
+  }
 
   function handleRestaurantCreated(
     r: RestaurantRow
@@ -6541,10 +7043,6 @@ export default function HomePage() {
     );
   }
 
-  /* =======================================================
-     LOGOUT
-  ======================================================= */
-
   async function handleLogout() {
     try {
       localStorage.removeItem("restaurant_iq_user");
@@ -6557,10 +7055,6 @@ export default function HomePage() {
     setDatabaseError(null);
     setTab("new");
   }
-
-  /* =======================================================
-     HYDRATION & AUTH CHECKING SCREEN
-  ======================================================= */
 
   if (!mounted) {
     return (
@@ -6592,10 +7086,6 @@ export default function HomePage() {
     );
   }
 
-  /* =======================================================
-     LOADING
-  ======================================================= */
-
   if (loading) {
     return (
       <div
@@ -6616,10 +7106,6 @@ export default function HomePage() {
       </div>
     );
   }
-
-  /* =======================================================
-     TOOLBAR
-  ======================================================= */
 
   const toolbarCopy: Record<
     Tab,
@@ -6661,6 +7147,13 @@ export default function HomePage() {
         "Users",
       subtitle:
         "Create Admin and POC logins",
+    },
+
+    tables: {
+      title:
+        "Table View",
+      subtitle:
+        "Live table status and dine-in orders",
     },
   };
 
@@ -6786,6 +7279,15 @@ export default function HomePage() {
               createdByUserId={
                 currentUser.id
               }
+              initialTable={
+                selectedTable
+              }
+              restaurantTables={
+                restaurantTables
+              }
+              orders={
+                todayOrders
+              }
               onPlaced={
                 handlePlaced
               }
@@ -6793,6 +7295,22 @@ export default function HomePage() {
                 loadRestaurantData(
                   currentUser.restaurantId
                 )
+              }
+            />
+          )}
+
+        {currentUser.role !==
+          "SUPER_ADMIN" &&
+          tab === "tables" && (
+            <TableView
+              tables={restaurantTables}
+              orders={todayOrders}
+              restaurantId={currentUser.restaurantId || ""}
+              restaurantName={currentUser.restaurantName}
+              onAddOrder={handleTableOrder}
+              onCloseTable={handleCloseTable}
+              onTableAdded={() =>
+                loadRestaurantData(currentUser.restaurantId)
               }
             />
           )}
@@ -8352,6 +8870,169 @@ export default function HomePage() {
           background: #fee2e2;
         }
 
+        .table-view-card {
+          overflow: visible;
+        }
+
+        .table-view-summary {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 12px;
+          margin: 20px 0;
+        }
+
+        .table-view-summary > div {
+          padding: 14px 16px;
+          border: 1px solid #e5e7eb;
+          border-radius: 12px;
+          background: #fafafa;
+        }
+
+        .table-view-summary span,
+        .table-card-meta,
+        .table-label {
+          color: #6b7280;
+          font-size: 12px;
+        }
+
+        .table-view-summary strong {
+          display: block;
+          margin-top: 5px;
+          font-size: 20px;
+        }
+
+        .table-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+          gap: 14px;
+        }
+
+        .table-view-card .table-card {
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
+          min-height: 210px;
+          margin-top: 0;
+          padding: 18px;
+          overflow: visible;
+          border: 1px solid #e5e7eb;
+          border-radius: 14px;
+          background: #ffffff;
+        }
+
+        .table-card-top,
+        .table-card-meta,
+        .table-card-actions {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+        }
+
+        .table-card-top h3 {
+          margin: 4px 0 0;
+          font-size: 26px;
+        }
+
+        .table-label {
+          font-weight: 800;
+          letter-spacing: 0.08em;
+        }
+
+        .table-status {
+          padding: 6px 9px;
+          border-radius: 999px;
+          font-size: 12px;
+          font-weight: 700;
+        }
+
+        .table-status.occupied {
+          color: #b91c1c;
+          background: #fee2e2;
+        }
+
+        .table-status.available {
+          color: #15803d;
+          background: #dcfce7;
+        }
+
+        .table-total {
+          font-size: 20px;
+        }
+
+        .table-card-total-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+        }
+
+        .table-items-toggle {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          border: 1px solid #e5e7eb;
+          border-radius: 999px;
+          padding: 5px 10px;
+          background: #fafafa;
+          color: #5b5ce2;
+          font-size: 12px;
+          font-weight: 700;
+          white-space: nowrap;
+        }
+
+        .table-items-toggle .rot {
+          transform: rotate(180deg);
+        }
+
+        .table-items-detail {
+          border: 1px solid #e5e7eb;
+          border-radius: 10px;
+          padding: 4px 12px;
+          background: #fafafa;
+          overflow-x: auto;
+        }
+
+        .table-items-detail table {
+          width: 100%;
+        }
+
+        .table-items-detail th,
+        .table-items-detail td {
+          padding: 9px 6px;
+          font-size: 13px;
+        }
+
+        .table-card-actions {
+          margin-top: auto;
+          justify-content: flex-start;
+          flex-wrap: wrap;
+        }
+
+        .table-card-actions button {
+          flex: 1 1 auto;
+          min-width: 110px;
+          white-space: nowrap;
+        }
+
+        .close-table-btn {
+          border-color: #15803d;
+          color: #15803d;
+        }
+
+        .close-table-btn:hover {
+          background: #f0fdf4;
+        }
+
+        .close-table-btn:disabled {
+          opacity: 0.6;
+          cursor: default;
+        }
+
+        .table-view-empty {
+          padding: 44px 20px;
+        }
+
         .user-filters {
           display: flex;
           flex-wrap: wrap;
@@ -8678,7 +9359,6 @@ export default function HomePage() {
           }
         }
 
-        /* Dhaba Ledger analytics theme */
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=Zilla+Slab:wght@500;600;700&display=swap');
 
         body {
@@ -9061,7 +9741,6 @@ export default function HomePage() {
           stroke-linejoin: round;
         }
 
-        /* Order entry refinements */
         .new-layout {
           grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.9fr);
           align-items: start;
