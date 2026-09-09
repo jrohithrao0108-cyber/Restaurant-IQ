@@ -3261,6 +3261,16 @@ function Orders({
    INSIGHTS
 ========================================================= */
 
+const globalAnalyticsCache: {
+  restaurantId?: string;
+  historicalOrders?: Order[];
+  historicalTimestamp?: number;
+  dayWiseRows?: any[];
+  dayWiseRangeKey?: string;
+  hourlyBuckets?: any[];
+  hourlyRangeKey?: string;
+} = {};
+
 function Insights({
   orders,
   restaurantId,
@@ -3272,10 +3282,22 @@ function Insights({
   restaurantName?: string;
   currentUserPhone?: string;
 }) {
-  const [historicalOrders, setHistoricalOrders] =
-    useState<Order[]>([]);
-  const [loading, setLoading] =
-    useState(false);
+  const [historicalOrders, setHistoricalOrders] = useState<Order[]>(() => {
+    if (
+      globalAnalyticsCache.restaurantId === restaurantId &&
+      globalAnalyticsCache.historicalOrders
+    ) {
+      return globalAnalyticsCache.historicalOrders;
+    }
+    return [];
+  });
+  const [loading, setLoading] = useState(() => {
+    return !(
+      globalAnalyticsCache.restaurantId === restaurantId &&
+      globalAnalyticsCache.historicalOrders &&
+      globalAnalyticsCache.historicalOrders.length > 0
+    );
+  });
 
   const latestRequestId = useRef(0);
 
@@ -3386,7 +3408,24 @@ function Insights({
   async function loadHistoricalData() {
     const requestId = ++latestRequestId.current;
 
-    setLoading(true);
+    // Use cached data immediately if available
+    const hasCache =
+      globalAnalyticsCache.restaurantId === restaurantId &&
+      globalAnalyticsCache.historicalOrders &&
+      globalAnalyticsCache.historicalOrders.length > 0;
+
+    if (hasCache) {
+      setHistoricalOrders(globalAnalyticsCache.historicalOrders!);
+      setLoading(false);
+      if (
+        globalAnalyticsCache.historicalTimestamp &&
+        Date.now() - globalAnalyticsCache.historicalTimestamp < 180000
+      ) {
+        return;
+      }
+    } else {
+      setLoading(true);
+    }
 
     const allRows: any[] = [];
 
@@ -3444,6 +3483,10 @@ function Insights({
       if (requestId !== latestRequestId.current) {
         return;
       }
+
+      globalAnalyticsCache.restaurantId = restaurantId;
+      globalAnalyticsCache.historicalOrders = formatted;
+      globalAnalyticsCache.historicalTimestamp = Date.now();
 
       setHistoricalOrders(formatted);
     } catch (err: any) {
@@ -3808,17 +3851,24 @@ function Insights({
         aov: number;
         isToday: boolean;
       }>
-    >([]);
+    >(() => globalAnalyticsCache.dayWiseRows || []);
   const [dayWiseLoading, setDayWiseLoading] =
-    useState(false);
+    useState(() => !(globalAnalyticsCache.dayWiseRows && globalAnalyticsCache.dayWiseRows.length > 0));
   const latestDayWiseRequestId = useRef(0);
 
   async function loadDayWiseTrend() {
     if (!restaurantId) return;
 
+    const rangeKey = `${restaurantId}_${analyticsRange.start.toISOString()}_${analyticsRange.end.toISOString()}`;
     const requestId =
       ++latestDayWiseRequestId.current;
-    setDayWiseLoading(true);
+
+    if (globalAnalyticsCache.dayWiseRows && globalAnalyticsCache.dayWiseRangeKey === rangeKey) {
+      setDayWiseTrendData(globalAnalyticsCache.dayWiseRows);
+      setDayWiseLoading(false);
+    } else {
+      setDayWiseLoading(true);
+    }
 
     try {
       const numDays = Math.max(
@@ -3879,6 +3929,8 @@ function Insights({
         return;
       }
 
+      globalAnalyticsCache.dayWiseRows = formatted;
+      globalAnalyticsCache.dayWiseRangeKey = rangeKey;
       setDayWiseTrendData(formatted);
     } catch (err: any) {
       console.error(
@@ -3955,20 +4007,27 @@ function Insights({
         aov: number;
         items: number;
       }>
-    >([]);
+    >(() => globalAnalyticsCache.hourlyBuckets || []);
   const [
     hourlyBucketLoading,
     setHourlyBucketLoading,
-  ] = useState(false);
+  ] = useState(() => !(globalAnalyticsCache.hourlyBuckets && globalAnalyticsCache.hourlyBuckets.length > 0));
   const latestHourlyBucketRequestId =
     useRef(0);
 
   async function loadHourlyBuckets() {
     if (!restaurantId) return;
 
+    const rangeKey = `${restaurantId}_${analyticsRange.start.toISOString()}_${analyticsRange.end.toISOString()}`;
     const requestId =
       ++latestHourlyBucketRequestId.current;
-    setHourlyBucketLoading(true);
+
+    if (globalAnalyticsCache.hourlyBuckets && globalAnalyticsCache.hourlyRangeKey === rangeKey) {
+      setHourlyBucketData(globalAnalyticsCache.hourlyBuckets);
+      setHourlyBucketLoading(false);
+    } else {
+      setHourlyBucketLoading(true);
+    }
 
     try {
       const { data, error } =
@@ -4016,6 +4075,8 @@ function Insights({
         return;
       }
 
+      globalAnalyticsCache.hourlyBuckets = formatted;
+      globalAnalyticsCache.hourlyRangeKey = rangeKey;
       setHourlyBucketData(formatted);
     } catch (err: any) {
       console.error(
@@ -6343,6 +6404,17 @@ export default function HomePage() {
   const [tab, setTab] =
     useState<Tab>("new");
 
+  const [visitedTabs, setVisitedTabs] = useState<Set<Tab>>(() => new Set(["new"]));
+
+  useEffect(() => {
+    setVisitedTabs((prev) => {
+      if (prev.has(tab)) return prev;
+      const next = new Set(prev);
+      next.add(tab);
+      return next;
+    });
+  }, [tab]);
+
   const [selectedTable, setSelectedTable] =
     useState("");
 
@@ -7273,100 +7345,106 @@ export default function HomePage() {
 
         {currentUser.role !==
           "SUPER_ADMIN" &&
-          tab === "new" && (
-            <NewOrder
-              products={
-                products
-              }
-              restaurantId={
-                currentUser.restaurantId ||
-                ""
-              }
-              restaurantName={
-                currentUser.restaurantName
-              }
-              isPoc={
-                currentUser.role === "POC"
-              }
-              createdByUserId={
-                currentUser.id
-              }
-              initialTable={
-                selectedTable
-              }
-              restaurantTables={
-                restaurantTables
-              }
-              orders={
-                todayOrders
-              }
-              onPlaced={
-                handlePlaced
-              }
-              onMenuChanged={() =>
-                loadRestaurantData(
-                  currentUser.restaurantId
-                )
-              }
-            />
+          visitedTabs.has("new") && (
+            <div style={{ display: tab === "new" ? "block" : "none" }}>
+              <NewOrder
+                products={
+                  products
+                }
+                restaurantId={
+                  currentUser.restaurantId ||
+                  ""
+                }
+                restaurantName={
+                  currentUser.restaurantName
+                }
+                isPoc={
+                  currentUser.role === "POC"
+                }
+                createdByUserId={
+                  currentUser.id
+                }
+                initialTable={
+                  selectedTable
+                }
+                restaurantTables={
+                  restaurantTables
+                }
+                orders={
+                  todayOrders
+                }
+                onPlaced={
+                  handlePlaced
+                }
+                onMenuChanged={() =>
+                  loadRestaurantData(
+                    currentUser.restaurantId
+                  )
+                }
+              />
+            </div>
           )}
 
         {currentUser.role !==
           "SUPER_ADMIN" &&
-          tab === "tables" && (
-            <TableView
-              tables={restaurantTables}
-              orders={todayOrders}
-              restaurantId={currentUser.restaurantId || ""}
-              restaurantName={currentUser.restaurantName}
-              onAddOrder={handleTableOrder}
-              onCloseTable={handleCloseTable}
-              onTableAdded={() =>
-                loadRestaurantData(currentUser.restaurantId)
-              }
-            />
+          visitedTabs.has("tables") && (
+            <div style={{ display: tab === "tables" ? "block" : "none" }}>
+              <TableView
+                tables={restaurantTables}
+                orders={todayOrders}
+                restaurantId={currentUser.restaurantId || ""}
+                restaurantName={currentUser.restaurantName}
+                onAddOrder={handleTableOrder}
+                onCloseTable={handleCloseTable}
+                onTableAdded={() =>
+                  loadRestaurantData(currentUser.restaurantId)
+                }
+              />
+            </div>
           )}
 
         {currentUser.role !==
           "SUPER_ADMIN" &&
-          tab ===
-            "orders" && (
-            <Orders
-              restaurantId={
-                currentUser.restaurantId ||
-                ""
-              }
-              restaurantName={
-                currentUser.restaurantName
-              }
-              refreshKey={
-                refreshKey
-              }
-              isPoc={
-                currentUser.role === "POC"
-              }
-            />
+          visitedTabs.has("orders") && (
+            <div style={{ display: tab === "orders" ? "block" : "none" }}>
+              <Orders
+                restaurantId={
+                  currentUser.restaurantId ||
+                  ""
+                }
+                restaurantName={
+                  currentUser.restaurantName
+                }
+                refreshKey={
+                  refreshKey
+                }
+                isPoc={
+                  currentUser.role === "POC"
+                }
+              />
+            </div>
           )}
 
         {currentUser.role ===
           "ADMIN" &&
-          tab ===
-            "insights" && (
-            <Insights
-              orders={
-                todayOrders
-              }
-              restaurantId={
-                currentUser.restaurantId ||
-                ""
-              }
-              restaurantName={
-                currentUser.restaurantName
-              }
-              currentUserPhone={
-                currentUser.phone
-              }
-            />
+          visitedTabs.has("insights") && (
+            <div style={{ display: tab === "insights" ? "block" : "none" }}>
+              <Insights
+                orders={
+                  todayOrders
+                }
+                restaurantId={
+                  currentUser.restaurantId ||
+                  ""
+                }
+                restaurantName={
+                  currentUser.restaurantName
+                }
+                currentUserPhone={
+                  currentUser.phone
+                }
+              />
+            </div>
           )}
 
         <footer>
