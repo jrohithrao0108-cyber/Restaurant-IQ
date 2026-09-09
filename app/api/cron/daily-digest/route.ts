@@ -17,8 +17,17 @@ async function handleCronDispatch(req: NextRequest) {
     }
 
     // Determine shift: lunch (4:00 PM) or eod (10:30 PM)
-    const shiftParam = (req.nextUrl.searchParams.get("shift") || "eod").toLowerCase();
-    const shift: DigestShift = shiftParam === "lunch" ? "LUNCH" : "EOD";
+    const shiftParam = req.nextUrl.searchParams.get("shift");
+    let shift: DigestShift = "EOD";
+    if (shiftParam) {
+      shift = shiftParam.toLowerCase() === "lunch" ? "LUNCH" : "EOD";
+    } else {
+      // Auto-detect based on current time (UTC)
+      // 10:30 AM UTC = 4:00 PM IST (Lunch window: 9:00 - 13:00 UTC)
+      // 5:00 PM UTC = 10:30 PM IST (EOD window)
+      const currentUtcHour = new Date().getUTCHours();
+      shift = currentUtcHour >= 9 && currentUtcHour <= 13 ? "LUNCH" : "EOD";
+    }
 
     // 1. Fetch active restaurants
     const { data: restaurants, error: restError } = await supabaseAdmin

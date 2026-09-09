@@ -1,11 +1,7 @@
-﻿{
+{
   "crons": [
     {
-      "path": "/api/cron/daily-digest?shift=lunch",
-      "schedule": "30 10 * * *"
-    },
-    {
-      "path": "/api/cron/daily-digest?shift=eod",
+      "path": "/api/cron/daily-digest",
       "schedule": "0 17 * * *"
     }
   ]
