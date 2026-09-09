@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Ban,
+  Bell,
   Brain,
   Calendar,
   CheckCircle2,
@@ -38,6 +39,20 @@ import {
 } from "recharts";
 
 import { supabase } from "@/lib/supabase";
+import { printKitchenOrderTicket } from "@/lib/printing/kotPrinter";
+import { printCustomerBillReceipt } from "@/lib/printing/receiptPrinter";
+import {
+  enqueueOfflineOrder,
+  cacheMenuItems,
+  getCachedMenuItems,
+  cacheTables,
+  getCachedTables,
+  getLocalSettings,
+  saveLocalSettings,
+} from "@/lib/offline/offlineStorage";
+import { OfflineBanner } from "@/components/OfflineBanner";
+import { WhatsAppDigestModal } from "@/components/WhatsAppDigestModal";
+import { SuperAdminRemindersPanel } from "@/components/SuperAdminRemindersPanel";
 
 /* =========================================================
    TYPES
@@ -51,7 +66,8 @@ type Tab =
   | "tables"
   | "insights"
   | "restaurants"
-  | "users";
+  | "users"
+  | "reminders";
 
 type CurrentUser = {
   id: string;
@@ -71,6 +87,7 @@ type Product = {
 
 type Item = Product & {
   qty: number;
+  notes?: string;
 };
 
 type OrderSource =
@@ -815,6 +832,20 @@ function Sidebar({
               Users
             </a>
 
+            <a
+              className={
+                tab === "reminders"
+                  ? "active"
+                  : ""
+              }
+              onClick={() =>
+                go("reminders")
+              }
+            >
+              <Bell size={18} />
+              Owner Reminders
+            </a>
+
           </nav>
         ) : (
           <nav>
@@ -1004,6 +1035,10 @@ function NewOrder({
 
   const [saving, setSaving] =
     useState(false);
+
+  const [autoPrintKot, setAutoPrintKot] = useState(
+    () => getLocalSettings().autoPrintKot
+  );
 
   const placingOrderRef = useRef(false);
 
@@ -1331,7 +1366,7 @@ function NewOrder({
 
   const displayNumber = (value: string | number) => String(value);
 
-  async function placeOrder() {
+  async function placeOrder(shouldPrintKot?: boolean) {
     if (placingOrderRef.current) return;
 
     if (!cart.length) {
@@ -1357,8 +1392,92 @@ function NewOrder({
     placingOrderRef.current = true;
     setSaving(true);
 
+    const cleanTable = table.trim();
+    const settings = getLocalSettings();
+    const willPrintKot = shouldPrintKot ?? settings.autoPrintKot;
+
+    const selectedSource = source as OrderSource;
+
+    function saveOfflineOrder(targetOrderNumber: string) {
+      const tempId = `OFFLINE-${Date.now()}`;
+      const orderType =
+        selectedSource === "DINE_IN"
+          ? "DINE_IN"
+          : selectedSource === "TAKEAWAY"
+          ? "TAKEAWAY"
+          : "DELIVERY";
+
+      enqueueOfflineOrder({
+        tempId,
+        restaurantId,
+        createdByUserId: createdByUserId || null,
+        orderNumber: targetOrderNumber,
+        orderType,
+        tableNumber: selectedSource === "DINE_IN" ? cleanTable : null,
+        channel: selectedSource,
+        paymentMode,
+        total,
+        status: "COMPLETED",
+        items: cart.map((c) => ({
+          id: c.id,
+          name: c.name,
+          price: c.price,
+          qty: c.qty,
+          notes: c.notes,
+          category: c.category,
+        })),
+        createdAt: new Date().toISOString(),
+        syncAttempts: 0,
+      });
+
+      const newOrder: Order = {
+        id: targetOrderNumber,
+        databaseId: tempId,
+        time: new Date().toLocaleTimeString("en-IN", {
+          hour: "numeric",
+          minute: "2-digit",
+        }),
+        source: selectedSource,
+        table: selectedSource === "DINE_IN" ? cleanTable : undefined,
+        items: cart,
+        total,
+        payment: paymentMode,
+        createdAt: new Date().toISOString(),
+        closedAt: null,
+      };
+
+      onPlaced(newOrder);
+
+      if (willPrintKot) {
+        printKitchenOrderTicket({
+          restaurantName,
+          orderNumber: targetOrderNumber,
+          table: source === "DINE_IN" ? cleanTable : undefined,
+          source,
+          items: cart,
+          paperWidth: settings.paperWidth,
+        });
+      }
+
+      setCart([]);
+      setSource("");
+      setPaymentMode("UPI");
+      setTable("");
+      alert(
+        `Order ${targetOrderNumber} queued in Offline Mode. It will sync automatically when cloud reconnects.`
+      );
+    }
+
+    // Check offline status first
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      const offlineOrderNumber = `OFF-${Date.now().toString().slice(-6)}`;
+      saveOfflineOrder(offlineOrderNumber);
+      placingOrderRef.current = false;
+      setSaving(false);
+      return;
+    }
+
     try {
-      const cleanTable = table.trim();
       let targetOrderId: string | null = null;
       let targetOrderNumber: string = "";
       let existingTotal = 0;
@@ -1417,12 +1536,6 @@ function NewOrder({
 
         if (itemError) throw itemError;
 
-        // Local state should mirror the DB row exactly — one Order per
-        // databaseId — so merge this round's items into whatever we
-        // already have locally for that order instead of only keeping
-        // this round's items. Without this, appending to an occupied
-        // table used to leave two separate Order entries in state for
-        // the same order (inflating order counts/AOV until a reload).
         const previousOrder = (orders || []).find(
           (o) => o.databaseId === targetOrderId
         );
@@ -1510,6 +1623,18 @@ function NewOrder({
 
       onPlaced(newOrder);
 
+      // Print KOT for the new items
+      if (willPrintKot) {
+        printKitchenOrderTicket({
+          restaurantName,
+          orderNumber: targetOrderNumber,
+          table: source === "DINE_IN" ? cleanTable : undefined,
+          source,
+          items: cart,
+          paperWidth: settings.paperWidth,
+        });
+      }
+
       setCart([]);
       setSource("");
       setPaymentMode("UPI");
@@ -1517,14 +1642,18 @@ function NewOrder({
 
       alert(`Order ${targetOrderNumber} saved successfully.`);
     } catch (error: any) {
-      console.error("FULL ORDER ERROR:", {
-        message: error?.message,
-        details: error?.details,
-        hint: error?.hint,
-        code: error?.code,
-      });
+      console.error("ORDER ERROR:", error);
+      const isNetwork =
+        !navigator.onLine ||
+        error?.message?.toLowerCase().includes("fetch") ||
+        error?.message?.toLowerCase().includes("network");
 
-      alert(error?.message || error?.details || "Could not save order.");
+      if (isNetwork) {
+        const offlineNum = `OFF-${Date.now().toString().slice(-6)}`;
+        saveOfflineOrder(offlineNum);
+      } else {
+        alert(error?.message || error?.details || "Could not save order.");
+      }
     } finally {
       placingOrderRef.current = false;
       setSaving(false);
@@ -1537,183 +1666,17 @@ function NewOrder({
       return;
     }
 
-    const escapeHtml = (value: string) =>
-      value
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-
-    const billWindow = window.open(
-      "",
-      "restaurant-bill",
-      "width=420,height=720"
-    );
-
-    if (!billWindow) {
-      alert("Allow pop-ups to print the bill.");
-      return;
-    }
-
-    const itemRows = cart
-      .map(
-        (item) => `
-          <tr>
-            <td>${escapeHtml(item.name)}<small>${item.qty} × ${money(item.price)}</small></td>
-            <td>${money(item.price * item.qty)}</td>
-          </tr>
-        `
-      )
-      .join("");
-
-    billWindow.document.write(`
-      <!doctype html>
-      <html>
-        <head>
-          <title>Restaurant bill</title>
-          <meta name="viewport" content="width=device-width, initial-scale=1" />
-          <style>
-  @page {
-    size: auto;
-    margin: 4mm 2mm;
-  }
-  * {
-    box-sizing: border-box;
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-  }
-  html, body {
-    margin: 0;
-    padding: 0;
-    background: #fff;
-    color: #000;
-    font-family: "Courier New", Courier, monospace, system-ui, -apple-system, sans-serif;
-    font-size: 12px;
-    line-height: 1.35;
-  }
-  .receipt {
-    width: 100%;
-    max-width: 80mm;
-    margin: 0 auto;
-    padding: 6px 4px;
-  }
-  header {
-    text-align: center;
-    border-bottom: 1px dashed #000;
-    padding-bottom: 6px;
-    margin-bottom: 6px;
-  }
-  h1 {
-    margin: 0 0 3px;
-    font-size: 16px;
-    font-weight: 900;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    word-break: break-word;
-  }
-  header p {
-    margin: 2px 0;
-    font-size: 11px;
-    color: #000;
-  }
-  .meta {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 6px;
-    margin: 6px 0;
-    padding-bottom: 5px;
-    border-bottom: 1px dashed #000;
-    font-size: 11px;
-    font-weight: 700;
-  }
-  .meta span {
-    word-break: break-word;
-  }
-  table {
-    width: 100%;
-    table-layout: fixed;
-    border-collapse: collapse;
-    margin: 4px 0;
-  }
-  td {
-    padding: 4px 0;
-    border-bottom: 1px dotted #bbb;
-    vertical-align: top;
-    font-size: 11.5px;
-  }
-  td:first-child {
-    width: 68%;
-    word-break: break-word;
-    padding-right: 4px;
-  }
-  td:last-child {
-    width: 32%;
-    text-align: right;
-    white-space: nowrap;
-    font-weight: 700;
-  }
-  small {
-    display: block;
-    color: #222;
-    margin-top: 2px;
-    font-size: 10px;
-    font-weight: normal;
-  }
-  .total {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 6px 0;
-    margin-top: 4px;
-    border-top: 2px solid #000;
-    border-bottom: 2px solid #000;
-    font-size: 14px;
-    font-weight: 900;
-  }
-  footer {
-    text-align: center;
-    margin-top: 10px;
-    padding-top: 4px;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-  @media print {
-    body {
-      padding: 0;
-    }
-    .receipt {
-      width: 100%;
-      max-width: 80mm;
-      padding: 0;
-    }
-  }
-</style>
-        </head>
-        <body>
-          <main class="receipt">
-            <header>
-              <h1>${escapeHtml(restaurantName || "Restaurant")}</h1>
-              <p>Restaurant bill</p>
-              <p>Draft bill · ${new Date().toLocaleString("en-IN")}</p>
-            </header>
-            <div class="meta">
-              <span>${escapeHtml(source || "Order source pending")}</span>
-              <span>${escapeHtml(paymentMode)}${source === "DINE_IN" && table.trim() ? ` · Table ${escapeHtml(table.trim())}` : ""}</span>
-            </div>
-            <table><tbody>${itemRows}</tbody></table>
-            <div class="total"><span>Total</span><span>${money(total)}</span></div>
-            <footer>Thank you for dining with us</footer>
-          </main>
-        </body>
-      </html>
-    `);
-    billWindow.document.close();
-    billWindow.focus();
-    billWindow.onafterprint = () => billWindow.close();
-    window.setTimeout(() => billWindow.print(), 250);
+    const settings = getLocalSettings();
+    printCustomerBillReceipt({
+      restaurantName,
+      orderNumber: `DRAFT-${Date.now().toString().slice(-4)}`,
+      table: source === "DINE_IN" ? table.trim() : undefined,
+      source: source || "DINE_IN",
+      paymentMode,
+      items: cart,
+      total,
+      paperWidth: settings.paperWidth,
+    });
   }
 
   return (
@@ -2063,27 +2026,64 @@ function NewOrder({
         </div>
 
         <button
-          className="print-bill"
-          disabled={!cart.length}
-          onClick={printBill}
-        >
-          PRINT BILL
-        </button>
-
-        <button
           className="place"
-          disabled={
-            !cart.length ||
-            saving
-          }
-          onClick={
-            placeOrder
-          }
+          disabled={!cart.length || saving}
+          onClick={() => placeOrder()}
+          style={{ marginTop: "12px" }}
         >
           {saving
             ? "SAVING ORDER..."
             : `PLACE ORDER · ${displayNumber(money(total))}`}
         </button>
+
+        {cart.length > 0 && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              padding: "10px 4px 0",
+              fontSize: "12px",
+            }}
+          >
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                cursor: "pointer",
+                color: "#64748b",
+                userSelect: "none",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={autoPrintKot}
+                onChange={(e) => {
+                  setAutoPrintKot(e.target.checked);
+                  saveLocalSettings({ autoPrintKot: e.target.checked });
+                }}
+              />
+              <span>Print KOT to Kitchen</span>
+            </label>
+
+            <button
+              type="button"
+              onClick={printBill}
+              style={{
+                background: "transparent",
+                border: "none",
+                color: "#2563eb",
+                fontWeight: 700,
+                cursor: "pointer",
+                padding: "2px 6px",
+                textDecoration: "underline",
+              }}
+            >
+              Print Bill
+            </button>
+          </div>
+        )}
 
       </section>
 
@@ -2340,185 +2340,35 @@ function printExistingBill(
   order: Order,
   restaurantName: string
 ): boolean {
-  const escapeHtml = (value: string) =>
-    value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
+  const settings = getLocalSettings();
+  return printCustomerBillReceipt({
+    restaurantName,
+    orderNumber: order.id,
+    table: order.table,
+    source: order.source,
+    paymentMode: order.payment,
+    items: order.items,
+    total: order.total,
+    timestamp: order.createdAt,
+    isReprint: true,
+    paperWidth: settings.paperWidth,
+  });
+}
 
-  const billWindow = window.open(
-    "",
-    "restaurant-reprint-bill",
-    "width=420,height=720"
-  );
-
-  if (!billWindow) {
-    alert("Allow pop-ups to reprint the bill.");
-    return false;
-  }
-
-  const itemRows = order.items
-    .map(
-      (item) => `
-        <tr>
-          <td>${escapeHtml(item.name)}<small>${item.qty} × ${money(item.price)}</small></td>
-          <td>${money(item.price * item.qty)}</td>
-        </tr>
-      `
-    )
-    .join("");
-
-  billWindow.document.write(`
-    <!doctype html>
-    <html>
-      <head>
-        <title>Reprint bill ${escapeHtml(order.id)}</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <style>
-  @page {
-    size: auto;
-    margin: 4mm 2mm;
-  }
-  * {
-    box-sizing: border-box;
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-  }
-  html, body {
-    margin: 0;
-    padding: 0;
-    background: #fff;
-    color: #000;
-    font-family: "Courier New", Courier, monospace, system-ui, -apple-system, sans-serif;
-    font-size: 12px;
-    line-height: 1.35;
-  }
-  .receipt {
-    width: 100%;
-    max-width: 80mm;
-    margin: 0 auto;
-    padding: 6px 4px;
-  }
-  header {
-    text-align: center;
-    border-bottom: 1px dashed #000;
-    padding-bottom: 6px;
-    margin-bottom: 6px;
-  }
-  h1 {
-    margin: 0 0 3px;
-    font-size: 16px;
-    font-weight: 900;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    word-break: break-word;
-  }
-  header p {
-    margin: 2px 0;
-    font-size: 11px;
-    color: #000;
-  }
-  .meta {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 6px;
-    margin: 6px 0;
-    padding-bottom: 5px;
-    border-bottom: 1px dashed #000;
-    font-size: 11px;
-    font-weight: 700;
-  }
-  .meta span {
-    word-break: break-word;
-  }
-  table {
-    width: 100%;
-    table-layout: fixed;
-    border-collapse: collapse;
-    margin: 4px 0;
-  }
-  td {
-    padding: 4px 0;
-    border-bottom: 1px dotted #bbb;
-    vertical-align: top;
-    font-size: 11.5px;
-  }
-  td:first-child {
-    width: 68%;
-    word-break: break-word;
-    padding-right: 4px;
-  }
-  td:last-child {
-    width: 32%;
-    text-align: right;
-    white-space: nowrap;
-    font-weight: 700;
-  }
-  small {
-    display: block;
-    color: #222;
-    margin-top: 2px;
-    font-size: 10px;
-    font-weight: normal;
-  }
-  .total {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 6px 0;
-    margin-top: 4px;
-    border-top: 2px solid #000;
-    border-bottom: 2px solid #000;
-    font-size: 14px;
-    font-weight: 900;
-  }
-  footer {
-    text-align: center;
-    margin-top: 10px;
-    padding-top: 4px;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-  @media print {
-    body {
-      padding: 0;
-    }
-    .receipt {
-      width: 100%;
-      max-width: 80mm;
-      padding: 0;
-    }
-  }
-</style>
-      </head>
-      <body>
-        <main class="receipt">
-          <header>
-            <h1>${escapeHtml(restaurantName || "Restaurant")}</h1>
-            <p>Reprinted bill · ${escapeHtml(order.id)}</p>
-            <p>${escapeHtml(order.createdAt ? new Date(order.createdAt).toLocaleString("en-IN") : "")}</p>
-          </header>
-          <div class="meta">
-            <span>${escapeHtml(order.source.replace(/_/g, " "))}</span>
-            <span>${order.table ? `Table ${escapeHtml(order.table)}` : ""}</span>
-          </div>
-          <table><tbody>${itemRows}</tbody></table>
-          <div class="total"><span>Total</span><span>${money(order.total)}</span></div>
-          <footer>Thank you for dining with us</footer>
-        </main>
-      </body>
-    </html>
-  `);
-  billWindow.document.close();
-  billWindow.focus();
-  billWindow.onafterprint = () => billWindow.close();
-  window.setTimeout(() => billWindow.print(), 250);
-
-  return true;
+function printExistingKot(
+  order: Order,
+  restaurantName: string
+): boolean {
+  const settings = getLocalSettings();
+  return printKitchenOrderTicket({
+    restaurantName,
+    orderNumber: order.id,
+    table: order.table,
+    source: order.source,
+    items: order.items,
+    timestamp: order.createdAt,
+    paperWidth: settings.paperWidth,
+  });
 }
 
 function TableView({
@@ -2802,7 +2652,7 @@ function TableView({
                 <div className="table-card-actions">
                   <button className="primary-btn" onClick={() => onAddOrder(table.tableNumber)}>
                     <Plus size={15} />
-                    Add Order
+                    {occupied ? "Add Items" : "Take Order"}
                   </button>
 
                   {occupied && (
@@ -2824,7 +2674,7 @@ function TableView({
                         disabled={isClosing}
                         onClick={() => handleCloseTable(table.tableNumber)}
                       >
-                        {isClosing ? "Closing..." : "Close Order"}
+                        {isClosing ? "Closing..." : "Close Table"}
                       </button>
                     </>
                   )}
@@ -3367,17 +3217,31 @@ function Orders({
 
                     </div>
 
-                    <button
-                      className="reprint-bill"
-                      onClick={() =>
-                        printExistingBill(
-                          o,
-                          restaurantName
-                        )
-                      }
-                    >
-                      Reprint Bill
-                    </button>
+                    <div style={{ display: "flex", gap: "8px" }}>
+                      <button
+                        className="reprint-bill"
+                        onClick={() =>
+                          printExistingBill(
+                            o,
+                            restaurantName
+                          )
+                        }
+                      >
+                        Reprint Bill
+                      </button>
+                      <button
+                        className="reprint-bill"
+                        style={{ background: "#0f172a", color: "#fff", border: "none" }}
+                        onClick={() =>
+                          printExistingKot(
+                            o,
+                            restaurantName
+                          )
+                        }
+                      >
+                        Print KOT
+                      </button>
+                    </div>
 
                   </div>
                 )}
@@ -3400,9 +3264,13 @@ function Orders({
 function Insights({
   orders,
   restaurantId,
+  restaurantName,
+  currentUserPhone,
 }: {
   orders: Order[];
   restaurantId: string;
+  restaurantName?: string;
+  currentUserPhone?: string;
 }) {
   const [historicalOrders, setHistoricalOrders] =
     useState<Order[]>([]);
@@ -4178,17 +4046,15 @@ function Insights({
     | "aov"
     | "items";
 
-  const categoryNames = [
-    "Mains",
-    "Starters",
-    "Beverages",
-    "Desserts",
-    "Sides & Add-ons",
-  ];
   const [categoryMetric, setCategoryMetric] =
     useState<CategoryMetric>("items");
+  // Categories are dynamic (whatever menu_items.category values show up in
+  // the data), so there's no fixed list to seed this with. It starts empty
+  // and the effect below auto-activates each category the first time it's
+  // seen, while preserving any manual on/off toggles after that.
   const [activeCategories, setActiveCategories] =
-    useState(() => new Set(categoryNames));
+    useState<Set<string>>(() => new Set());
+  const knownCategoryNames = useRef<Set<string>>(new Set());
 
   type CategoryDay = {
     dateKey: string;
@@ -4205,16 +4071,6 @@ function Insights({
     useState(false);
   const latestCategoryRequestId = useRef(0);
 
-  function categoryNameForItem(category: string) {
-    const normalized = normalizeCategory(category);
-
-    if (normalized === "Mains") return "Mains";
-    if (normalized === "Starters") return "Starters";
-    if (normalized === "Beverages") return "Beverages";
-    if (normalized === "Desserts") return "Desserts";
-    return "Sides & Add-ons";
-  }
-
   useEffect(() => {
     if (!restaurantId) return;
 
@@ -4224,68 +4080,38 @@ function Insights({
       setCategoryLoading(true);
 
       try {
-        const rows: any[] = [];
-        const pageSize = 500;
-        let cursor = analyticsRange.start.toISOString();
-        const endIso = analyticsRange.end.toISOString();
+        const { data, error } = await supabase.rpc(
+          "get_category_daily_breakdown",
+          {
+            p_restaurant_id: restaurantId,
+            p_start: analyticsRange.start.toISOString(),
+            p_end: analyticsRange.end.toISOString(),
+          }
+        );
 
-        while (true) {
-          const { data, error } = await supabase
-            .from("orders")
-            .select(ORDER_SELECT)
-            .eq("restaurant_id", restaurantId)
-            .gte("created_at", cursor)
-            .lt("created_at", endIso)
-            .neq("status", "CANCELLED")
-            .order("created_at", { ascending: true })
-            .limit(pageSize);
-
-          if (error) throw error;
-
-          rows.push(...(data || []));
-
-          if (!data || data.length < pageSize) break;
-
-          const lastCreatedAt = data[data.length - 1].created_at;
-          cursor = new Date(
-            new Date(lastCreatedAt).getTime() + 1
-          ).toISOString();
-
-          if (rows.length >= 50000) break;
-        }
+        if (error) throw error;
 
         const byDate = new Map<string, CategoryDay>();
 
-        rows.map(formatOrder).forEach((order) => {
-          const dateKey = new Date(order.createdAt)
-            .toISOString()
-            .split("T")[0];
+        (data || []).forEach((row: any) => {
+          const dateKey: string = row.order_date;
           const dateValue = new Date(`${dateKey}T00:00:00`);
-          const day = byDate.get(dateKey) || {
-            dateKey,
-            label: dateValue.toLocaleDateString("en-IN", {
-              day: "numeric",
-              month: "short",
-            }),
-            categories: Object.fromEntries(
-              categoryNames.map((name) => [
-                name,
-                { revenue: 0, orders: 0, items: 0 },
-              ])
-            ),
+          const day =
+            byDate.get(dateKey) || {
+              dateKey,
+              label: dateValue.toLocaleDateString("en-IN", {
+                day: "numeric",
+                month: "short",
+              }),
+              categories: {},
+            };
+
+          day.categories[row.category] = {
+            revenue: Number(row.revenue) || 0,
+            orders: Number(row.order_count) || 0,
+            items: Number(row.items_sold) || 0,
           };
-          const seen = new Set<string>();
 
-          order.items.forEach((item) => {
-            const category = categoryNameForItem(item.category);
-            day.categories[category].revenue += item.price * item.qty;
-            day.categories[category].items += item.qty;
-            seen.add(category);
-          });
-
-          seen.forEach((category) => {
-            day.categories[category].orders += 1;
-          });
           byDate.set(dateKey, day);
         });
 
@@ -4320,36 +4146,62 @@ function Insights({
   ]);
 
   const categoryData = useMemo(() => {
-    const sortedCategories = categoryNames.map((name) => {
-      const values = categoryDailyData.map((day) => {
-        const total = day.categories[name];
-        return categoryMetric === "revenue"
-          ? total.revenue
-          : categoryMetric === "orders"
-            ? total.orders
-            : categoryMetric === "aov"
-              ? total.orders
-                ? total.revenue / total.orders
-                : 0
-              : total.items;
-      });
+    const names = new Set<string>();
+    categoryDailyData.forEach((day) => {
+      Object.keys(day.categories).forEach((name) => names.add(name));
+    });
 
-      return {
-        name,
-        values,
-        labels: categoryDailyData.map((day) => day.label),
-        total: values.reduce((sum, value) => sum + value, 0),
-        revenueTotal: categoryDailyData.reduce(
-          (sum, day) => sum + day.categories[name].revenue,
-          0
-        ),
-      };
-    })
+    const zero = { revenue: 0, orders: 0, items: 0 };
+
+    const sortedCategories = Array.from(names)
+      .map((name) => {
+        const values = categoryDailyData.map((day) => {
+          const total = day.categories[name] || zero;
+          return categoryMetric === "revenue"
+            ? total.revenue
+            : categoryMetric === "orders"
+              ? total.orders
+              : categoryMetric === "aov"
+                ? total.orders
+                  ? total.revenue / total.orders
+                  : 0
+                : total.items;
+        });
+
+        return {
+          name,
+          values,
+          labels: categoryDailyData.map((day) => day.label),
+          total: values.reduce((sum, value) => sum + value, 0),
+          revenueTotal: categoryDailyData.reduce(
+            (sum, day) => sum + (day.categories[name]?.revenue || 0),
+            0
+          ),
+        };
+      })
       .filter((category) => category.revenueTotal > 0)
       .sort((a, b) => b.revenueTotal - a.revenueTotal);
 
     return sortedCategories;
   }, [categoryDailyData, categoryMetric]);
+
+  // Auto-activate any category the first time it's seen (including brand-new
+  // ones added to the menu later), without clobbering a user's manual
+  // on/off toggles for categories already known.
+  useEffect(() => {
+    const newlySeen = categoryData
+      .map((c) => c.name)
+      .filter((name) => !knownCategoryNames.current.has(name));
+
+    if (newlySeen.length === 0) return;
+
+    newlySeen.forEach((name) => knownCategoryNames.current.add(name));
+    setActiveCategories((current) => {
+      const next = new Set(current);
+      newlySeen.forEach((name) => next.add(name));
+      return next;
+    });
+  }, [categoryData]);
 
   const categoryMetricLabel = (metric: CategoryMetric) =>
     metric === "revenue"
@@ -6844,6 +6696,7 @@ export default function HomePage() {
       setProducts(
         formattedMenu
       );
+      cacheMenuItems(restaurantId, formattedMenu);
 
       const {
         data: rawTables,
@@ -6858,14 +6711,15 @@ export default function HomePage() {
         throw tablesError;
       }
 
-      setRestaurantTables(
-        (rawTables || []).map((table: any) => ({
-          id: String(table.id),
-          tableNumber: String(table.table_number),
-          capacity: Number(table.capacity) || 0,
-          isActive: table.is_active !== false,
-        }))
-      );
+      const formattedTables = (rawTables || []).map((table: any) => ({
+        id: String(table.id),
+        tableNumber: String(table.table_number),
+        capacity: Number(table.capacity) || 0,
+        isActive: table.is_active !== false,
+      }));
+
+      setRestaurantTables(formattedTables);
+      cacheTables(restaurantId, formattedTables);
 
       await loadTodayOrders(
         restaurantId
@@ -6876,10 +6730,22 @@ export default function HomePage() {
         err
       );
 
-      setDatabaseError(
-        err?.message ||
-          "Unknown database error."
-      );
+      // Offline fallback: load cached menu & tables if available
+      const cachedMenu = getCachedMenuItems(restaurantId);
+      if (cachedMenu && cachedMenu.length > 0) {
+        setProducts(cachedMenu);
+      }
+      const cachedTbls = getCachedTables(restaurantId);
+      if (cachedTbls && cachedTbls.length > 0) {
+        setRestaurantTables(cachedTbls);
+      }
+
+      if (!cachedMenu || cachedMenu.length === 0) {
+        setDatabaseError(
+          err?.message ||
+            "Could not connect to database. Check internet connection."
+        );
+      }
     } finally {
       setLoading(false);
     }
@@ -7155,6 +7021,13 @@ export default function HomePage() {
       subtitle:
         "Live table status and dine-in orders",
     },
+
+    reminders: {
+      title:
+        "Owner Reminders",
+      subtitle:
+        "Configure 2 daily triggers and manually send reports to restaurant owners",
+    },
   };
 
   return (
@@ -7234,6 +7107,26 @@ export default function HomePage() {
 
         </div>
 
+        {currentUser.role !== "SUPER_ADMIN" && (
+          <OfflineBanner
+            restaurantId={currentUser.restaurantId}
+            onOrderSynced={(tempId, realOrder) => {
+              setTodayOrders((current) =>
+                current.map((o) =>
+                  o.databaseId === tempId
+                    ? {
+                        ...o,
+                        databaseId: realOrder.id,
+                        id: realOrder.order_number,
+                      }
+                    : o
+                )
+              );
+              setRefreshKey((k) => k + 1);
+            }}
+          />
+        )}
+
         {currentUser.role ===
           "SUPER_ADMIN" &&
           tab ===
@@ -7253,6 +7146,17 @@ export default function HomePage() {
           tab ===
             "users" && (
             <UsersPanel
+              restaurants={
+                restaurants
+              }
+            />
+          )}
+
+        {currentUser.role ===
+          "SUPER_ADMIN" &&
+          tab ===
+            "reminders" && (
+            <SuperAdminRemindersPanel
               restaurants={
                 restaurants
               }
@@ -7347,6 +7251,12 @@ export default function HomePage() {
               restaurantId={
                 currentUser.restaurantId ||
                 ""
+              }
+              restaurantName={
+                currentUser.restaurantName
+              }
+              currentUserPhone={
+                currentUser.phone
               }
             />
           )}
