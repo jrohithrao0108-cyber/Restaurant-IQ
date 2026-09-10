@@ -28,21 +28,18 @@ function escapeHtml(value: string): string {
 
 export function printKitchenOrderTicket(options: KotPrintOptions): boolean {
   if (!options.items || options.items.length === 0) {
-    alert("No items to send to kitchen.");
+    console.warn("No items to send to kitchen.");
     return false;
   }
 
   const paperWidth = options.paperWidth || "80mm";
   const is58mm = paperWidth === "58mm";
 
-  const printWindow = window.open(
-    "",
-    "restaurant-kot",
-    "width=420,height=600"
-  );
+  const winName = `kot_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const printWindow = window.open("", winName, "width=420,height=600");
 
   if (!printWindow) {
-    alert("Please allow pop-ups to print the Kitchen Order Ticket (KOT).");
+    console.warn("Pop-up blocked for printing KOT.");
     return false;
   }
 
@@ -65,7 +62,7 @@ export function printKitchenOrderTicket(options: KotPrintOptions): boolean {
 
   const isDineIn = options.source === "DINE_IN";
   const destinationBadge = isDineIn
-    ? `TABLE ${options.table?.trim() || "N/A"}`
+    ? (options.table?.trim() ? `TABLE ${options.table.trim()}` : "DINE-IN (NO TABLE)")
     : options.source.toUpperCase();
 
   const totalItemsCount = options.items.reduce(
@@ -248,12 +245,22 @@ export function printKitchenOrderTicket(options: KotPrintOptions): boolean {
     </html>
   `);
 
-  printWindow.document.close();
-  printWindow.focus();
-  printWindow.onafterprint = () => printWindow.close();
-  window.setTimeout(() => {
-    printWindow.print();
-  }, 250);
+  try {
+    printWindow.document.close();
+    printWindow.focus();
+    printWindow.onafterprint = () => {
+      try { printWindow.close(); } catch (e) {}
+    };
+    window.setTimeout(() => {
+      try {
+        printWindow.print();
+      } catch (e) {
+        console.warn("Print KOT dialog error:", e);
+      }
+    }, 250);
+  } catch (err) {
+    console.error("Failed to print KOT:", err);
+  }
 
   return true;
 }

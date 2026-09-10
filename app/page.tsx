@@ -13,6 +13,7 @@ import {
   LogOut,
   Menu as MenuIcon,
   Plus,
+  RefreshCw,
   Search,
   ShoppingBag,
   Store,
@@ -38,7 +39,17 @@ import {
   YAxis,
 } from "recharts";
 
-import { supabase } from "@/lib/supabase";
+import { supabase, isSupabaseConfigured } from "@/lib/supabase";
+import {
+  DEMO_PRODUCTS,
+  DEMO_TABLES,
+  DEMO_RESTAURANTS,
+  DEMO_TODAY_ORDERS,
+  getDemoHistoricalOrders,
+  getDemoDayWiseTrend,
+  getDemoHourlyBuckets,
+  getDemoCategoryDailyBreakdown,
+} from "@/lib/demoData";
 import { printKitchenOrderTicket } from "@/lib/printing/kotPrinter";
 import { printCustomerBillReceipt } from "@/lib/printing/receiptPrinter";
 import {
@@ -53,7 +64,8 @@ import {
 import { OfflineBanner } from "@/components/OfflineBanner";
 import { WhatsAppDigestModal } from "@/components/WhatsAppDigestModal";
 import { SuperAdminRemindersPanel } from "@/components/SuperAdminRemindersPanel";
-
+import { RestaurantPOS } from "@/components/RestaurantPOS";
+import { ModernLogin } from "@/components/ModernLogin";
 /* =========================================================
    TYPES
 ========================================================= */
@@ -107,6 +119,7 @@ type Order = {
   payment: string;
   createdAt: string;
   closedAt?: string | null;
+  status?: string;
 };
 
 type RestaurantRow = {
@@ -847,9 +860,24 @@ function Sidebar({
             </a>
 
           </nav>
+        ) : user.role === "ADMIN" ? (
+          <nav>
+            <a
+              className={
+                tab === "insights"
+                  ? "active"
+                  : ""
+              }
+              onClick={() =>
+                go("insights")
+              }
+            >
+              <TrendingUp size={18} />
+              Analytics & Insights
+            </a>
+          </nav>
         ) : (
           <nav>
-
             <a
               className={
                 tab === "new"
@@ -861,55 +889,8 @@ function Sidebar({
               }
             >
               <Plus size={18} />
-              New order
+              POS Terminal
             </a>
-
-            <a
-              className={
-                tab === "tables"
-                  ? "active"
-                  : ""
-              }
-              onClick={() =>
-                go("tables")
-              }
-            >
-              <Calendar size={18} />
-              Table View
-            </a>
-
-            <a
-              className={
-                tab === "orders"
-                  ? "active"
-                  : ""
-              }
-              onClick={() =>
-                go("orders")
-              }
-            >
-              <ShoppingBag size={18} />
-              Orders
-            </a>
-
-            {user.role ===
-              "ADMIN" && (
-              <a
-                className={
-                  tab ===
-                  "insights"
-                    ? "active"
-                    : ""
-                }
-                onClick={() =>
-                  go("insights")
-                }
-              >
-                <Brain size={18} />
-                Analytics
-              </a>
-            )}
-
           </nav>
         )}
 
@@ -943,41 +924,99 @@ function Sidebar({
 function Header({
   user,
   onMenu,
+  onRefresh,
+  lastUpdated,
+  isRefreshing,
+  tab,
 }: {
   user: CurrentUser;
   onMenu: () => void;
+  onRefresh?: () => void;
+  lastUpdated?: string;
+  isRefreshing?: boolean;
+  tab?: Tab;
 }) {
+  if (user.role === "ADMIN") {
+    const today = new Date();
+    const dateFormatted = today.toLocaleDateString("en-IN", {
+      weekday: "short",
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    });
+
+    const greetingTime = timeGreeting();
+    const formattedGreeting =
+      greetingTime.charAt(0).toUpperCase() + greetingTime.slice(1);
+
+    const headingText =
+      user.name.toLowerCase().includes("rohith") ||
+      user.restaurantName.toLowerCase().includes("shubham") ||
+      user.name.toLowerCase().includes("rajesh")
+        ? `Good ${formattedGreeting} Rohith, Shubham Today's Performance 👋`
+        : `Good ${formattedGreeting} ${firstName(user.name)}, ${user.restaurantName} Today's Performance 👋`;
+
+    return (
+      <header className="admin-unified-header">
+        <button className="hamb" onClick={onMenu}>
+          <MenuIcon />
+        </button>
+
+        <div className="admin-header-title-box">
+          <h1>{headingText}</h1>
+        </div>
+
+        <div className="admin-header-meta-group">
+          <div className="header-meta-chip">
+            <Calendar size={13} />
+            <span>{dateFormatted}</span>
+          </div>
+
+          <div className="header-meta-chip live">
+            <span className="pulsing-live-dot" />
+            <span>{lastUpdated ? `Live as of ${lastUpdated}` : "Live updated"}</span>
+          </div>
+
+          {onRefresh && (
+            <button
+              type="button"
+              className="header-refresh-action"
+              onClick={onRefresh}
+              title="Refresh live data"
+              disabled={isRefreshing}
+            >
+              <RefreshCw
+                size={13}
+                className={isRefreshing ? "spin-icon" : ""}
+              />
+              <span>{isRefreshing ? "Refreshing..." : "Refresh Data"}</span>
+            </button>
+          )}
+
+          <div className="profile">{initials(user.name)}</div>
+        </div>
+      </header>
+    );
+  }
+
   return (
     <header>
-
-      <button
-        className="hamb"
-        onClick={onMenu}
-      >
+      <button className="hamb" onClick={onMenu}>
         <MenuIcon />
       </button>
 
       <div>
-
         <h1>
-          Good{" "}
-          {timeGreeting()},{" "}
-          {firstName(user.name)} 👋
+          Good {timeGreeting()}, {firstName(user.name)} 👋
         </h1>
-
         <p>
-          {user.role ===
-          "SUPER_ADMIN"
+          {user.role === "SUPER_ADMIN"
             ? "Platform overview"
             : `${user.restaurantName} · Live database`}
         </p>
-
       </div>
 
-      <div className="profile">
-        {initials(user.name)}
-      </div>
-
+      <div className="profile">{initials(user.name)}</div>
     </header>
   );
 }
@@ -1379,11 +1418,6 @@ function NewOrder({
       return;
     }
 
-    if (source === "DINE_IN" && !table.trim()) {
-      alert("Enter a table number.");
-      return;
-    }
-
     if (!restaurantId) {
       alert("Restaurant is not mapped.");
       return;
@@ -1392,7 +1426,7 @@ function NewOrder({
     placingOrderRef.current = true;
     setSaving(true);
 
-    const cleanTable = table.trim();
+    const cleanTable = table ? table.trim() : null;
     const settings = getLocalSettings();
     const willPrintKot = shouldPrintKot ?? settings.autoPrintKot;
 
@@ -1483,7 +1517,7 @@ function NewOrder({
       let existingTotal = 0;
 
       // 1. Check for an open dine-in order on this table
-      if (source === "DINE_IN") {
+      if (source === "DINE_IN" && cleanTable) {
         const { data: existingOpenOrder, error: fetchError } = await supabase
           .from("orders")
           .select("id, order_number, total")
@@ -3271,6 +3305,29 @@ const globalAnalyticsCache: {
   hourlyRangeKey?: string;
 } = {};
 
+function computeLinearTrend(values: number[]): number[] {
+  const n = values.length;
+  if (n === 0) return [];
+  if (n === 1) return [values[0]];
+
+  const xMean = (n - 1) / 2;
+  const yMean = values.reduce((sum, v) => sum + v, 0) / n;
+
+  let xVariance = 0;
+  let covariance = 0;
+
+  for (let i = 0; i < n; i++) {
+    const xDiff = i - xMean;
+    xVariance += xDiff * xDiff;
+    covariance += xDiff * (values[i] - yMean);
+  }
+
+  const slope = xVariance > 0 ? covariance / xVariance : 0;
+  const intercept = yMean - slope * xMean;
+
+  return values.map((_, i) => Math.max(0, Math.round(slope * i + intercept)));
+}
+
 function Insights({
   orders,
   restaurantId,
@@ -3361,7 +3418,13 @@ function Insights({
     >(null);
 
   useEffect(() => {
-    if (!restaurantId) return;
+    if (
+      !restaurantId ||
+      !isSupabaseConfigured ||
+      restaurantId === "demo-restaurant-1"
+    ) {
+      return;
+    }
 
     const channel = supabase
       .channel(
@@ -3407,6 +3470,16 @@ function Insights({
 
   async function loadHistoricalData() {
     const requestId = ++latestRequestId.current;
+
+    if (!isSupabaseConfigured || restaurantId === "demo-restaurant-1") {
+      const demoOrders = getDemoHistoricalOrders();
+      globalAnalyticsCache.restaurantId = restaurantId;
+      globalAnalyticsCache.historicalOrders = demoOrders;
+      globalAnalyticsCache.historicalTimestamp = Date.now();
+      setHistoricalOrders(demoOrders);
+      setLoading(false);
+      return;
+    }
 
     // Use cached data immediately if available
     const hasCache =
@@ -3852,6 +3925,284 @@ function Insights({
         isToday: boolean;
       }>
     >(() => globalAnalyticsCache.dayWiseRows || []);
+
+  const [trendViewMode, setTrendViewMode] =
+    useState<"continuous" | "weekday">("continuous");
+
+  // Continuous trend data with 3-week same-weekday MTD moving baseline
+  const continuousTrendWithMtd = useMemo(() => {
+    return dayWiseTrendData.map((item, index) => {
+      const priorSameWeekdays = dayWiseTrendData
+        .slice(0, index)
+        .filter((d) => d.weekday === item.weekday);
+      const last3 = priorSameWeekdays.slice(-3);
+
+      let mtdBaselineVal = 0;
+      if (last3.length > 0) {
+        const sum = last3.reduce((acc, cur) => {
+          const val =
+            dayWiseMetric === "revenue"
+              ? cur.revenue
+              : dayWiseMetric === "orderCount"
+                ? cur.orderCount
+                : cur.aov;
+          return acc + val;
+        }, 0);
+        mtdBaselineVal = Math.round(sum / last3.length);
+      } else {
+        const val =
+          dayWiseMetric === "revenue"
+            ? item.revenue
+            : dayWiseMetric === "orderCount"
+              ? item.orderCount
+              : item.aov;
+        mtdBaselineVal = Math.round(val * 0.94);
+      }
+
+      return {
+        ...item,
+        mtdBaseline: mtdBaselineVal,
+      };
+    });
+  }, [dayWiseTrendData, dayWiseMetric]);
+
+  // Aggregated data by weekday (Monday to Sunday)
+  const weekdayAggregatedData = useMemo(() => {
+    const days = [
+      { dayIdx: 1, name: "Mon" },
+      { dayIdx: 2, name: "Tue" },
+      { dayIdx: 3, name: "Wed" },
+      { dayIdx: 4, name: "Thu" },
+      { dayIdx: 5, name: "Fri" },
+      { dayIdx: 6, name: "Sat" },
+      { dayIdx: 0, name: "Sun" },
+    ];
+
+    return days.map(({ dayIdx, name }) => {
+      const match = dayWiseTrendData.filter((d) => d.weekday === dayIdx);
+      const count = match.length || 1;
+      const totRev = match.reduce((s, d) => s + (d.revenue || 0), 0);
+      const totOrders = match.reduce((s, d) => s + (d.orderCount || 0), 0);
+      const avgRev = Math.round(totRev / count);
+      const avgOrders = Math.round(totOrders / count);
+      const avgAov = avgOrders > 0 ? Math.round(avgRev / avgOrders) : 0;
+
+      const curMetricVal =
+        dayWiseMetric === "revenue"
+          ? avgRev
+          : dayWiseMetric === "orderCount"
+            ? avgOrders
+            : avgAov;
+
+      const last3Match = match.slice(-3);
+      const mtdVal =
+        last3Match.length > 0
+          ? Math.round(
+              last3Match.reduce((s, d) => {
+                const val =
+                  dayWiseMetric === "revenue"
+                    ? d.revenue
+                    : dayWiseMetric === "orderCount"
+                      ? d.orderCount
+                      : d.aov;
+                return s + val;
+              }, 0) / last3Match.length
+            )
+          : curMetricVal;
+
+      return {
+        dateKey: `weekday-${dayIdx}`,
+        label: name,
+        fullLabel: `${name} (${match.length} occurrences avg)`,
+        weekday: dayIdx,
+        revenue: avgRev,
+        orderCount: avgOrders,
+        aov: avgAov,
+        mtdBaseline: mtdVal,
+        isToday: dayIdx === currentDayOfWeek,
+      };
+    });
+  }, [dayWiseTrendData, dayWiseMetric, currentDayOfWeek]);
+
+  const displayTrendChartData = continuousTrendWithMtd;
+
+  const [selectedWeekdayFilter, setSelectedWeekdayFilter] = useState<number>(() => currentDayOfWeek);
+
+  const WEEKDAYS_LIST = [
+    { dayIdx: 1, name: "Mon", fullName: "Monday" },
+    { dayIdx: 2, name: "Tue", fullName: "Tuesday" },
+    { dayIdx: 3, name: "Wed", fullName: "Wednesday" },
+    { dayIdx: 4, name: "Thu", fullName: "Thursday" },
+    { dayIdx: 5, name: "Fri", fullName: "Friday" },
+    { dayIdx: 6, name: "Sat", fullName: "Saturday" },
+    { dayIdx: 0, name: "Sun", fullName: "Sunday" },
+  ];
+
+  const selectedWeekdayObj =
+    WEEKDAYS_LIST.find((w) => w.dayIdx === selectedWeekdayFilter) ||
+    WEEKDAYS_LIST[3];
+  const selectedWeekdayName = selectedWeekdayObj.fullName;
+
+  // 7-Week Same Day Data: Both Same-Time Cutoff and Full-Day
+  const sevenWeeksSameDayData = useMemo(() => {
+    const result: Array<{
+      date: Date;
+      dateKey: string;
+      label: string;
+      relativeLabel: string;
+      isToday: boolean;
+      sameTimeValue: number;
+      fullDayValue: number;
+      projectedRemaining: number;
+      projectedTotal: number;
+      isLaggingSameTime: boolean;
+      pctDiffVsLwSameTime: number;
+      sameTimeTrend: number;
+      fullDayTrend: number;
+    }> = [];
+
+    const d = new Date(today);
+    const diff = (today.getDay() - selectedWeekdayFilter + 7) % 7;
+    d.setDate(d.getDate() - diff);
+    d.setHours(0, 0, 0, 0);
+
+    const relativeLabels = [
+      "6 Wks Ago",
+      "5 Wks Ago",
+      "4 Wks Ago",
+      "3 Wks Ago",
+      "2 Wks Ago",
+      "Last Week",
+      "Today",
+    ];
+
+    // Compute projection ratio from Last Week's same weekday
+    const lastWkDate = new Date(d);
+    lastWkDate.setDate(lastWkDate.getDate() - 7);
+    const lwSameTimeOrders = getOrdersByDate(lastWkDate, historicalOrders, nowMsIntoDay);
+    const lwFullOrders = getOrdersByDate(lastWkDate, historicalOrders);
+    const lwSameTimeMetrics = calculateMetrics(lwSameTimeOrders);
+    const lwFullMetrics = calculateMetrics(lwFullOrders);
+
+    const lwSameTimeRev = lwSameTimeMetrics.revenue;
+    const lwFullRev = lwFullMetrics.revenue;
+    const revShare = lwFullRev > 0 ? lwSameTimeRev / lwFullRev : 0.55;
+
+    const lwSameTimeCnt = lwSameTimeMetrics.count;
+    const lwFullCnt = lwFullMetrics.count;
+    const cntShare = lwFullCnt > 0 ? lwSameTimeCnt / lwFullCnt : 0.55;
+
+    for (let i = 6; i >= 0; i--) {
+      const targetDate = new Date(d);
+      targetDate.setDate(d.getDate() - i * 7);
+      const isDayToday = targetDate.toDateString() === today.toDateString();
+      const dateFormatted = targetDate.toLocaleDateString("en-IN", {
+        day: "numeric",
+        month: "short",
+      });
+
+      let sameTimeVal = 0;
+      let fullDayVal = 0;
+      let projRemaining = 0;
+      let projTotal = 0;
+
+      if (isDayToday) {
+        sameTimeVal =
+          dayWiseMetric === "revenue"
+            ? todayMetrics.revenue
+            : dayWiseMetric === "orderCount"
+              ? todayMetrics.count
+              : todayMetrics.aov;
+
+        if (dayWiseMetric === "revenue") {
+          projTotal =
+            revShare > 0.1 && revShare < 0.95
+              ? Math.round(todayMetrics.revenue / revShare)
+              : Math.round(todayMetrics.revenue * 1.5);
+          projRemaining = Math.max(0, projTotal - sameTimeVal);
+        } else if (dayWiseMetric === "orderCount") {
+          projTotal =
+            cntShare > 0.1 && cntShare < 0.95
+              ? Math.round(todayMetrics.count / cntShare)
+              : Math.round(todayMetrics.count * 1.5);
+          projRemaining = Math.max(0, projTotal - sameTimeVal);
+        } else {
+          projTotal = todayMetrics.aov;
+          projRemaining = 0;
+        }
+        fullDayVal = sameTimeVal;
+      } else {
+        const sameTimeOrders = getOrdersByDate(targetDate, historicalOrders, nowMsIntoDay);
+        const fullOrders = getOrdersByDate(targetDate, historicalOrders);
+        const sameTimeM = calculateMetrics(sameTimeOrders);
+        const fullM = calculateMetrics(fullOrders);
+
+        sameTimeVal =
+          dayWiseMetric === "revenue"
+            ? sameTimeM.revenue
+            : dayWiseMetric === "orderCount"
+              ? sameTimeM.count
+              : sameTimeM.aov;
+
+        fullDayVal =
+          dayWiseMetric === "revenue"
+            ? fullM.revenue
+            : dayWiseMetric === "orderCount"
+              ? fullM.count
+              : fullM.aov;
+
+        projTotal = fullDayVal;
+        projRemaining = 0;
+      }
+
+      result.push({
+        date: targetDate,
+        dateKey: `7wk-${targetDate.toISOString().slice(0, 10)}`,
+        label: isDayToday ? `Today (${dateFormatted})` : dateFormatted,
+        relativeLabel: isDayToday ? "Today" : relativeLabels[6 - i],
+        isToday: isDayToday,
+        sameTimeValue: sameTimeVal,
+        fullDayValue: fullDayVal,
+        projectedRemaining: projRemaining,
+        projectedTotal: projTotal,
+        isLaggingSameTime: false,
+        pctDiffVsLwSameTime: 0,
+        sameTimeTrend: 0,
+        fullDayTrend: 0,
+      });
+    }
+
+    // Compare index 6 (Today / latest) with index 5 (Last Week)
+    const latestItem = result[6];
+    const lwItem = result[5];
+    if (latestItem && lwItem && lwItem.sameTimeValue > 0) {
+      latestItem.isLaggingSameTime = latestItem.sameTimeValue < lwItem.sameTimeValue;
+      latestItem.pctDiffVsLwSameTime = Math.round(
+        ((latestItem.sameTimeValue - lwItem.sameTimeValue) / lwItem.sameTimeValue) * 100
+      );
+    }
+
+    // Power BI-style Linear Regression Trend Lines
+    const stTrends = computeLinearTrend(result.map((d) => d.sameTimeValue));
+    const fdTrends = computeLinearTrend(result.map((d) => d.projectedTotal));
+
+    result.forEach((item, i) => {
+      item.sameTimeTrend = stTrends[i] ?? item.sameTimeValue;
+      item.fullDayTrend = fdTrends[i] ?? item.projectedTotal;
+    });
+
+    return result;
+  }, [
+    today,
+    selectedWeekdayFilter,
+    historicalOrders,
+    todayMetrics,
+    nowMsIntoDay,
+    dayWiseMetric,
+  ]);
+
+  const latestWeekItem = sevenWeeksSameDayData[6];
+
   const [dayWiseLoading, setDayWiseLoading] =
     useState(() => !(globalAnalyticsCache.dayWiseRows && globalAnalyticsCache.dayWiseRows.length > 0));
   const latestDayWiseRequestId = useRef(0);
@@ -3862,6 +4213,15 @@ function Insights({
     const rangeKey = `${restaurantId}_${analyticsRange.start.toISOString()}_${analyticsRange.end.toISOString()}`;
     const requestId =
       ++latestDayWiseRequestId.current;
+
+    if (!isSupabaseConfigured || restaurantId === "demo-restaurant-1") {
+      const demoTrend = getDemoDayWiseTrend(analyticsRange.start, analyticsRange.end);
+      globalAnalyticsCache.dayWiseRows = demoTrend;
+      globalAnalyticsCache.dayWiseRangeKey = rangeKey;
+      setDayWiseTrendData(demoTrend);
+      setDayWiseLoading(false);
+      return;
+    }
 
     if (globalAnalyticsCache.dayWiseRows && globalAnalyticsCache.dayWiseRangeKey === rangeKey) {
       setDayWiseTrendData(globalAnalyticsCache.dayWiseRows);
@@ -4022,6 +4382,15 @@ function Insights({
     const requestId =
       ++latestHourlyBucketRequestId.current;
 
+    if (!isSupabaseConfigured || restaurantId === "demo-restaurant-1") {
+      const demoBuckets = getDemoHourlyBuckets();
+      globalAnalyticsCache.hourlyBuckets = demoBuckets;
+      globalAnalyticsCache.hourlyRangeKey = rangeKey;
+      setHourlyBucketData(demoBuckets);
+      setHourlyBucketLoading(false);
+      return;
+    }
+
     if (globalAnalyticsCache.hourlyBuckets && globalAnalyticsCache.hourlyRangeKey === rangeKey) {
       setHourlyBucketData(globalAnalyticsCache.hourlyBuckets);
       setHourlyBucketLoading(false);
@@ -4109,6 +4478,8 @@ function Insights({
 
   const [categoryMetric, setCategoryMetric] =
     useState<CategoryMetric>("items");
+  const [categoryViewMode, setCategoryViewMode] =
+    useState<"daily" | "weekday">("daily");
   // Categories are dynamic (whatever menu_items.category values show up in
   // the data), so there's no fixed list to seed this with. It starts empty
   // and the effect below auto-activates each category the first time it's
@@ -4140,13 +4511,33 @@ function Insights({
     async function loadCategoryHistory() {
       setCategoryLoading(true);
 
+      const lookbackDays = 60;
+      const historyStart = new Date();
+      historyStart.setHours(0, 0, 0, 0);
+      historyStart.setDate(historyStart.getDate() - lookbackDays);
+
+      const fetchStart = new Date(Math.min(analyticsRange.start.getTime(), historyStart.getTime()));
+      const fetchEnd = new Date(Math.max(analyticsRange.end.getTime(), Date.now() + 86400000));
+
+      if (!isSupabaseConfigured || restaurantId === "demo-restaurant-1") {
+        const demoCat = getDemoCategoryDailyBreakdown(
+          fetchStart,
+          fetchEnd
+        );
+        if (requestId === latestCategoryRequestId.current) {
+          setCategoryDailyData(demoCat);
+          setCategoryLoading(false);
+        }
+        return;
+      }
+
       try {
         const { data, error } = await supabase.rpc(
           "get_category_daily_breakdown",
           {
             p_restaurant_id: restaurantId,
-            p_start: analyticsRange.start.toISOString(),
-            p_end: analyticsRange.end.toISOString(),
+            p_start: fetchStart.toISOString(),
+            p_end: fetchEnd.toISOString(),
           }
         );
 
@@ -4211,12 +4602,43 @@ function Insights({
     categoryDailyData.forEach((day) => {
       Object.keys(day.categories).forEach((name) => names.add(name));
     });
+    // Include categories from today's live orders
+    orders.forEach((o) => {
+      (o.items || []).forEach((it) => {
+        if (it.category) names.add(it.category);
+      });
+    });
 
     const zero = { revenue: 0, orders: 0, items: 0 };
 
+    // Real-time live sales for each category today
+    const todayCategoryMap = new Map<string, { revenue: number; orders: number; items: number }>();
+    orders.forEach((o) => {
+      const seenCatsInOrder = new Set<string>();
+      (o.items || []).forEach((it) => {
+        const cat = it.category || "Other";
+        const cur = todayCategoryMap.get(cat) || { revenue: 0, orders: 0, items: 0 };
+        cur.revenue += (it.price || 0) * (it.qty || 0);
+        cur.items += (it.qty || 0);
+        todayCategoryMap.set(cat, cur);
+        seenCatsInOrder.add(cat);
+      });
+      seenCatsInOrder.forEach((cat) => {
+        const cur = todayCategoryMap.get(cat)!;
+        cur.orders += 1;
+      });
+    });
+
+    const startIsoStr = analyticsRange.start.toISOString().split("T")[0];
+    const endIsoStr = analyticsRange.end.toISOString().split("T")[0];
+    const dailyFilteredDays = categoryDailyData.filter(
+      (day) => day.dateKey >= startIsoStr && day.dateKey <= endIsoStr
+    );
+
     const sortedCategories = Array.from(names)
       .map((name) => {
-        const values = categoryDailyData.map((day) => {
+        // Daily timeline values
+        const values = dailyFilteredDays.map((day) => {
           const total = day.categories[name] || zero;
           return categoryMetric === "revenue"
             ? total.revenue
@@ -4224,27 +4646,118 @@ function Insights({
               ? total.orders
               : categoryMetric === "aov"
                 ? total.orders
-                  ? total.revenue / total.orders
+                  ? Math.round(total.revenue / total.orders)
                   : 0
                 : total.items;
         });
 
+        // 7-Week Same Day at Same Time values (apples-to-apples comparison)
+        const sameTime7WkValues = sevenWeeksSameDayData.map((wk, idx) => {
+          let catVal = 0;
+          let catFullVal = 0;
+
+          if (wk.isToday) {
+            const todayStats = todayCategoryMap.get(name) || zero;
+            catVal =
+              categoryMetric === "revenue"
+                ? todayStats.revenue
+                : categoryMetric === "orders"
+                  ? todayStats.orders
+                  : categoryMetric === "aov"
+                    ? (todayStats.orders ? Math.round(todayStats.revenue / todayStats.orders) : 0)
+                    : todayStats.items;
+            catFullVal = catVal;
+          } else {
+            const targetDateStr = wk.date.toISOString().split("T")[0];
+            const dayRecord = categoryDailyData.find((d) => d.dateKey === targetDateStr);
+            const catStats = dayRecord?.categories[name] || zero;
+
+            const fullCatRev = catStats.revenue;
+            const fullCatOrders = catStats.orders;
+            const fullCatItems = catStats.items;
+
+            const timeRatio =
+              wk.fullDayValue > 0
+                ? Math.min(1, Math.max(0, wk.sameTimeValue / wk.fullDayValue))
+                : Math.min(1, Math.max(0.1, nowMsIntoDay / 86400000));
+
+            if (categoryMetric === "revenue") {
+              catVal = Math.round(fullCatRev * timeRatio);
+              catFullVal = fullCatRev;
+            } else if (categoryMetric === "orders") {
+              catVal = Math.max(0, Math.round(fullCatOrders * timeRatio));
+              catFullVal = fullCatOrders;
+            } else if (categoryMetric === "aov") {
+              const sameOrders = Math.max(0, Math.round(fullCatOrders * timeRatio));
+              const sameRev = Math.round(fullCatRev * timeRatio);
+              catVal = sameOrders > 0 ? Math.round(sameRev / sameOrders) : (fullCatOrders > 0 ? Math.round(fullCatRev / fullCatOrders) : 0);
+              catFullVal = fullCatOrders > 0 ? Math.round(fullCatRev / fullCatOrders) : 0;
+            } else {
+              catVal = Math.max(0, Math.round(fullCatItems * timeRatio));
+              catFullVal = fullCatItems;
+            }
+          }
+
+          const shortLabels = ["6 Wks", "5 Wks", "4 Wks", "3 Wks", "2 Wks", "Last Wk", "Today"];
+          const shortLabel = wk.isToday ? "Today" : shortLabels[idx] || wk.relativeLabel;
+
+          return {
+            label: shortLabel,
+            fullLabel: `${wk.label} (${shortLabel})`,
+            dateKey: wk.dateKey,
+            value: catVal,
+            fullDayValue: catFullVal,
+            isToday: wk.isToday,
+          };
+        });
+
+        // Compute Power BI style linear trend across the 7 same-time weeks
+        const catTrends = computeLinearTrend(sameTime7WkValues.map((v) => v.value));
+        sameTime7WkValues.forEach((v, i) => {
+          (v as any).trendLine = catTrends[i] ?? v.value;
+        });
+
+        const todayItem = sameTime7WkValues[6];
+        const lwItem = sameTime7WkValues[5];
+        const todayVal = todayItem?.value || 0;
+        const lwVal = lwItem?.value || 0;
+        const isLagging = lwVal > 0 ? todayVal < lwVal : false;
+        const pctDiffVsLw = lwVal > 0 ? Math.round(((todayVal - lwVal) / lwVal) * 100) : 0;
+        const sevenWkAvg = Math.round(
+          sameTime7WkValues.reduce((s, v) => s + v.value, 0) / Math.max(1, sameTime7WkValues.length)
+        );
+
         return {
           name,
           values,
-          labels: categoryDailyData.map((day) => day.label),
+          labels: dailyFilteredDays.map((day) => day.label),
           total: values.reduce((sum, value) => sum + value, 0),
-          revenueTotal: categoryDailyData.reduce(
-            (sum, day) => sum + (day.categories[name]?.revenue || 0),
-            0
-          ),
+          revenueTotal:
+            dailyFilteredDays.reduce(
+              (sum, day) => sum + (day.categories[name]?.revenue || 0),
+              0
+            ) + (todayCategoryMap.get(name)?.revenue || 0),
+          sameTime7WkValues,
+          todayVal,
+          lwVal,
+          isLagging,
+          pctDiffVsLw,
+          sevenWkAvg,
         };
       })
       .filter((category) => category.revenueTotal > 0)
       .sort((a, b) => b.revenueTotal - a.revenueTotal);
 
     return sortedCategories;
-  }, [categoryDailyData, categoryMetric]);
+  }, [
+    categoryDailyData,
+    orders,
+    categoryMetric,
+    analyticsRange.start.getTime(),
+    analyticsRange.end.getTime(),
+    sevenWeeksSameDayData,
+    nowMsIntoDay,
+  ]);
 
   // Auto-activate any category the first time it's seen (including brand-new
   // ones added to the menu later), without clobbering a user's manual
@@ -4365,22 +4878,6 @@ function Insights({
 
   return (
     <>
-      <div className="date-header">
-        <h2>{dateDisplay}</h2>
-        <span className="as-of-time">
-          As of{" "}
-          {today.toLocaleTimeString(
-            "en-IN",
-            {
-              hour: "numeric",
-              minute: "2-digit",
-            }
-          )}{" "}
-          — compared to last week same
-          day up to the same time
-        </span>
-      </div>
-
       <div className="kpis">
 
         <Kpi
@@ -4607,403 +5104,578 @@ function Insights({
         <div className="section-title">
           <div>
             <h2>
-              {dayWiseMetricLabel(
-                dayWiseMetric
-              )}{" "}
-              Trend
+              {trendViewMode === "continuous"
+                ? `${dayWiseMetricLabel(dayWiseMetric)} Trend`
+                : `Weekday Analysis · Last 7 Weeks (${selectedWeekdayName}s)`}
             </h2>
             <span>
               {dayWiseLoading
                 ? "Loading..."
-                : `${dayWiseTrendData.length} day(s) · ${dayOfWeek}s highlighted`}
+                : trendViewMode === "weekday"
+                  ? `Comparing ${selectedWeekdayName}s across the last 7 weeks (Same Time & Full Day)`
+                  : `${dayWiseTrendData.length} day(s) · ${dayOfWeek}s highlighted · MTD baseline`}
             </span>
           </div>
         </div>
 
-        <div className="metric-pills">
-          <button
-            className={
-              dayWiseMetric ===
-              "revenue"
-                ? "active"
-                : ""
-            }
-            onClick={() =>
-              setDayWiseMetric(
+        <div className="trend-view-controls">
+          <div className="trend-mode-toggle">
+            <button
+              type="button"
+              className={trendViewMode === "continuous" ? "active" : ""}
+              onClick={() => setTrendViewMode("continuous")}
+            >
+              <Calendar size={13} />
+              <span>Continuous Days</span>
+            </button>
+            <button
+              type="button"
+              className={trendViewMode === "weekday" ? "active" : ""}
+              onClick={() => setTrendViewMode("weekday")}
+            >
+              <TrendingUp size={13} />
+              <span>By Weekday (Last 7 Weeks)</span>
+            </button>
+          </div>
+
+          <div className="metric-pills" style={{ margin: 0 }}>
+            <button
+              className={
+                dayWiseMetric ===
                 "revenue"
-              )
-            }
-          >
-            Revenue
-          </button>
-          <button
-            className={
-              dayWiseMetric ===
-              "orderCount"
-                ? "active"
-                : ""
-            }
-            onClick={() =>
-              setDayWiseMetric(
+                  ? "active"
+                  : ""
+              }
+              onClick={() =>
+                setDayWiseMetric(
+                  "revenue"
+                )
+              }
+            >
+              Revenue
+            </button>
+            <button
+              className={
+                dayWiseMetric ===
                 "orderCount"
-              )
-            }
-          >
-            Orders
-          </button>
-          <button
-            className={
-              dayWiseMetric === "aov"
-                ? "active"
-                : ""
-            }
-            onClick={() =>
-              setDayWiseMetric("aov")
-            }
-          >
-            Avg Order Value
-          </button>
+                  ? "active"
+                  : ""
+              }
+              onClick={() =>
+                setDayWiseMetric(
+                  "orderCount"
+                )
+              }
+            >
+              Orders
+            </button>
+            <button
+              className={
+                dayWiseMetric === "aov"
+                  ? "active"
+                  : ""
+              }
+              onClick={() =>
+                setDayWiseMetric("aov")
+              }
+            >
+              Avg Order Value
+            </button>
+          </div>
         </div>
 
-        <div className="chart">
-          <ResponsiveContainer
-            width="100%"
-            height={300}
-          >
-            <BarChart
-              data={dayWiseTrendData}
-            >
-              <defs>
-                <linearGradient
-                  id={
-                    REVENUE_HIGHLIGHT_GRADIENT_ID
-                  }
-                  x1="0"
-                  y1="0"
-                  x2="0"
-                  y2="1"
-                >
-                  <stop
-                    offset="0%"
-                    stopColor="#fb923c"
-                  />
-                  <stop
-                    offset="100%"
-                    stopColor="#ea580c"
-                  />
-                </linearGradient>
-                <linearGradient
-                  id={
-                    REVENUE_MUTED_GRADIENT_ID
-                  }
-                  x1="0"
-                  y1="0"
-                  x2="0"
-                  y2="1"
-                >
-                  <stop
-                    offset="0%"
-                    stopColor="#c7d2fe"
-                  />
-                  <stop
-                    offset="100%"
-                    stopColor="#a5b4fc"
-                  />
-                </linearGradient>
-              </defs>
-              <CartesianGrid
-                strokeDasharray="3 3"
-                vertical={false}
-              />
-              <XAxis
-                dataKey="label"
-                fontSize={11}
-                interval={
-                  dayWiseTrendData.length >
-                  15
-                    ? Math.ceil(
-                        dayWiseTrendData.length /
-                          15
-                      )
-                    : 0
-                }
-              />
-              <YAxis
-                fontSize={12}
-              />
-              <Tooltip
-                formatter={(
-                  v: any
-                ) =>
-                  dayWiseValueFormatter(
-                    Number(v)
-                  )
-                }
-                labelFormatter={(
-                  label,
-                  payload
-                ) => {
-                  const weekday =
-                    payload?.[0]
-                      ?.payload
-                      ?.weekday;
-                  const dayName =
-                    typeof weekday ===
-                    "number"
-                      ? [
-                          "Sun",
-                          "Mon",
-                          "Tue",
-                          "Wed",
-                          "Thu",
-                          "Fri",
-                          "Sat",
-                        ][weekday]
-                      : "";
-                  return `${label} (${dayName})`;
-                }}
-              />
-              <Bar
-                dataKey={dayWiseMetric}
-                radius={[
-                  4, 4, 0, 0,
-                ]}
+        {trendViewMode === "continuous" ? (
+          <>
+            <div className="trend-chart-legend">
+              <span className="legend-item">
+                <span className="legend-bar-swatch" />
+                Daily Actual ({dayWiseMetricLabel(dayWiseMetric)})
+              </span>
+              <span className="legend-item">
+                <span className="legend-line-swatch" />
+                {dayWiseMetric === "orderCount"
+                  ? "3-Wk Same Day Avg Orders (MTD)"
+                  : "3-Wk Same Day Avg (MTD)"}
+              </span>
+            </div>
+
+            <div className="chart">
+              <ResponsiveContainer
+                width="100%"
+                height={300}
               >
-                {dayWiseTrendData.map(
-                  (entry) => {
-                    const isSelectedWeekday =
-                      entry.weekday ===
-                      highlightedTrendWeekday;
-                    return (
-                      <Cell
-                        key={
-                          entry.dateKey
-                        }
-                        fill={
-                          isSelectedWeekday
-                            ? `url(#${REVENUE_HIGHLIGHT_GRADIENT_ID})`
-                            : `url(#${REVENUE_MUTED_GRADIENT_ID})`
-                        }
-                        stroke={
-                          entry.isToday
-                            ? REVENUE_TODAY_STROKE
-                            : undefined
-                        }
-                        strokeWidth={
-                          entry.isToday
-                            ? 2
-                            : 0
-                        }
+                <ComposedChart
+                  data={displayTrendChartData}
+                >
+                  <defs>
+                    <linearGradient
+                      id={
+                        REVENUE_HIGHLIGHT_GRADIENT_ID
+                      }
+                      x1="0"
+                      y1="0"
+                      x2="0"
+                      y2="1"
+                    >
+                      <stop
+                        offset="0%"
+                        stopColor="#fb923c"
                       />
-                    );
-                  }
-                )}
-                <LabelList
-                  dataKey={
-                    dayWiseMetric
-                  }
-                  position="top"
-                  formatter={(
-                    v: any
-                  ) =>
-                    dayWiseValueFormatter(
-                      Number(v)
-                    )
-                  }
+                      <stop
+                        offset="100%"
+                        stopColor="#ea580c"
+                      />
+                    </linearGradient>
+                    <linearGradient
+                      id={
+                        REVENUE_MUTED_GRADIENT_ID
+                      }
+                      x1="0"
+                      y1="0"
+                      x2="0"
+                      y2="1"
+                    >
+                      <stop
+                        offset="0%"
+                        stopColor="#c7d2fe"
+                      />
+                      <stop
+                        offset="100%"
+                        stopColor="#a5b4fc"
+                      />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid
+                    strokeDasharray="3 3"
+                    vertical={false}
+                  />
+                  <XAxis
+                    dataKey="label"
+                    fontSize={11}
+                    interval={
+                      displayTrendChartData.length > 15
+                        ? Math.ceil(
+                            displayTrendChartData.length /
+                              15
+                          )
+                        : 0
+                    }
+                  />
+                  <YAxis
+                    fontSize={12}
+                  />
+                  <Tooltip
+                    formatter={(
+                      v: any,
+                      name: any
+                    ) => [
+                      dayWiseValueFormatter(
+                        Number(v)
+                      ),
+                      name === "mtdBaseline"
+                        ? (dayWiseMetric === "orderCount"
+                            ? "3-Wk Same Day Avg Orders (MTD)"
+                            : "3-Wk Same Day Avg (MTD)")
+                        : dayWiseMetricLabel(dayWiseMetric),
+                    ]}
+                    labelFormatter={(
+                      label,
+                      payload
+                    ) => {
+                      const entry = payload?.[0]?.payload;
+                      if (entry?.fullLabel) {
+                        return entry.fullLabel;
+                      }
+                      const weekday =
+                        entry?.weekday;
+                      const dayName =
+                        typeof weekday ===
+                        "number"
+                          ? [
+                              "Sun",
+                              "Mon",
+                              "Tue",
+                              "Wed",
+                              "Thu",
+                              "Fri",
+                              "Sat",
+                            ][weekday]
+                          : "";
+                      return `${label} (${dayName})`;
+                    }}
+                  />
+                  <Bar
+                    dataKey={dayWiseMetric}
+                    radius={[
+                      4, 4, 0, 0,
+                    ]}
+                  >
+                    {displayTrendChartData.map(
+                      (entry) => {
+                        const isSelectedWeekday =
+                          entry.weekday ===
+                          highlightedTrendWeekday;
+                        return (
+                          <Cell
+                            key={
+                              entry.dateKey
+                            }
+                            fill={
+                              isSelectedWeekday
+                                ? `url(#${REVENUE_HIGHLIGHT_GRADIENT_ID})`
+                                : `url(#${REVENUE_MUTED_GRADIENT_ID})`
+                            }
+                            stroke={
+                              entry.isToday
+                                ? REVENUE_TODAY_STROKE
+                                : undefined
+                            }
+                            strokeWidth={
+                              entry.isToday
+                                ? 2
+                                : 0
+                            }
+                          />
+                        );
+                      }
+                    )}
+                    <LabelList
+                      dataKey={
+                        dayWiseMetric
+                      }
+                      position="top"
+                      formatter={(
+                        v: any
+                      ) =>
+                        dayWiseValueFormatter(
+                          Number(v)
+                        )
+                      }
+                      style={{
+                        fontSize: 11,
+                        fontWeight: 600,
+                        fill: "#4b5563",
+                      }}
+                    />
+                  </Bar>
+                  <Line
+                    type="monotone"
+                    dataKey="mtdBaseline"
+                    stroke="#6366f1"
+                    strokeWidth={2.5}
+                    strokeDasharray="5 5"
+                    dot={{
+                      r: 3.5,
+                      fill: "#6366f1",
+                      strokeWidth: 0,
+                    }}
+                    activeDot={{ r: 6 }}
+                    name={
+                      dayWiseMetric === "orderCount"
+                        ? "3-Wk Same Day Avg Orders (MTD)"
+                        : "3-Wk Same Day Avg (MTD)"
+                    }
+                  />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="weekday-legend">
+              <span className="weekday-legend-item">
+                <span
+                  className="weekday-legend-swatch"
                   style={{
-                    fontSize: 11,
-                    fontWeight: 600,
-                    fill: "#4b5563",
+                    background:
+                      "linear-gradient(180deg, #fb923c, #ea580c)",
                   }}
                 />
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-
-        <div className="weekday-legend">
-          <span className="weekday-legend-item">
-            <span
-              className="weekday-legend-swatch"
-              style={{
-                background:
-                  "linear-gradient(180deg, #fb923c, #ea580c)",
-              }}
-            />
-            {highlightedTrendLabel}s (selected end-date weekday)
-          </span>
-          <span className="weekday-legend-item">
-            <span
-              className="weekday-legend-swatch"
-              style={{
-                background:
-                  "linear-gradient(180deg, #c7d2fe, #a5b4fc)",
-              }}
-            />
-            Other days
-          </span>
-        </div>
-
-      </div>
-
-      <div className="card">
-
-        <div className="section-title">
+                {highlightedTrendLabel}s (selected end-date weekday)
+              </span>
+              <span className="weekday-legend-item">
+                <span
+                  className="weekday-legend-swatch"
+                  style={{
+                    background:
+                      "linear-gradient(180deg, #c7d2fe, #a5b4fc)",
+                  }}
+                />
+                Other days
+              </span>
+            </div>
+          </>
+        ) : (
           <div>
-            <h2>
-              {hourlyBucketMetricLabel(
-                hourlyBucketMetric
-              )}{" "}
-              by Time of Day
-            </h2>
-            <span>
-              {hourlyBucketLoading
-                ? "Loading..."
-                : `2-hour buckets · ${analyticsRangeLabel()}`}
-            </span>
-          </div>
-        </div>
+            {/* Weekday Selector Bar */}
+            <div className="weekday-selector-bar">
+              <span className="weekday-selector-title">Select Day to Compare:</span>
+              {WEEKDAYS_LIST.map((w) => {
+                const isSelected = selectedWeekdayFilter === w.dayIdx;
+                const isDayToday = w.dayIdx === currentDayOfWeek;
+                return (
+                  <button
+                    key={w.dayIdx}
+                    type="button"
+                    className={`weekday-pill-btn ${isSelected ? "active" : ""}`}
+                    onClick={() => setSelectedWeekdayFilter(w.dayIdx)}
+                  >
+                    <span>{w.name}</span>
+                    {isDayToday && <span className="today-tag">Today</span>}
+                  </button>
+                );
+              })}
+            </div>
 
-        <div className="metric-pills">
-          <button
-            className={
-              hourlyBucketMetric ===
-              "revenue"
-                ? "active"
-                : ""
-            }
-            onClick={() =>
-              setHourlyBucketMetric(
-                "revenue"
-              )
-            }
-          >
-            Revenue
-          </button>
-          <button
-            className={
-              hourlyBucketMetric ===
-              "orderCount"
-                ? "active"
-                : ""
-            }
-            onClick={() =>
-              setHourlyBucketMetric(
-                "orderCount"
-              )
-            }
-          >
-            Orders
-          </button>
-          <button
-            className={
-              hourlyBucketMetric ===
-              "aov"
-                ? "active"
-                : ""
-            }
-            onClick={() =>
-              setHourlyBucketMetric(
-                "aov"
-              )
-            }
-          >
-            Avg Order Value
-          </button>
-          <button
-            className={
-              hourlyBucketMetric ===
-              "items"
-                ? "active"
-                : ""
-            }
-            onClick={() =>
-              setHourlyBucketMetric(
-                "items"
-              )
-            }
-          >
-            Items Sold
-          </button>
-        </div>
+            {/* Dual 7-Week Charts: Same Time & Full Day */}
+            <div className="weekday-dual-charts-grid">
+              {/* Chart 1: Same Day Same Time */}
+              <div className="weekday-chart-card">
+                <div className="weekday-chart-head">
+                  <div>
+                    <h3>Last 7 Weeks · Same Time ({selectedWeekdayName})</h3>
+                    <p>
+                      Apples-to-apples performance up to{" "}
+                      {today.toLocaleTimeString("en-IN", {
+                        hour: "numeric",
+                        minute: "2-digit",
+                      })}{" "}
+                      cutoff
+                    </p>
+                  </div>
+                  {latestWeekItem?.isToday && (
+                    <span
+                      className={`weekday-status-pill ${
+                        latestWeekItem.isLaggingSameTime ? "neg" : "pos"
+                      }`}
+                    >
+                      {latestWeekItem.isLaggingSameTime ? "▼" : "▲"}{" "}
+                      {Math.abs(latestWeekItem.pctDiffVsLwSameTime)}% vs Last Wk
+                    </span>
+                  )}
+                </div>
 
-        <div className="chart">
-          <ResponsiveContainer
-            width="100%"
-            height={300}
-          >
-            <BarChart
-              data={hourlyBucketData}
-            >
-              <defs>
-                <linearGradient
-                  id="hourlyBucketGradient"
-                  x1="0"
-                  y1="0"
-                  x2="0"
-                  y2="1"
+                <div style={{ height: 260 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart
+                      data={sevenWeeksSameDayData}
+                      margin={{ top: 16, right: 10, left: 0, bottom: 0 }}
+                    >
+                      <CartesianGrid
+                        strokeDasharray="3 3"
+                        vertical={false}
+                        stroke="#f1f5f9"
+                      />
+                      <XAxis dataKey="label" fontSize={10.5} tickLine={false} />
+                      <YAxis fontSize={11} tickLine={false} axisLine={false} />
+                      <Tooltip
+                        formatter={(val: any, name: any) => [
+                          dayWiseValueFormatter(Number(val)),
+                          name === "sameTimeTrend"
+                            ? "Trend line"
+                            : "Same-Time Actual",
+                        ]}
+                        labelFormatter={(label, payload) => {
+                          const item = payload?.[0]?.payload;
+                          return `${item?.relativeLabel || label} (${item?.label || ""})`;
+                        }}
+                      />
+                      <Bar dataKey="sameTimeValue" radius={[4, 4, 0, 0]}>
+                        {sevenWeeksSameDayData.map((entry, idx) => {
+                          let barColor = "#475569";
+                          if (entry.isToday) {
+                            barColor = entry.isLaggingSameTime
+                              ? "#ef4444"
+                              : "#10b981";
+                          } else if (idx === 5) {
+                            barColor = "#334155";
+                          }
+                          return <Cell key={entry.dateKey} fill={barColor} />;
+                        })}
+                        <LabelList
+                          dataKey="sameTimeValue"
+                          position="top"
+                          formatter={(v: any) =>
+                            dayWiseValueFormatter(Number(v))
+                          }
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 700,
+                            fill: "#475569",
+                          }}
+                        />
+                      </Bar>
+                      <Line
+                        type="linear"
+                        dataKey="sameTimeTrend"
+                        stroke="#f59e0b"
+                        strokeWidth={2.5}
+                        strokeDasharray="5 5"
+                        dot={false}
+                        name="Trend line"
+                      />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+
+                <div
+                  className="trend-chart-legend"
+                  style={{ marginTop: 10, marginBottom: 0 }}
                 >
-                  <stop
-                    offset="0%"
-                    stopColor="#818cf8"
-                  />
-                  <stop
-                    offset="100%"
-                    stopColor="#4f46e5"
-                  />
-                </linearGradient>
-              </defs>
-              <CartesianGrid
-                strokeDasharray="3 3"
-                vertical={false}
-              />
-              <XAxis
-                dataKey="label"
-                fontSize={11}
-              />
-              <YAxis
-                fontSize={12}
-              />
-              <Tooltip
-                formatter={(
-                  v: any
-                ) =>
-                  hourlyBucketValueFormatter(
-                    Number(v)
-                  )
-                }
-              />
-              <Bar
-                dataKey={
-                  hourlyBucketMetric
-                }
-                fill="url(#hourlyBucketGradient)"
-                radius={[
-                  6, 6, 0, 0,
-                ]}
-              >
-                <LabelList
-                  dataKey={
-                    hourlyBucketMetric
-                  }
-                  position="top"
-                  formatter={(
-                    v: any
-                  ) =>
-                    hourlyBucketValueFormatter(
-                      Number(v)
-                    )
-                  }
-                  style={{
-                    fontSize: 10,
-                    fontWeight: 600,
-                    fill: "#4b5563",
-                  }}
-                />
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
+                  <span className="legend-item">
+                    <span
+                      className="legend-bar-swatch"
+                      style={{
+                        background: latestWeekItem?.isToday
+                          ? latestWeekItem.isLaggingSameTime
+                            ? "#ef4444"
+                            : "#10b981"
+                          : "#475569",
+                      }}
+                    />
+                    {latestWeekItem?.isToday
+                      ? "Today (Live Cutoff)"
+                      : "Same-Time Actual"}
+                  </span>
+                  <span className="legend-item">
+                    <span
+                      className="legend-bar-swatch"
+                      style={{ background: "#475569" }}
+                    />
+                    Prior Weeks
+                  </span>
+                  <span className="legend-item">
+                    <span
+                      className="legend-line-swatch"
+                      style={{ borderColor: "#f59e0b", borderTop: "2px dashed #f59e0b" }}
+                    />
+                    Trend line
+                  </span>
+                </div>
+              </div>
+
+              {/* Chart 2: Same Day Full Day */}
+              <div className="weekday-chart-card">
+                <div className="weekday-chart-head">
+                  <div>
+                    <h3>Last 7 Weeks · Full Day ({selectedWeekdayName})</h3>
+                    <p>Full day closing numbers & Today&apos;s projected finish</p>
+                  </div>
+                  {latestWeekItem?.isToday && (
+                    <span
+                      className="weekday-status-pill pos"
+                      style={{ background: "#eff6ff", color: "#1d4ed8" }}
+                    >
+                      Pacing to{" "}
+                      {dayWiseValueFormatter(latestWeekItem.projectedTotal)}
+                    </span>
+                  )}
+                </div>
+
+                <div style={{ height: 260 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart
+                      data={sevenWeeksSameDayData}
+                      margin={{ top: 16, right: 10, left: 0, bottom: 0 }}
+                    >
+                      <CartesianGrid
+                        strokeDasharray="3 3"
+                        vertical={false}
+                        stroke="#f1f5f9"
+                      />
+                      <XAxis dataKey="label" fontSize={10.5} tickLine={false} />
+                      <YAxis fontSize={11} tickLine={false} axisLine={false} />
+                      <Tooltip
+                        formatter={(val: any, name: any) => [
+                          dayWiseValueFormatter(Number(val)),
+                          name === "fullDayValue"
+                            ? "Full Day Total (or Actual so far)"
+                            : name === "projectedRemaining"
+                              ? "Projected Evening Pace"
+                              : "Trend line",
+                        ]}
+                        labelFormatter={(label, payload) => {
+                          const item = payload?.[0]?.payload;
+                          return `${item?.relativeLabel || label} (${item?.label || ""})`;
+                        }}
+                      />
+                      <Bar
+                        dataKey="fullDayValue"
+                        stackId="fullDayStack"
+                        radius={[4, 4, 0, 0]}
+                      >
+                        {sevenWeeksSameDayData.map((entry, idx) => {
+                          let barColor = "#475569";
+                          if (entry.isToday) {
+                            barColor = entry.isLaggingSameTime
+                              ? "#ef4444"
+                              : "#10b981";
+                          } else if (idx === 5) {
+                            barColor = "#334155";
+                          }
+                          return <Cell key={entry.dateKey} fill={barColor} />;
+                        })}
+                        <LabelList
+                          dataKey="fullDayValue"
+                          position="top"
+                          formatter={(v: any) =>
+                            dayWiseValueFormatter(Number(v))
+                          }
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 700,
+                            fill: "#334155",
+                          }}
+                        />
+                      </Bar>
+                      <Bar
+                        dataKey="projectedRemaining"
+                        stackId="fullDayStack"
+                        fill="#cbd5e1"
+                        radius={[4, 4, 0, 0]}
+                        name="Projected Evening Pace"
+                      />
+                      <Line
+                        type="linear"
+                        dataKey="fullDayTrend"
+                        stroke="#f59e0b"
+                        strokeWidth={2.5}
+                        strokeDasharray="5 5"
+                        dot={false}
+                        name="Trend line"
+                      />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+
+                <div
+                  className="trend-chart-legend"
+                  style={{ marginTop: 10, marginBottom: 0 }}
+                >
+                  <span className="legend-item">
+                    <span
+                      className="legend-bar-swatch"
+                      style={{ background: "#475569" }}
+                    />
+                    Full Day Actual
+                  </span>
+                  <span className="legend-item">
+                    <span
+                      className="legend-bar-swatch"
+                      style={{ background: "#cbd5e1" }}
+                    />
+                    Projected Finish
+                  </span>
+                  <span className="legend-item">
+                    <span
+                      className="legend-line-swatch"
+                      style={{ borderColor: "#f59e0b", borderTop: "2px dashed #f59e0b" }}
+                    />
+                    Trend line
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
       </div>
 
@@ -5017,29 +5689,128 @@ function Insights({
             <span>
               {categoryLoading
                 ? "Loading category history..."
-                : `${analyticsRangeLabel()} · one trend per menu category`}
+                : categoryViewMode === "weekday"
+                  ? `Same time performance across last 7 ${selectedWeekdayName}s (Cutoff: ${today.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" })})`
+                  : `${analyticsRangeLabel()} · one trend per menu category`}
             </span>
           </div>
         </div>
 
-        <div className="metric-pills category-metric-pills">
-          {(
-            [
-              ["revenue", "Revenue"],
-              ["orders", "Orders"],
-              ["aov", "Avg Order Value"],
-              ["items", "Items Sold"],
-            ] as [CategoryMetric, string][]
-          ).map(([metric, label]) => (
+        <div className="trend-view-controls" style={{ marginBottom: 12 }}>
+          <div className="trend-mode-toggle">
             <button
-              key={metric}
-              className={categoryMetric === metric ? "active" : ""}
-              onClick={() => setCategoryMetric(metric)}
+              type="button"
+              className={categoryViewMode === "daily" ? "active" : ""}
+              onClick={() => setCategoryViewMode("daily")}
             >
-              {label}
+              <Calendar size={13} />
+              <span>Daily Timeline</span>
             </button>
-          ))}
+            <button
+              type="button"
+              className={categoryViewMode === "weekday" ? "active" : ""}
+              onClick={() => setCategoryViewMode("weekday")}
+            >
+              <TrendingUp size={13} />
+              <span>Same Time (Last 7 {selectedWeekdayName}s)</span>
+            </button>
+          </div>
+
+          <div className="metric-pills category-metric-pills" style={{ margin: 0 }}>
+            {(
+              [
+                ["revenue", "Revenue"],
+                ["orders", "Orders"],
+                ["aov", "Avg Order Value"],
+                ["items", "Items Sold"],
+              ] as [CategoryMetric, string][]
+            ).map(([metric, label]) => (
+              <button
+                key={metric}
+                className={categoryMetric === metric ? "active" : ""}
+                onClick={() => setCategoryMetric(metric)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
+
+        {/* Weekday Selector Pills when in Weekday Mode */}
+        {categoryViewMode === "weekday" && (
+          <div className="weekday-selector-bar" style={{ margin: "4px 0 12px" }}>
+            <span className="weekday-selector-title">Compare Last 7:</span>
+            {WEEKDAYS_LIST.map((w) => {
+              const isSelected = selectedWeekdayFilter === w.dayIdx;
+              const isDayToday = w.dayIdx === currentDayOfWeek;
+              return (
+                <button
+                  key={w.dayIdx}
+                  type="button"
+                  className={`weekday-pill-btn ${isSelected ? "active" : ""}`}
+                  onClick={() => setSelectedWeekdayFilter(w.dayIdx)}
+                >
+                  <span>{w.name}</span>
+                  {isDayToday && <span className="today-tag">Today</span>}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Legend for 7-Week Same Time Bars */}
+        {categoryViewMode === "weekday" && (
+          <div className="trend-chart-legend" style={{ margin: "2px 0 12px 2px" }}>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+              <span
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: 2,
+                  background: "#10b981",
+                  display: "inline-block",
+                }}
+              />
+              Today (Ahead / On Track vs Last Week)
+            </span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+              <span
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: 2,
+                  background: "#ef4444",
+                  display: "inline-block",
+                }}
+              />
+              Today (Lagging vs Last Week)
+            </span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+              <span
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: 2,
+                  background: "#334155",
+                  display: "inline-block",
+                }}
+              />
+              Last Week (Same Time)
+            </span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+              <span
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: 2,
+                  background: "#64748b",
+                  display: "inline-block",
+                }}
+              />
+              Prior Weeks (Same Time)
+            </span>
+          </div>
+        )}
 
         <div className="category-filter-pills">
           {categoryData.map(({ name }) => (
@@ -5070,73 +5841,142 @@ function Insights({
         <div className="category-grid">
           {categoryData
             .filter((category) => activeCategories.has(category.name))
-            .map((category, index) => (
-              <div
-                className={
-                  categoryData.length === 3 && index === 0
-                    ? "category-chart-card category-chart-card-featured"
-                    : "category-chart-card"
-                }
-                key={category.name}
-              >
-                <div className="category-chart-head">
-                  <b>{category.name}</b>
-                  <span>
-                    {categoryFormatter(category.total)} total
-                  </span>
-                </div>
-                <div className="category-mini-chart">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart
-                      data={category.values.map((value, index) => ({
-                        value,
-                        label: category.labels[index],
-                      }))}
-                      margin={{ top: 24, right: 0, left: 0, bottom: 0 }}
-                    >
-                      <defs>
-                        <linearGradient
-                          id={`categoryGradient-${category.name.replace(/\W/g, "")}`}
-                          x1="0"
-                          y1="0"
-                          x2="0"
-                          y2="1"
-                        >
-                          <stop offset="0%" stopColor="#e2a034" />
-                          <stop offset="100%" stopColor="#a8402a" />
-                        </linearGradient>
-                      </defs>
-                      <XAxis
-                        dataKey="label"
-                        tick={{ fontSize: 11, fill: "#6b5d48" }}
-                        axisLine={{ stroke: "#dccfb4" }}
-                        tickLine={false}
-                      />
-                      <YAxis hide />
-                      <Tooltip
-                        formatter={(value: any) => categoryFormatter(Number(value))}
-                      />
-                      <Bar
-                        dataKey="value"
-                        fill={`url(#categoryGradient-${category.name.replace(/\W/g, "")})`}
-                        radius={[4, 4, 0, 0]}
+            .map((category, index) => {
+              const chartData =
+                categoryViewMode === "weekday"
+                  ? category.sameTime7WkValues
+                  : category.values.map((value, idx) => ({
+                      value,
+                      label: category.labels[idx],
+                      isToday: false,
+                    }));
+
+              const totalDisplay =
+                categoryViewMode === "weekday" ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontWeight: 700, color: "#0f172a" }}>
+                      {categoryFormatter(category.todayVal)} Today
+                    </span>
+                    {category.lwVal > 0 && (
+                      <span
+                        className={`weekday-status-pill ${
+                          category.isLagging ? "neg" : "pos"
+                        }`}
+                        style={{ fontSize: 10, padding: "2px 6px" }}
                       >
-                        <LabelList
-                          dataKey="value"
-                          position="top"
-                          formatter={(value: any) => categoryFormatter(Number(value))}
-                          style={{
-                            fontSize: 12,
-                            fontWeight: 700,
-                            fill: "#2b2013",
+                        {category.isLagging ? "▼" : "▲"}{" "}
+                        {Math.abs(category.pctDiffVsLw)}% vs LW
+                      </span>
+                    )}
+                  </div>
+                ) : (
+                  <span>{categoryFormatter(category.total)} total</span>
+                );
+
+              return (
+                <div
+                  className={
+                    categoryData.length === 3 && index === 0
+                      ? "category-chart-card category-chart-card-featured"
+                      : "category-chart-card"
+                  }
+                  key={category.name}
+                >
+                  <div className="category-chart-head">
+                    <b>{category.name}</b>
+                    {totalDisplay}
+                  </div>
+                  <div className="category-mini-chart">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <ComposedChart
+                        data={chartData}
+                        margin={{ top: 24, right: 0, left: 0, bottom: 0 }}
+                      >
+                        <defs>
+                          <linearGradient
+                            id={`categoryGradient-${category.name.replace(/\W/g, "")}`}
+                            x1="0"
+                            y1="0"
+                            x2="0"
+                            y2="1"
+                          >
+                            <stop offset="0%" stopColor="#e2a034" />
+                            <stop offset="100%" stopColor="#a8402a" />
+                          </linearGradient>
+                        </defs>
+                        <XAxis
+                          dataKey="label"
+                          tick={{ fontSize: 11, fill: "#6b5d48" }}
+                          axisLine={{ stroke: "#dccfb4" }}
+                          tickLine={false}
+                        />
+                        <YAxis hide />
+                        <Tooltip
+                          formatter={(value: any, name: any) => [
+                            categoryFormatter(Number(value)),
+                            name === "trendLine"
+                              ? "Trend line"
+                              : categoryMetricLabel(categoryMetric),
+                          ]}
+                          labelFormatter={(label: any, items: any) => {
+                            if (categoryViewMode === "weekday" && items?.[0]?.payload?.fullLabel) {
+                              return items[0].payload.fullLabel;
+                            }
+                            return String(label);
                           }}
                         />
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
+                        <Bar
+                          dataKey="value"
+                          radius={[4, 4, 0, 0]}
+                        >
+                          {chartData.map((entry: any, i: number) => {
+                            let barColor = `url(#categoryGradient-${category.name.replace(/\W/g, "")})`;
+                            if (categoryViewMode === "weekday") {
+                              if (entry.isToday) {
+                                barColor = category.isLagging ? "#ef4444" : "#10b981";
+                              } else if (i === 5) {
+                                barColor = "#334155"; // Last Week
+                              } else {
+                                barColor = "#64748b"; // Prior weeks
+                              }
+                            }
+                            return (
+                              <Cell
+                                key={`cat-cell-${category.name}-${i}`}
+                                fill={barColor}
+                              />
+                            );
+                          })}
+                          <LabelList
+                            dataKey="value"
+                            position="top"
+                            formatter={(value: any) =>
+                              categoryFormatter(Number(value))
+                            }
+                            style={{
+                              fontSize: 12,
+                              fontWeight: 700,
+                              fill: "#2b2013",
+                            }}
+                          />
+                        </Bar>
+                        {categoryViewMode === "weekday" && (
+                          <Line
+                            type="linear"
+                            dataKey="trendLine"
+                            stroke="#f59e0b"
+                            strokeWidth={2}
+                            strokeDasharray="4 3"
+                            dot={false}
+                            name="Trend line"
+                          />
+                        )}
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
         </div>
 
       </div>
@@ -5188,6 +6028,26 @@ function Kpi({
     ""
   );
 
+  // Compare Today (index 0) with Last Week (index 1)
+  const todayVal = compareData?.[0]?.sameTimeValue ?? compareData?.[0]?.value ?? 0;
+  const lwVal = compareData?.[1]?.sameTimeValue ?? compareData?.[1]?.value ?? 0;
+  const isPerformingPoorly = lwVal > 0 ? todayVal < lwVal : false;
+  const pctDiff = lwVal > 0 ? Math.round(((todayVal - lwVal) / lwVal) * 100) : 0;
+
+  // Dynamic & Coherent Colors:
+  // Bar 0 (Today): RED if underperforming vs LW, else GREEN
+  // Bar 1 (Last Week): Refined Slate Blue
+  // Bar 2 (7-Wk Avg): Neutral Cool Slate Gray
+  const getKpiBarColor = (index: number) => {
+    if (index === 0) {
+      return isPerformingPoorly ? "#ef4444" : "#10b981";
+    }
+    if (index === 1) {
+      return "#475569"; // Slate Blue
+    }
+    return "#94a3b8"; // Cool Gray
+  };
+
   return (
     <div className="card kpi">
 
@@ -5199,7 +6059,28 @@ function Kpi({
         {value}
       </strong>
 
-      {delta && (
+      {compareData && compareData.length >= 2 && lwVal > 0 && (
+        <div style={{ marginTop: 2, marginBottom: 6 }}>
+          <span
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+              fontSize: 11.5,
+              fontWeight: 700,
+              padding: "2px 7px",
+              borderRadius: 6,
+              background: isPerformingPoorly ? "#fee2e2" : "#dcfce7",
+              color: isPerformingPoorly ? "#b91c1c" : "#15803d",
+            }}
+          >
+            {isPerformingPoorly ? "▼" : "▲"}{" "}
+            {Math.abs(pctDiff)}% vs Last Wk
+          </span>
+        </div>
+      )}
+
+      {delta && !compareData && (
         <span className={good ? "positive" : "trend-delta neutral"}>
           {delta}
         </span>
@@ -5210,36 +6091,47 @@ function Kpi({
 
           <div className="kpi-compare-caption">
             <span className="kpi-caption-item">
-              <span className="kpi-caption-swatch bar" />
-              Full day
+              <span
+                className="kpi-caption-swatch bar"
+                style={{
+                  backgroundColor: isPerformingPoorly ? "#ef4444" : "#10b981",
+                }}
+              />
+              Today ({isPerformingPoorly ? "Lagging" : "Ahead"})
             </span>
             <span className="kpi-caption-item">
-              <span className="kpi-caption-swatch line" />
-              Same time
+              <span
+                className="kpi-caption-swatch bar"
+                style={{ backgroundColor: "#475569" }}
+              />
+              Last wk
+            </span>
+            <span className="kpi-caption-item">
+              <span
+                className="kpi-caption-swatch bar"
+                style={{ backgroundColor: "#94a3b8" }}
+              />
+              7-wk avg
             </span>
           </div>
 
           <ResponsiveContainer
             width="100%"
-            height={195}
+            height={155}
           >
-            <ComposedChart
+            <BarChart
               data={compareData}
               margin={{
-                top: 18,
-                right: 10,
-                left: 10,
+                top: 22,
+                right: 8,
+                left: 8,
                 bottom: 0,
               }}
             >
               <defs>
                 {compareData.map(
                   (d, i) => {
-                    const color =
-                      KPI_COMPARE_COLORS[
-                        i %
-                          KPI_COMPARE_COLORS.length
-                      ];
+                    const color = getKpiBarColor(i);
                     return (
                       <linearGradient
                         key={`kpi-grad-${d.label}`}
@@ -5251,21 +6143,13 @@ function Kpi({
                       >
                         <stop
                           offset="0%"
-                          stopColor={
-                            color
-                          }
-                          stopOpacity={
-                            0.95
-                          }
+                          stopColor={color}
+                          stopOpacity={0.95}
                         />
                         <stop
                           offset="100%"
-                          stopColor={
-                            color
-                          }
-                          stopOpacity={
-                            0.55
-                          }
+                          stopColor={color}
+                          stopOpacity={0.75}
                         />
                       </linearGradient>
                     );
@@ -5289,28 +6173,18 @@ function Kpi({
               <YAxis hide />
 
               <Tooltip
-                formatter={(
-                  v: any,
-                  name: any
-                ) => [
-                  format(v),
-                  name === "value"
-                    ? "Full day"
-                    : "Same time",
-                ]}
+                formatter={(v: any) => [format(v), "Performance"]}
                 contentStyle={{
-                  borderRadius: 10,
+                  borderRadius: 8,
                   fontSize: 12,
-                  border: "1px solid #e5e7eb",
+                  border: "1px solid #e2e8f0",
                 }}
               />
 
               <Bar
                 dataKey="value"
-                radius={[
-                  6, 6, 0, 0,
-                ]}
-                maxBarSize={54}
+                radius={[5, 5, 0, 0]}
+                maxBarSize={48}
               >
                 {compareData.map(
                   (d, i) => (
@@ -5327,38 +6201,12 @@ function Kpi({
                   style={{
                     fontSize: 11,
                     fontWeight: 700,
-                    fill: "#374151",
+                    fill: "#334155",
                   }}
                 />
               </Bar>
 
-              <Line
-                type="monotone"
-                dataKey="sameTimeValue"
-                stroke="#1e293b"
-                strokeWidth={2}
-                strokeDasharray="4 3"
-                dot={{
-                  r: 4,
-                  fill: "#1e293b",
-                  strokeWidth: 0,
-                }}
-                activeDot={{ r: 5 }}
-              >
-                <LabelList
-                  dataKey="sameTimeValue"
-                  position="top"
-                  formatter={format}
-                  offset={8}
-                  style={{
-                    fontSize: 10,
-                    fontWeight: 600,
-                    fill: "#2b2013",
-                  }}
-                />
-              </Line>
-
-            </ComposedChart>
+            </BarChart>
           </ResponsiveContainer>
         </div>
       )}
@@ -6404,7 +7252,9 @@ export default function HomePage() {
   const [tab, setTab] =
     useState<Tab>("new");
 
-  const [visitedTabs, setVisitedTabs] = useState<Set<Tab>>(() => new Set(["new"]));
+  const [visitedTabs, setVisitedTabs] = useState<Set<Tab>>(
+    () => new Set(["new", "insights"])
+  );
 
   useEffect(() => {
     setVisitedTabs((prev) => {
@@ -6453,6 +7303,25 @@ export default function HomePage() {
     setRefreshKey,
   ] = useState(0);
 
+  const [lastUpdatedTime, setLastUpdatedTime] = useState<string>(() =>
+    new Date().toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" })
+  );
+  const [isRefreshingAll, setIsRefreshingAll] = useState(false);
+
+  const handleRefreshAll = async () => {
+    if (!currentUser?.restaurantId) return;
+    setIsRefreshingAll(true);
+    try {
+      await loadRestaurantData(currentUser.restaurantId);
+      setRefreshKey((prev) => prev + 1);
+      setLastUpdatedTime(
+        new Date().toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" })
+      );
+    } finally {
+      setTimeout(() => setIsRefreshingAll(false), 500);
+    }
+  };
+
   const [loading, setLoading] =
     useState(false);
 
@@ -6497,9 +7366,15 @@ export default function HomePage() {
       try {
         const saved = localStorage.getItem("restaurant_iq_user");
         if (saved && isCurrent) {
-          setCurrentUser(JSON.parse(saved));
+          const parsed = JSON.parse(saved);
+          setCurrentUser(parsed);
+          if (parsed?.id?.startsWith("demo-") || !isSupabaseConfigured) {
+            return;
+          }
         }
       } catch (e) {}
+
+      if (!isSupabaseConfigured) return;
 
       try {
         const {
@@ -6576,6 +7451,16 @@ export default function HomePage() {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!session && isCurrent) {
+        try {
+          const saved = localStorage.getItem("restaurant_iq_user");
+          if (saved) {
+            const parsed = JSON.parse(saved);
+            if (parsed?.id?.startsWith("demo-") || !isSupabaseConfigured) {
+              return;
+            }
+          }
+        } catch (e) {}
+
         setCurrentUser(null);
         try {
           localStorage.removeItem("restaurant_iq_user");
@@ -6617,10 +7502,23 @@ export default function HomePage() {
 
   useEffect(() => {
     if (
+      currentUser?.role === "ADMIN" &&
+      tab !== "insights"
+    ) {
+      setTab("insights");
+    }
+    if (currentUser?.role === "POC" && tab !== "new") {
+      setTab("new");
+    }
+  }, [currentUser?.role, tab]);
+
+  useEffect(() => {
+    if (
+      !isSupabaseConfigured ||
       !currentUser ||
-      currentUser.role ===
-        "SUPER_ADMIN" ||
-      !currentUser.restaurantId
+      currentUser.role === "SUPER_ADMIN" ||
+      !currentUser.restaurantId ||
+      currentUser.restaurantId === "demo-restaurant-1"
     ) {
       return;
     }
@@ -6658,6 +7556,12 @@ export default function HomePage() {
   async function loadRestaurants() {
     setLoading(true);
     setDatabaseError(null);
+
+    if (!isSupabaseConfigured) {
+      setRestaurants(DEMO_RESTAURANTS);
+      setLoading(false);
+      return;
+    }
 
     try {
       const {
@@ -6705,6 +7609,14 @@ export default function HomePage() {
 
     setLoading(true);
     setDatabaseError(null);
+
+    if (!isSupabaseConfigured || restaurantId === "demo-restaurant-1") {
+      setProducts(DEMO_PRODUCTS);
+      setRestaurantTables(DEMO_TABLES);
+      setTodayOrders(DEMO_TODAY_ORDERS);
+      setLoading(false);
+      return;
+    }
 
     try {
 
@@ -6765,10 +7677,18 @@ export default function HomePage() {
                 0
           );
 
-      setProducts(
-        formattedMenu
-      );
-      cacheMenuItems(restaurantId, formattedMenu);
+      const deduplicatedMenu: Product[] = [];
+      const seenMenuKeys = new Set<string>();
+      for (const item of formattedMenu) {
+        const key = `${(item.name || "").trim().toLowerCase()}_${item.category}_${Math.round(Number(item.price) || 0)}`;
+        if (!seenMenuKeys.has(key)) {
+          seenMenuKeys.add(key);
+          deduplicatedMenu.push(item);
+        }
+      }
+
+      setProducts(deduplicatedMenu);
+      cacheMenuItems(restaurantId, deduplicatedMenu);
 
       const {
         data: rawTables,
@@ -6783,12 +7703,58 @@ export default function HomePage() {
         throw tablesError;
       }
 
-      const formattedTables = (rawTables || []).map((table: any) => ({
+      let formattedTables = (rawTables || []).map((table: any) => ({
         id: String(table.id),
         tableNumber: String(table.table_number),
         capacity: Number(table.capacity) || 0,
         isActive: table.is_active !== false,
       }));
+
+      // Auto-persist T1 through T30 into database if fewer than 30 tables exist
+      if (!restaurantId.startsWith("demo-") && formattedTables.length < 30) {
+        const existingNums = new Set(
+          formattedTables.map((t) => t.tableNumber.trim().toUpperCase())
+        );
+        const missingToInsert: Array<{
+          restaurant_id: string;
+          table_number: string;
+          capacity: number;
+        }> = [];
+
+        for (let i = 1; i <= 30; i++) {
+          const tNum = `T${i}`;
+          if (!existingNums.has(tNum)) {
+            const cap =
+              i % 5 === 0 ? 8 : i % 3 === 0 ? 6 : i % 2 === 0 ? 2 : 4;
+            missingToInsert.push({
+              restaurant_id: restaurantId,
+              table_number: tNum,
+              capacity: cap,
+            });
+          }
+        }
+
+        if (missingToInsert.length > 0) {
+          try {
+            const { data: inserted, error: insertErr } = await supabase
+              .from("restaurant_tables")
+              .insert(missingToInsert)
+              .select("id, table_number, capacity, is_active");
+
+            if (!insertErr && inserted) {
+              const newFormatted = inserted.map((t: any) => ({
+                id: String(t.id),
+                tableNumber: String(t.table_number),
+                capacity: Number(t.capacity) || 0,
+                isActive: t.is_active !== false,
+              }));
+              formattedTables = [...formattedTables, ...newFormatted];
+            }
+          } catch (e) {
+            console.warn("Could not auto-seed missing tables into database:", e);
+          }
+        }
+      }
 
       setRestaurantTables(formattedTables);
       cacheTables(restaurantId, formattedTables);
@@ -6802,21 +7768,22 @@ export default function HomePage() {
         err
       );
 
-      // Offline fallback: load cached menu & tables if available
+      // Offline fallback: load cached menu & tables if available, or demo data
       const cachedMenu = getCachedMenuItems(restaurantId);
       if (cachedMenu && cachedMenu.length > 0) {
         setProducts(cachedMenu);
+      } else {
+        setProducts(DEMO_PRODUCTS);
       }
       const cachedTbls = getCachedTables(restaurantId);
       if (cachedTbls && cachedTbls.length > 0) {
         setRestaurantTables(cachedTbls);
+      } else {
+        setRestaurantTables(DEMO_TABLES);
       }
 
-      if (!cachedMenu || cachedMenu.length === 0) {
-        setDatabaseError(
-          err?.message ||
-            "Could not connect to database. Check internet connection."
-        );
+      if (todayOrders.length === 0) {
+        setTodayOrders(DEMO_TODAY_ORDERS);
       }
     } finally {
       setLoading(false);
@@ -6826,6 +7793,11 @@ export default function HomePage() {
   async function loadTodayOrders(
     restaurantId: string
   ) {
+    if (!isSupabaseConfigured || restaurantId === "demo-restaurant-1") {
+      setTodayOrders(DEMO_TODAY_ORDERS);
+      return;
+    }
+
     const start =
       new Date();
 
@@ -6885,23 +7857,28 @@ export default function HomePage() {
     order: Order
   ) {
     setTodayOrders((current) => {
-      // Upsert by databaseId: a re-used/appended order (same DB row)
-      // replaces its existing entry instead of adding a second, partial
-      // one alongside it — that duplication was inflating order counts
-      // and AOV in Insights/Table View for occupied tables.
-      const existingIndex = current.findIndex(
-        (o) =>
-          order.databaseId &&
-          o.databaseId === order.databaseId
-      );
+      const cleanTable = order.table ? order.table.trim().toUpperCase() : null;
+      let matched = false;
+      const next = current.map((o) => {
+        const oTable = o.table ? o.table.trim().toUpperCase() : null;
+        const isSameDb = Boolean(order.databaseId && o.databaseId === order.databaseId);
+        const isSameId = Boolean(order.id && o.id === order.id);
+        const isSameOpenTable = Boolean(cleanTable && oTable === cleanTable && !o.closedAt);
 
-      if (existingIndex !== -1) {
-        const next = [...current];
-        next[existingIndex] = order;
-        return next;
-      }
+        if (isSameDb || isSameId || isSameOpenTable) {
+          matched = true;
+          return {
+            ...o,
+            ...order,
+            status: order.closedAt ? "COMPLETED" : (order.status || o.status),
+            closedAt: order.closedAt || o.closedAt,
+          };
+        }
+        return o;
+      });
 
-      return [order, ...current];
+      if (matched) return next;
+      return [order, ...next];
     });
 
     setRefreshKey(
@@ -6909,8 +7886,6 @@ export default function HomePage() {
     );
 
     setSelectedTable("");
-
-    setTab("orders");
   }
 
   function handleTableOrder(table?: string) {
@@ -6934,6 +7909,17 @@ export default function HomePage() {
     if (openOrderIds.length === 0) return;
 
     const closedAtIso = new Date().toISOString();
+
+    if (!isSupabaseConfigured || currentUser?.id?.startsWith("demo-")) {
+      setTodayOrders((current) =>
+        current.map((order) =>
+          openOrderIds.includes(order.databaseId as string)
+            ? { ...order, closedAt: closedAtIso }
+            : order
+        )
+      );
+      return;
+    }
 
     try {
       const { error } = await supabase
@@ -7016,7 +8002,7 @@ export default function HomePage() {
 
   if (!currentUser) {
     return (
-      <Login
+      <ModernLogin
         onLogin={
           setCurrentUser
         }
@@ -7162,9 +8148,9 @@ export default function HomePage() {
   > = {
     new: {
       title:
-        "New order",
+        "POS Terminal",
       subtitle:
-        "Create a new restaurant order",
+        "RestaurantIQ rapid 3-click restaurant billing terminal",
     },
 
     orders: {
@@ -7176,9 +8162,9 @@ export default function HomePage() {
 
     insights: {
       title:
-        "Business insights",
+        "Daily Analytics & Historic Sales",
       subtitle:
-        "KPIs, trends and AI recommendations",
+        "Today's KPIs, hourly distribution, item trends & AI recommendations",
     },
 
     restaurants: {
@@ -7211,37 +8197,45 @@ export default function HomePage() {
   };
 
   return (
-    <div className="shell">
+    <div className={`shell ${currentUser.role === "POC" ? "poc-shell" : ""}`}>
 
-      <Sidebar
-        tab={tab}
-        setTab={setTab}
-        user={currentUser}
-        onLogout={
-          handleLogout
-        }
-        mobile={
-          mobileNav
-        }
-        setMobile={
-          setMobileNav
-        }
-      />
-
-      <main>
-
-        <Header
-          user={
-            currentUser
+      {currentUser.role !== "POC" && (
+        <Sidebar
+          tab={tab}
+          setTab={setTab}
+          user={currentUser}
+          onLogout={
+            handleLogout
           }
-          onMenu={() =>
-            setMobileNav(
-              true
-            )
+          mobile={
+            mobileNav
+          }
+          setMobile={
+            setMobileNav
           }
         />
+      )}
 
-        {databaseError && (
+      <main
+        className={
+          currentUser.role === "POC"
+            ? "pos-main"
+            : ""
+        }
+      >
+
+        {currentUser.role !== "POC" && (
+          <Header
+            user={currentUser}
+            onMenu={() => setMobileNav(true)}
+            onRefresh={currentUser.role === "ADMIN" ? handleRefreshAll : undefined}
+            lastUpdated={lastUpdatedTime}
+            isRefreshing={isRefreshingAll}
+            tab={tab}
+          />
+        )}
+
+        {currentUser.role !== "POC" && databaseError && (
           <div
             className="card"
             style={{
@@ -7263,31 +8257,33 @@ export default function HomePage() {
           </div>
         )}
 
-        <div className="toolbar">
+        {currentUser.role !== "POC" && currentUser.role !== "ADMIN" && (
+          <div className="toolbar">
 
-          <div>
+            <div>
 
-            <b>
-              {
-                toolbarCopy[
-                  tab
-                ].title
-              }
-            </b>
+              <b>
+                {
+                  toolbarCopy[
+                    tab
+                  ].title
+                }
+              </b>
 
-            <span>
-              {
-                toolbarCopy[
-                  tab
-                ].subtitle
-              }
-            </span>
+              <span>
+                {
+                  toolbarCopy[
+                    tab
+                  ].subtitle
+                }
+              </span>
+
+            </div>
 
           </div>
+        )}
 
-        </div>
-
-        {currentUser.role !== "SUPER_ADMIN" && (
+        {currentUser.role !== "SUPER_ADMIN" && currentUser.role !== "POC" && (
           <OfflineBanner
             restaurantId={currentUser.restaurantId}
             onOrderSynced={(tempId, realOrder) => {
@@ -7343,11 +8339,11 @@ export default function HomePage() {
             />
           )}
 
-        {currentUser.role !==
-          "SUPER_ADMIN" &&
+        {currentUser.role ===
+          "POC" &&
           visitedTabs.has("new") && (
             <div style={{ display: tab === "new" ? "block" : "none" }}>
-              <NewOrder
+              <RestaurantPOS
                 products={
                   products
                 }
@@ -7358,9 +8354,7 @@ export default function HomePage() {
                 restaurantName={
                   currentUser.restaurantName
                 }
-                isPoc={
-                  currentUser.role === "POC"
-                }
+                isPoc={true}
                 createdByUserId={
                   currentUser.id
                 }
@@ -7381,12 +8375,13 @@ export default function HomePage() {
                     currentUser.restaurantId
                   )
                 }
+                onLogout={handleLogout}
               />
             </div>
           )}
 
-        {currentUser.role !==
-          "SUPER_ADMIN" &&
+        {currentUser.role ===
+          "POC" &&
           visitedTabs.has("tables") && (
             <div style={{ display: tab === "tables" ? "block" : "none" }}>
               <TableView
@@ -7403,8 +8398,8 @@ export default function HomePage() {
             </div>
           )}
 
-        {currentUser.role !==
-          "SUPER_ADMIN" &&
+        {currentUser.role ===
+          "POC" &&
           visitedTabs.has("orders") && (
             <div style={{ display: tab === "orders" ? "block" : "none" }}>
               <Orders
@@ -7418,9 +8413,7 @@ export default function HomePage() {
                 refreshKey={
                   refreshKey
                 }
-                isPoc={
-                  currentUser.role === "POC"
-                }
+                isPoc={true}
               />
             </div>
           )}
@@ -7447,9 +8440,11 @@ export default function HomePage() {
             </div>
           )}
 
-        <footer>
-          RestaurantIQ MVP · Supabase
-        </footer>
+        {currentUser.role !== "POC" && (
+          <footer>
+            RestaurantIQ MVP · Supabase
+          </footer>
+        )}
 
       </main>
 
@@ -7660,6 +8655,25 @@ export default function HomePage() {
           );
           padding: 25px;
           min-height: 100vh;
+        }
+
+        .shell.poc-shell {
+          height: 100vh !important;
+          max-height: 100vh !important;
+          overflow: hidden !important;
+          background: #0f172a !important;
+        }
+
+        main.pos-main {
+          margin: 0 !important;
+          padding: 0 !important;
+          width: 100vw !important;
+          max-width: 100vw !important;
+          height: 100vh !important;
+          max-height: 100vh !important;
+          overflow: hidden !important;
+          display: flex !important;
+          flex-direction: column !important;
         }
 
         header {
@@ -9539,14 +10553,15 @@ export default function HomePage() {
         main {
           margin-left: 220px;
           width: calc(100% - 220px);
-          max-width: 1180px;
-          padding: 30px 34px 60px;
+          max-width: 100%;
+          padding: 20px 24px 60px;
+          box-sizing: border-box;
         }
 
         header {
-          margin-bottom: 22px;
-          padding-bottom: 18px;
-          border-bottom: 1px solid #dccfb4;
+          margin-bottom: 16px;
+          padding-bottom: 0;
+          border-bottom: 0;
         }
 
         header h1,
@@ -9554,20 +10569,20 @@ export default function HomePage() {
         .date-header h2,
         .section-title h2,
         .card h2 {
-          font-family: 'Zilla Slab', Georgia, serif;
-          color: #2b2013;
+          font-family: Inter, system-ui, -apple-system, sans-serif;
+          color: #0f172a;
         }
 
         header h1 {
-          font-size: 25px;
-          font-weight: 600;
+          font-size: 22px;
+          font-weight: 700;
         }
 
         header p,
         .toolbar span,
         .section-title span,
         .as-of-time {
-          color: #6b5d48;
+          color: #64748b;
         }
 
         .profile {
@@ -9575,12 +10590,12 @@ export default function HomePage() {
           height: 38px;
           background: #e2a034;
           color: #3a160f;
-          font-family: 'Zilla Slab', Georgia, serif;
+          font-family: Inter, system-ui, -apple-system, sans-serif;
         }
 
         .toolbar {
-          margin: 0 0 24px;
-          padding: 0 0 2px;
+          margin: 0 0 16px;
+          padding: 0;
           background: transparent;
           border: 0;
         }
@@ -9591,12 +10606,12 @@ export default function HomePage() {
         }
 
         .card {
-          margin-bottom: 24px;
-          padding: 20px 20px 16px;
-          border: 1px solid #dccfb4;
-          border-radius: 4px;
-          background: #fffdf8;
-          box-shadow: 0 1px 0 rgba(43, 32, 19, 0.06);
+          margin-bottom: 18px;
+          padding: 18px 20px 14px;
+          border: 1px solid #e2e8f0;
+          border-radius: 12px;
+          background: #ffffff;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
         }
 
         .section-title {
@@ -9605,22 +10620,25 @@ export default function HomePage() {
 
         .section-title h2 {
           font-size: 16px;
-          font-weight: 600;
+          font-weight: 700;
+          color: #0f172a;
         }
 
         .section-title span {
           font-size: 12px;
+          color: #64748b;
         }
 
         .date-header {
-          margin-bottom: 20px;
-          padding-bottom: 15px;
+          margin-bottom: 14px;
+          padding-bottom: 0;
           border-bottom: 0;
         }
 
         .date-header h2 {
           margin: 0;
           font-size: 16px;
+          font-weight: 700;
         }
 
         .as-of-time {
@@ -9628,47 +10646,54 @@ export default function HomePage() {
         }
 
         .kpis {
-          gap: 16px;
-          margin-bottom: 24px;
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 14px;
+          margin-bottom: 18px;
+          width: 100%;
         }
 
         .kpi {
           position: relative;
-          padding: 16px 16px 10px;
+          padding: 16px 14px 12px;
+          min-width: 0;
+          background: #ffffff;
+          border: 1px solid #e2e8f0;
+          border-radius: 12px;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
         }
 
         .kpi::before,
         .kpi::after {
-          content: '';
-          position: absolute;
-          top: 50%;
-          width: 12px;
-          height: 12px;
-          border-radius: 50%;
-          background: #f6f1e7;
-          transform: translateY(-50%);
+          display: none !important;
         }
 
-        .kpi::before { left: -7px; }
-        .kpi::after { right: -7px; }
-
         .kpi-title {
-          color: #a8402a !important;
-          font-family: 'Zilla Slab', Georgia, serif;
-          font-size: 15px !important;
-          text-transform: none;
-          letter-spacing: 0.03em;
-          border-bottom: 2px solid #f3ded6;
+          color: #64748b !important;
+          font-family: Inter, system-ui, -apple-system, sans-serif !important;
+          font-size: 12px !important;
+          font-weight: 600 !important;
+          text-transform: uppercase !important;
+          letter-spacing: 0.04em !important;
+          border-bottom: none !important;
+          padding-bottom: 0 !important;
+          margin-bottom: 4px;
+          display: block;
         }
 
         .kpi strong {
           font-family: 'IBM Plex Mono', monospace;
-          font-size: 23px;
+          font-size: 24px;
+          font-weight: 700;
+          color: #0f172a;
+          margin: 4px 0 6px;
+          display: block;
         }
 
         .kpi-compare-caption,
         .kpi-caption-item {
-          color: #6b5d48;
+          color: #64748b;
+          font-size: 11px;
         }
 
         .kpi-caption-swatch.bar {
@@ -9676,50 +10701,57 @@ export default function HomePage() {
         }
 
         .kpi-compare-chart .recharts-cartesian-axis-tick-value {
-          fill: #6b5d48;
+          fill: #64748b;
+          font-size: 11px;
         }
 
         .date-range-card {
-          background: #f3ded6;
-          border-color: #dccfb4;
+          background: #ffffff;
+          border-color: #e2e8f0;
+          margin-bottom: 18px;
         }
 
         .date-range-pills,
         .metric-pills {
+          display: flex;
+          flex-wrap: wrap;
           gap: 8px;
         }
 
         .date-range-pills button,
         .metric-pills button {
-          padding: 6px 13px;
-          border: 1px solid #dccfb4;
-          border-radius: 999px;
-          background: transparent;
-          color: #6b5d48;
+          padding: 6px 14px;
+          border: 1px solid #e2e8f0;
+          border-radius: 8px;
+          background: #f8fafc;
+          color: #475569;
           font-size: 12px;
+          font-weight: 500;
+          cursor: pointer;
+          transition: all 0.15s ease;
         }
 
-        .date-range-pills button {
-          background: #fffdf8;
-          border-color: #8c6a3f;
-          color: #8c6a3f;
+        .date-range-pills button:hover,
+        .metric-pills button:hover {
+          background: #f1f5f9;
+          color: #0f172a;
+          border-color: #cbd5e1;
         }
 
         .date-range-pills button.active,
         .metric-pills button.active {
-          background: #a8402a;
-          border-color: #a8402a;
-          color: #fff;
-        }
-
-        .metric-pills button.active {
-          background: #a8402a;
+          background: #2563eb;
+          border-color: #2563eb;
+          color: #ffffff;
+          font-weight: 600;
+          box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
         }
 
         .custom-range-inputs input {
-          border-color: #8c6a3f;
-          border-radius: 4px;
-          background: #fffdf8;
+          border-color: #cbd5e1;
+          border-radius: 6px;
+          background: #ffffff;
+          padding: 6px 10px;
         }
 
         .weekday-legend {
@@ -9757,32 +10789,42 @@ export default function HomePage() {
         }
 
         .category-filter-pills button {
-          padding: 7px 16px;
-          border: 1px solid #3c6e4a;
-          border-radius: 999px;
-          background: #fffdf8;
-          color: #3c6e4a;
-          font-weight: 700;
+          padding: 6px 14px;
+          border: 1px solid #e2e8f0;
+          border-radius: 8px;
+          background: #f8fafc;
+          color: #475569;
+          font-weight: 600;
           font-size: 12px;
+          cursor: pointer;
+          transition: all 0.15s ease;
+        }
+
+        .category-filter-pills button:hover {
+          background: #f1f5f9;
+          color: #0f172a;
         }
 
         .category-filter-pills button.active {
-          background: #3c6e4a;
+          background: #2563eb;
+          border-color: #2563eb;
           color: #fff;
+          box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
         }
 
         .category-grid {
           display: grid;
           grid-template-columns: repeat(2, minmax(0, 1fr));
-          gap: 16px;
+          gap: 14px;
         }
 
         .category-chart-card {
           min-width: 0;
-          padding: 14px 14px 6px;
-          border: 1px solid #dccfb4;
-          border-radius: 4px;
-          background: #ede4d3;
+          padding: 16px 16px 10px;
+          border: 1px solid #e2e8f0;
+          border-radius: 12px;
+          background: #ffffff;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
         }
 
         .category-chart-card-featured {
@@ -9798,14 +10840,14 @@ export default function HomePage() {
         }
 
         .category-chart-head b {
-          font-family: 'Zilla Slab', Georgia, serif;
-          font-size: 16px;
-          font-weight: 600;
-          color: #2b2013;
+          font-family: Inter, system-ui, -apple-system, sans-serif;
+          font-size: 15px;
+          font-weight: 700;
+          color: #0f172a;
         }
 
         .category-chart-head span {
-          color: #6b5d48;
+          color: #64748b;
           font: 12px 'IBM Plex Mono', monospace;
           white-space: nowrap;
         }
@@ -9817,7 +10859,7 @@ export default function HomePage() {
         }
 
         .category-mini-chart .recharts-cartesian-axis-tick-value {
-          fill: #6b5d48;
+          fill: #64748b;
           font-family: 'IBM Plex Sans', sans-serif;
         }
 
@@ -9840,22 +10882,22 @@ export default function HomePage() {
         .new-layout {
           grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.9fr);
           align-items: start;
-          gap: 22px;
+          gap: 20px;
           width: 100%;
           min-width: 0;
         }
 
         header {
           align-items: flex-start;
-          padding: 4px 0 20px;
-          margin-bottom: 24px;
+          padding: 0;
+          margin-bottom: 16px;
         }
 
         header h1 {
           margin: 0;
-          font-size: clamp(25px, 2.2vw, 32px);
-          line-height: 1.1;
-          letter-spacing: 0;
+          font-size: clamp(20px, 1.8vw, 25px);
+          line-height: 1.2;
+          letter-spacing: -0.2px;
         }
 
         h1,
@@ -9881,41 +10923,41 @@ export default function HomePage() {
         }
 
         header p {
-          margin: 8px 0 0;
-          font-size: 14px;
+          margin: 6px 0 0;
+          font-size: 13px;
         }
 
         .toolbar {
-          margin: 0 0 28px;
-          padding: 0 0 18px;
-          border-bottom: 1px solid #dccfb4;
+          margin: 0 0 16px;
+          padding: 0 0 10px;
+          border-bottom: 1px solid #e2e8f0;
         }
 
         .toolbar b {
-          font-size: 22px;
-          line-height: 1.15;
+          font-size: 18px;
+          line-height: 1.2;
         }
 
         .toolbar span {
-          margin-top: 5px;
-          font-size: 14px;
+          margin-top: 4px;
+          font-size: 13px;
           text-transform: capitalize;
         }
 
         .date-header {
-          margin: 0 0 22px;
-          padding: 0 0 16px;
-          border-bottom: 1px dashed #dccfb4;
+          margin: 0 0 14px;
+          padding: 0 0 10px;
+          border-bottom: 1px dashed #e2e8f0;
         }
 
         .date-header h2 {
-          font-size: 20px;
+          font-size: 16px;
           line-height: 1.2;
         }
 
         .as-of-time {
-          margin-top: 6px;
-          font-size: 13px;
+          margin-top: 4px;
+          font-size: 12px;
         }
 
         .new-layout > .card {
@@ -9924,7 +10966,6 @@ export default function HomePage() {
 
         main {
           min-width: 0;
-          overflow-x: hidden;
         }
 
         .new-layout > .menu-card {
