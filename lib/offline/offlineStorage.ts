@@ -1,3 +1,12 @@
+import {
+  dbDeleteOrder,
+  dbGetAllOrders,
+  dbGetCache,
+  dbGetOrdersByRestaurant,
+  dbPutCache,
+  dbPutOrder,
+} from "./offlineDB";
+
 export type QueuedOfflineOrder = {
   tempId: string;
   restaurantId: string;
@@ -20,91 +29,121 @@ export type QueuedOfflineOrder = {
   createdAt: string;
   syncAttempts: number;
   lastError?: string;
+  permanentlyFailed?: boolean;
+  /**
+   * "OPEN"    -> came from KOT print / Save (running tab). Sync should
+   *              create-or-merge into the table's order WITHOUT closing it,
+   *              so later rounds for the same table keep consolidating.
+   * "SETTLED" -> came from Settle & Pay. Sync should create-or-merge and
+   *              then close the order (closed_at set).
+   * Missing/undefined is treated as "SETTLED" for backward compatibility
+   * with orders queued before this field existed.
+   */
+  orderPhase?: "OPEN" | "SETTLED";
 };
 
-const QUEUE_KEY = "restaurant_iq_offline_orders_v1";
-const MENU_CACHE_PREFIX = "restaurant_iq_menu_cache_";
-const TABLES_CACHE_PREFIX = "restaurant_iq_tables_cache_";
-const SETTINGS_KEY = "restaurant_iq_local_settings_v1";
+export const MAX_SYNC_ATTEMPTS = 5;
 
-export function getOfflineOrdersQueue(restaurantId?: string): QueuedOfflineOrder[] {
-  if (typeof window === "undefined") return [];
+// ---------------------------------------------------------------------------
+// Order queue — now backed by IndexedDB (see ./offlineDB) instead of a single
+// localStorage JSON blob. Same function names/signatures as before EXCEPT:
+//   - these all now return Promises (IndexedDB is inherently async), and
+//   - enqueueOfflineOrder is kept "fire and forget" (its call site in
+//     RestaurantPOS.tsx doesn't await it today) — it still returns void and
+//     resolves the write in the background, so no call-site changes needed
+//     there. Every other queue function is genuinely async and any caller
+//     needs `await` — none of the currently-uploaded files call them
+//     directly today (only offlineSync.ts does, updated to match), but if
+//     you build a "review failed orders" screen later, await these.
+// ---------------------------------------------------------------------------
+
+export async function getOfflineOrdersQueue(restaurantId?: string): Promise<QueuedOfflineOrder[]> {
   try {
-    const raw = localStorage.getItem(QUEUE_KEY);
-    if (!raw) return [];
-    const parsed: QueuedOfflineOrder[] = JSON.parse(raw);
-    if (restaurantId) {
-      return parsed.filter((o) => o.restaurantId === restaurantId);
-    }
-    return parsed;
+    return restaurantId
+      ? await dbGetOrdersByRestaurant<QueuedOfflineOrder>(restaurantId)
+      : await dbGetAllOrders<QueuedOfflineOrder>();
   } catch (err) {
     console.error("Failed to read offline orders queue:", err);
     return [];
   }
 }
 
-export function enqueueOfflineOrder(order: QueuedOfflineOrder): void {
-  if (typeof window === "undefined") return;
-  try {
-    const queue = getOfflineOrdersQueue();
-    // Avoid duplicates
-    const filtered = queue.filter((o) => o.tempId !== order.tempId);
-    filtered.push(order);
-    localStorage.setItem(QUEUE_KEY, JSON.stringify(filtered));
-  } catch (err) {
-    console.error("Failed to enqueue offline order:", err);
-  }
+/** Orders that have exhausted MAX_SYNC_ATTEMPTS and need manual attention. */
+export async function getFailedOfflineOrders(restaurantId?: string): Promise<QueuedOfflineOrder[]> {
+  const all = await getOfflineOrdersQueue(restaurantId);
+  return all.filter((o) => o.permanentlyFailed);
 }
 
-export function removeOfflineOrder(tempId: string): void {
-  if (typeof window === "undefined") return;
+/** Orders still eligible for an automatic sync attempt. */
+export async function getPendingOfflineOrders(restaurantId?: string): Promise<QueuedOfflineOrder[]> {
+  const all = await getOfflineOrdersQueue(restaurantId);
+  return all.filter((o) => !o.permanentlyFailed);
+}
+
+/** Reset a permanently-failed order so it will be retried again (e.g. after a manual fix). */
+export async function retryOfflineOrder(tempId: string): Promise<void> {
+  await updateOfflineOrder(tempId, {
+    permanentlyFailed: false,
+    syncAttempts: 0,
+    lastError: undefined,
+  });
+}
+
+/**
+ * Fire-and-forget by design, matching how RestaurantPOS.tsx calls this
+ * today (inside a sync try/catch, never awaited). The actual IndexedDB
+ * write happens in the background; failures are logged, not thrown, so the
+ * settle flow's UI never blocks or breaks on this.
+ */
+export function enqueueOfflineOrder(order: QueuedOfflineOrder): void {
+  dbPutOrder(order).catch((err) => {
+    console.error("Failed to enqueue offline order:", err);
+  });
+}
+
+export async function removeOfflineOrder(tempId: string): Promise<void> {
   try {
-    const queue = getOfflineOrdersQueue();
-    const filtered = queue.filter((o) => o.tempId !== tempId);
-    localStorage.setItem(QUEUE_KEY, JSON.stringify(filtered));
+    await dbDeleteOrder(tempId);
   } catch (err) {
     console.error("Failed to remove offline order:", err);
   }
 }
 
-export function updateOfflineOrder(
+export async function updateOfflineOrder(
   tempId: string,
   patch: Partial<QueuedOfflineOrder>
-): void {
-  if (typeof window === "undefined") return;
+): Promise<void> {
   try {
-    const queue = getOfflineOrdersQueue();
-    const updated = queue.map((o) =>
-      o.tempId === tempId ? { ...o, ...patch } : o
-    );
-    localStorage.setItem(QUEUE_KEY, JSON.stringify(updated));
+    const all = await dbGetAllOrders<QueuedOfflineOrder>();
+    const existing = all.find((o) => o.tempId === tempId);
+    if (!existing) return;
+    await dbPutOrder({ ...existing, ...patch });
   } catch (err) {
     console.error("Failed to update offline order:", err);
   }
 }
 
+// ---------------------------------------------------------------------------
+// Menu / tables cache — also moved to IndexedDB. Both call sites in
+// page.tsx's loadRestaurantData are already inside an async function, so
+// this only requires adding `await` in front of the two READ calls
+// (getCachedMenuItems / getCachedTables) in the catch block; the two WRITE
+// calls (cacheMenuItems / cacheTables) are kept fire-and-forget the same
+// way enqueueOfflineOrder is, so those two call sites need no changes.
+// ---------------------------------------------------------------------------
+
 export function cacheMenuItems(restaurantId: string, items: any[]): void {
-  if (typeof window === "undefined" || !restaurantId) return;
-  try {
-    localStorage.setItem(
-      `${MENU_CACHE_PREFIX}${restaurantId}`,
-      JSON.stringify({
-        cachedAt: new Date().toISOString(),
-        items,
-      })
-    );
-  } catch (err) {
-    console.error("Failed to cache menu items:", err);
-  }
+  if (!restaurantId) return;
+  dbPutCache("menu", restaurantId, { cachedAt: new Date().toISOString(), items }).catch(
+    (err) => console.error("Failed to cache menu items:", err)
+  );
 }
 
-export function getCachedMenuItems(restaurantId: string): any[] | null {
-  if (typeof window === "undefined" || !restaurantId) return null;
+export async function getCachedMenuItems(restaurantId: string): Promise<any[] | null> {
+  if (!restaurantId) return null;
   try {
-    const raw = localStorage.getItem(`${MENU_CACHE_PREFIX}${restaurantId}`);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return parsed?.items || null;
+    const cached = await dbGetCache<{ items: any[] }>("menu", restaurantId);
+    return cached?.items || null;
   } catch (err) {
     console.error("Failed to get cached menu items:", err);
     return null;
@@ -112,32 +151,33 @@ export function getCachedMenuItems(restaurantId: string): any[] | null {
 }
 
 export function cacheTables(restaurantId: string, tables: any[]): void {
-  if (typeof window === "undefined" || !restaurantId) return;
-  try {
-    localStorage.setItem(
-      `${TABLES_CACHE_PREFIX}${restaurantId}`,
-      JSON.stringify({
-        cachedAt: new Date().toISOString(),
-        tables,
-      })
-    );
-  } catch (err) {
-    console.error("Failed to cache tables:", err);
-  }
+  if (!restaurantId) return;
+  dbPutCache("tables", restaurantId, { cachedAt: new Date().toISOString(), tables }).catch(
+    (err) => console.error("Failed to cache tables:", err)
+  );
 }
 
-export function getCachedTables(restaurantId: string): any[] | null {
-  if (typeof window === "undefined" || !restaurantId) return null;
+export async function getCachedTables(restaurantId: string): Promise<any[] | null> {
+  if (!restaurantId) return null;
   try {
-    const raw = localStorage.getItem(`${TABLES_CACHE_PREFIX}${restaurantId}`);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return parsed?.tables || null;
+    const cached = await dbGetCache<{ tables: any[] }>("tables", restaurantId);
+    return cached?.tables || null;
   } catch (err) {
     console.error("Failed to get cached tables:", err);
     return null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Local device settings — unchanged, still localStorage on purpose.
+// getLocalSettings() is called synchronously inside a useState initializer
+// and directly inside JSX (`value={getLocalSettings().paperWidth}`) in
+// RestaurantPOS.tsx — IndexedDB can't support that without restructuring
+// those call sites to state + useEffect, and there's no real benefit to
+// moving two tiny scalar fields off localStorage.
+// ---------------------------------------------------------------------------
+
+const SETTINGS_KEY = "restaurant_iq_local_settings_v1";
 
 type LocalSettings = {
   paperWidth: "80mm" | "58mm";

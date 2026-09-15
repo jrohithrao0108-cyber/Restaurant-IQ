@@ -7,8 +7,8 @@ export default function Loading() {
         alignItems: "center",
         justifyContent: "center",
         minHeight: "100vh",
-        background: "radial-gradient(ellipse at top, #111b2e, #070a12)",
-        color: "#ffffff",
+        background: "#faf7f2",
+        color: "#1c1917",
         fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
         padding: "24px",
       }}
@@ -23,36 +23,26 @@ export default function Loading() {
           textAlign: "center",
         }}
       >
-        {/* Glowing Brand Icon */}
+        {/* Brand Icon */}
         <div
           style={{
             position: "relative",
-            width: "100px",
-            height: "100px",
-            marginBottom: "28px",
+            width: "90px",
+            height: "90px",
+            marginBottom: "24px",
           }}
         >
-          <div
-            style={{
-              position: "absolute",
-              inset: "-8px",
-              borderRadius: "28px",
-              background: "radial-gradient(circle, rgba(16,185,129,0.35) 0%, rgba(16,185,129,0) 70%)",
-              filter: "blur(12px)",
-              animation: "pulse 2s infinite ease-in-out",
-            }}
-          />
           <img
-            src="/icon-192.png"
+            src="/logo.png"
             alt="RestaurantIQ"
-            width={100}
-            height={100}
+            width={90}
+            height={90}
             style={{
               position: "relative",
-              width: "100px",
-              height: "100px",
-              borderRadius: "24px",
-              boxShadow: "0 12px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.1)",
+              width: "90px",
+              height: "90px",
+              borderRadius: "20px",
+              boxShadow: "0 8px 24px rgba(0, 0, 0, 0.08), 0 0 0 1px #ede7dc",
               objectFit: "cover",
             }}
           />
@@ -62,12 +52,10 @@ export default function Loading() {
         <h1
           style={{
             margin: "0 0 8px 0",
-            fontSize: "28px",
+            fontSize: "26px",
             fontWeight: 800,
             letterSpacing: "-0.02em",
-            background: "linear-gradient(135deg, #ffffff 40%, #10b981 100%)",
-            WebkitBackgroundClip: "text",
-            WebkitTextFillColor: "transparent",
+            color: "#1c1917",
           }}
         >
           RestaurantIQ
@@ -75,9 +63,9 @@ export default function Loading() {
 
         <p
           style={{
-            margin: "0 0 28px 0",
+            margin: "0 0 24px 0",
             fontSize: "14px",
-            color: "#94a3b8",
+            color: "#78716c",
             fontWeight: 500,
           }}
         >
@@ -87,13 +75,13 @@ export default function Loading() {
         {/* Animated Progress Shimmer Bar */}
         <div
           style={{
-            width: "180px",
+            width: "160px",
             height: "4px",
-            background: "rgba(255, 255, 255, 0.08)",
+            background: "#ede7dc",
             borderRadius: "999px",
             overflow: "hidden",
             position: "relative",
-            marginBottom: "16px",
+            marginBottom: "14px",
           }}
         >
           <div
@@ -103,7 +91,7 @@ export default function Loading() {
               left: 0,
               height: "100%",
               width: "40%",
-              background: "linear-gradient(90deg, #10b981, #34d399)",
+              background: "linear-gradient(90deg, #d99726, #167a49)",
               borderRadius: "999px",
               animation: "shimmer 1.5s infinite ease-in-out",
             }}
@@ -113,9 +101,8 @@ export default function Loading() {
         <span
           style={{
             fontSize: "12px",
-            color: "#64748b",
+            color: "#78716c",
             fontWeight: 500,
-            letterSpacing: "0.02em",
           }}
         >
           Loading your restaurant workspace...
@@ -123,10 +110,6 @@ export default function Loading() {
       </div>
 
       <style>{`
-        @keyframes pulse {
-          0%, 100% { opacity: 0.4; transform: scale(1); }
-          50% { opacity: 0.9; transform: scale(1.08); }
-        }
         @keyframes shimmer {
           0% { transform: translateX(-100%); }
           100% { transform: translateX(350%); }

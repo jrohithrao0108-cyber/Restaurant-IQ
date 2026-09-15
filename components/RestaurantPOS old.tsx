@@ -37,7 +37,6 @@ import {
   getLocalSettings,
   saveLocalSettings,
 } from "@/lib/offline/offlineStorage";
-import { offlineSyncManager } from "@/lib/offline/offlineSync";
 
 export type Role = "SUPER_ADMIN" | "ADMIN" | "POC";
 
@@ -150,8 +149,9 @@ function normalizeCategory(category: any): string {
   return "Starters";
 }
 
+// Auto-detect veg/non-veg from Indian menu conventions
 function isVeg(name: string, category: string): boolean {
-  const text = `${name}${category}`.toLowerCase();
+  const text = `${name} ${category}`.toLowerCase();
   const nonVegKeywords = [
     "chicken", "mutton", "fish", "prawn", "egg", "meat", "lamb", "pork",
     "beef", "keema", "wings", "tandoori chicken", "tikka chicken", "seafood",
@@ -188,7 +188,6 @@ function cleanDishDisplayName(name: string, category?: string): string {
 
 const HELD_ORDERS_STORAGE_KEY = "restaurant_iq_held_orders";
 const ACTIVE_TABLES_STORAGE_KEY = "restaurant_iq_active_tables";
-const TABLES_CONFIG_STORAGE_KEY = "restaurant_iq_cached_tables_config";
 
 function loadActiveTablesFromStorage(): Order[] {
   try {
@@ -218,28 +217,6 @@ function removeActiveTableFromStorage(tableNumber: string) {
   } catch (e) {}
 }
 
-function loadCachedTablesConfig(): RestaurantTable[] {
-  try {
-    const raw = localStorage.getItem(TABLES_CONFIG_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function saveTablesConfigToStorage(tables: RestaurantTable[]) {
-  try {
-    if (tables && tables.length > 0) {
-      localStorage.setItem(TABLES_CONFIG_STORAGE_KEY, JSON.stringify(tables));
-    }
-  } catch (e) {}
-}
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-function isValidUuid(value?: string | null): value is string {
-  return typeof value === "string" && UUID_RE.test(value);
-}
-
 export function RestaurantPOS({
   products,
   restaurantId,
@@ -267,20 +244,22 @@ export function RestaurantPOS({
   onMenuChanged?: () => Promise<void> | void;
   onLogout?: () => void;
 }) {
-  const safeCreatedByUserId = isValidUuid(createdByUserId) ? createdByUserId : null;
-
+  // View Switcher: POS Menu & Billing vs Tables Floor (30 tables)
   const [activeView, setActiveView] = useState<"POS" | "TABLES">("POS");
 
+  // Navigation & Filtering
   const [selectedCat, setSelectedCat] = useState("All Dishes");
   const [vegFilter, setVegFilter] = useState<"ALL" | "VEG" | "NON_VEG">("ALL");
   const [searchQuery, setSearchQuery] = useState("");
 
+  // Order Details: table defaults to null for Dine-In unless specially selected
   const [source, setSource] = useState<OrderSource>("DINE_IN");
   const [table, setTable] = useState<string | null>(initialTable || null);
   const [serverName, setServerName] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [customerName, setCustomerName] = useState("");
 
+  // Cart & Bill
   const [cart, setCart] = useState<Item[]>([]);
   const [discountPercent, setDiscountPercent] = useState<number>(0);
   const [discountFlat, setDiscountFlat] = useState<number>(0);
@@ -288,24 +267,29 @@ export function RestaurantPOS({
   const [paymentMode, setPaymentMode] = useState<string>("UPI");
   const [cashTendered, setCashTendered] = useState<string>("");
 
+  // Item cooking notes state
   const [editingItemNoteId, setEditingItemNoteId] = useState<string | null>(null);
   const [tempNoteText, setTempNoteText] = useState("");
 
+  // Hold / Recall queue
   const [heldOrders, setHeldOrders] = useState<HeldOrder[]>([]);
   const [showHeldModal, setShowHeldModal] = useState(false);
 
+  // Table Picker modal & Recent Bills modal
   const [showTablePickerModal, setShowTablePickerModal] = useState(false);
   const [pendingKotOnTableSelect, setPendingKotOnTableSelect] = useState(false);
   const [pendingSaveOnTableSelect, setPendingSaveOnTableSelect] = useState(false);
   const [showRecentBillsModal, setShowRecentBillsModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
 
+  // Item management modals
   const [showAddModal, setShowAddModal] = useState(false);
   const [newItemName, setNewItemName] = useState("");
   const [newItemPrice, setNewItemPrice] = useState("");
   const [newItemCategory, setNewItemCategory] = useState("Starters");
   const [addingItem, setAddingItem] = useState(false);
 
+  // Bulk menu creation state
   type BulkDishRow = {
     id: string;
     category: string;
@@ -327,33 +311,35 @@ export function RestaurantPOS({
   const [editingItem, setEditingItem] = useState<Product | null>(null);
   const [editPrice, setEditPrice] = useState("");
 
-  const [autoPrintKot, setAutoPrintKot] = useState(() => getLocalSettings().autoPrintKot);
+  // Status
+  const [autoPrintKot, setAutoPrintKot] = useState(
+    () => getLocalSettings().autoPrintKot
+  );
   const [isOnline, setIsOnline] = useState(true);
   const [saving, setSaving] = useState(false);
   const placingOrderRef = useRef(false);
 
+  // Optimistic instant clearing for tables
   const [settledTableNumbers, setSettledTableNumbers] = useState<Set<string>>(new Set());
   const [settlingTableNumber, setSettlingTableNumber] = useState<string | null>(null);
 
+  // Non-blocking toast notifications
   const [toast, setToast] = useState<{
     text: string;
     type: "success" | "error" | "info";
   } | null>(null);
 
-  function showToast(text: string, type: "success" | "error" | "info" = "success") {
+  function showToast(
+    text: string,
+    type: "success" | "error" | "info" = "success"
+  ) {
     setToast({ text, type });
     setTimeout(() => {
       setToast((current) => (current?.text === text ? null : current));
     }, 2800);
   }
 
-  // Cache table configuration whenever props arrive
-  useEffect(() => {
-    if (restaurantTables && restaurantTables.length > 0) {
-      saveTablesConfigToStorage(restaurantTables);
-    }
-  }, [restaurantTables]);
-
+  // Active products with deduplication and fallback
   const activeProducts = useMemo(() => {
     const raw = products && products.length > 0 ? products : DEMO_PRODUCTS;
     const seen = new Set<string>();
@@ -368,17 +354,13 @@ export function RestaurantPOS({
     });
   }, [products]);
 
-  // 30 Tables floor layout with cached tables fallback
+  // 30 Tables floor layout (T1 to T30 guaranteed)
   const thirtyTables = useMemo(() => {
     const existingMap = new Map<string, RestaurantTable>();
-    const baseTables =
-      restaurantTables && restaurantTables.length > 0
-        ? restaurantTables
-        : loadCachedTablesConfig().length > 0
-        ? loadCachedTablesConfig()
-        : DEMO_TABLES;
-
-    baseTables.forEach((t) => {
+    (restaurantTables && restaurantTables.length > 0
+      ? restaurantTables
+      : DEMO_TABLES
+    ).forEach((t) => {
       existingMap.set(t.tableNumber.trim().toUpperCase(), t);
     });
 
@@ -400,6 +382,7 @@ export function RestaurantPOS({
     return list;
   }, [restaurantTables]);
 
+  // Active running dine-in order by table number
   const tableOrderMap = useMemo(() => {
     const map = new Map<string, Order>();
     const savedActive = loadActiveTablesFromStorage();
@@ -434,6 +417,7 @@ export function RestaurantPOS({
 
   const activeTables = thirtyTables;
 
+  // Dynamic Categories list with live counts
   const categoriesWithCounts = useMemo(() => {
     const counts: Record<string, number> = {
       "All Dishes": activeProducts.length,
@@ -457,6 +441,7 @@ export function RestaurantPOS({
     return list;
   }, [activeProducts]);
 
+  // Sync initial table if passed or selection token changes
   useEffect(() => {
     if (initialTable) {
       const cleanT = initialTable.trim().toUpperCase();
@@ -470,6 +455,7 @@ export function RestaurantPOS({
         if (activeOrd.serverName) setServerName(activeOrd.serverName);
         showToast(`Table ${cleanT} active order loaded`, "info");
       } else {
+        // Table is available/vacant: ALWAYS reset cart so previous table items don't leak!
         setCart([]);
         setDiscountPercent(0);
         setDiscountFlat(0);
@@ -478,41 +464,34 @@ export function RestaurantPOS({
         setServerName("");
       }
     }
-  }, [initialTable, tableSelectionToken]);
+  }, [initialTable, tableSelectionToken, tableOrderMap]);
 
+  // Ensure that under Takeaway, Swiggy, or Zomato, NO tables or table floor can ever be shown
   useEffect(() => {
     if (source !== "DINE_IN") {
-      if (activeView === "TABLES") setActiveView("POS");
-      if (table !== null) setTable(null);
+      if (activeView === "TABLES") {
+        setActiveView("POS");
+      }
+      if (table !== null) {
+        setTable(null);
+      }
     }
   }, [source, activeView, table]);
 
-  // Track network and trigger background sync on reconnect
+  // Track online/offline status
   useEffect(() => {
     setIsOnline(typeof navigator !== "undefined" ? navigator.onLine : true);
-
-    const handleOnline = () => {
-      setIsOnline(true);
-      if (offlineSyncManager && typeof (offlineSyncManager as any).syncAll === "function") {
-        (offlineSyncManager as any).syncAll(undefined, restaurantId || undefined);
-      }
-    };
-
+    const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
-
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
-
-    if (typeof navigator !== "undefined" && navigator.onLine) {
-      handleOnline();
-    }
-
     return () => {
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
     };
-  }, [restaurantId]);
+  }, []);
 
+  // Load held orders from storage
   useEffect(() => {
     try {
       const raw = localStorage.getItem(HELD_ORDERS_STORAGE_KEY);
@@ -527,6 +506,7 @@ export function RestaurantPOS({
     } catch (e) {}
   }
 
+  // Cart operations
   function addToCart(p: Product) {
     setCart((prev) => {
       const existing = prev.find((item) => item.id === p.id);
@@ -566,6 +546,7 @@ export function RestaurantPOS({
     setTempNoteText("");
   }
 
+  // Bill totals calculation
   const subtotal = useMemo(() => {
     return cart.reduce((sum, item) => sum + item.price * item.qty, 0);
   }, [cart]);
@@ -577,21 +558,27 @@ export function RestaurantPOS({
   }, [subtotal, discountPercent, discountFlat]);
 
   const taxableAmount = Math.max(0, subtotal - discountAmount);
+  // Standard Restaurant 5% GST (2.5% CGST + 2.5% SGST)
   const gstAmount = applyGst ? Math.round(taxableAmount * 0.05) : 0;
   const grandTotal = Math.round(taxableAmount + gstAmount);
 
+  // Cash change calculation
   const tenderNumber = Number(cashTendered) || 0;
   const changeDue = tenderNumber > grandTotal ? tenderNumber - grandTotal : 0;
 
+  // Filter products
   const filteredProducts = useMemo(() => {
     return activeProducts.filter((p) => {
+      // Category filter
       if (selectedCat !== "All Dishes") {
         if (normalizeCategory(p.category) !== selectedCat) return false;
       }
+      // Veg / Non-Veg filter
       const veg = isVeg(p.name, p.category);
       if (vegFilter === "VEG" && !veg) return false;
       if (vegFilter === "NON_VEG" && veg) return false;
 
+      // Search query
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
         return p.name.toLowerCase().includes(q);
@@ -600,12 +587,14 @@ export function RestaurantPOS({
     });
   }, [activeProducts, selectedCat, vegFilter, searchQuery]);
 
+  // Cart item quantity map for quick badge on cards
   const cartQtyMap = useMemo(() => {
     const map = new Map<string, number>();
     cart.forEach((i) => map.set(i.id, i.qty));
     return map;
   }, [cart]);
 
+  // HOLD & RECALL
   function handleHoldOrder() {
     if (cart.length === 0) {
       showToast("Cart is empty. Add items before holding an order.", "info");
@@ -621,7 +610,7 @@ export function RestaurantPOS({
       customerName,
       serverName,
       source,
-      table: table || "",
+      table,
       items: [...cart],
       discountPercent,
       discountFlat,
@@ -663,6 +652,7 @@ export function RestaurantPOS({
     if (chId === "DINE_IN") {
       setSource("DINE_IN");
     } else {
+      // TAKEAWAY, SWIGGY, ZOMATO: strictly NO TABLE shown or attached
       setSource(chId);
       setTable(null);
       setActiveView("POS");
@@ -681,8 +671,10 @@ export function RestaurantPOS({
     setSource("DINE_IN");
   }
 
+  // Local cache of unique order keys placed in the active session for strict sequential bill numbering
   const localPlacedOrderKeysRef = useRef<string[]>([]);
 
+  // Sequential Bill No: strictly the count of unique order_id for the day
   function getDailyBillNumber(targetOrderId?: string, targetDbId?: string): number {
     const list = (orders || []).slice();
     list.sort((a, b) => {
@@ -726,6 +718,7 @@ export function RestaurantPOS({
     return uniqueOrderKeys.length + 1;
   }
 
+  // Quick actions for the 30 Tables screen
   function handleQuickPrintTable(order: Order) {
     try {
       if (!order || !order.items || order.items.length === 0) {
@@ -751,7 +744,7 @@ export function RestaurantPOS({
         total: order.total,
         paperWidth: "80mm",
       });
-      showToast(`Bill #${billNo} printed for Table${order.table || ""}`, "success");
+      showToast(`Bill #${billNo} printed for Table ${order.table || ""}`, "success");
     } catch (e) {
       showToast("Bill receipt sent to printer.", "info");
     }
@@ -762,10 +755,11 @@ export function RestaurantPOS({
     const cleanTable = (order.table || "").trim().toUpperCase();
 
     try {
+      // 1. INSTANT OPTIMISTIC UI CLEARING (0ms):
+      // Mark table vacant immediately in UI without waiting for network
       if (cleanTable) {
         setSettledTableNumbers((prev) => new Set([...prev, cleanTable]));
         setSettlingTableNumber(cleanTable);
-        removeActiveTableFromStorage(cleanTable);
       }
 
       if (table && table.trim().toUpperCase() === cleanTable) {
@@ -777,6 +771,7 @@ export function RestaurantPOS({
 
       const billNo = getDailyBillNumber(order.id, order.databaseId);
 
+      // 2. Mark order completed in parent state
       const closedOrder: Order = {
         ...order,
         status: "COMPLETED",
@@ -784,7 +779,9 @@ export function RestaurantPOS({
       };
       onPlaced(closedOrder);
 
+      // 3. PERSIST TO SUPABASE (Non-blocking background update)
       if (isSupabaseConfigured && !restaurantId.startsWith("demo-")) {
+        // A. Close by table number (instant via idx_orders_active_table)
         if (cleanTable) {
           Promise.resolve(
             supabase
@@ -797,10 +794,15 @@ export function RestaurantPOS({
               .eq("table_number", cleanTable)
               .is("closed_at", null)
           )
-            .then(() => setSettlingTableNumber(null))
-            .catch(() => setSettlingTableNumber(null));
+            .then(() => {
+              setSettlingTableNumber(null);
+            })
+            .catch(() => {
+              setSettlingTableNumber(null);
+            });
         }
 
+        // B. Also close by UUID if order.databaseId is a valid UUID
         if (
           order.databaseId &&
           /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
@@ -820,6 +822,7 @@ export function RestaurantPOS({
         setSettlingTableNumber(null);
       }
 
+      // 4. NON-BLOCKING ASYNC PRINTING (Does NOT freeze the screen)
       if (order && order.items && order.items.length > 0) {
         setTimeout(() => {
           try {
@@ -869,6 +872,7 @@ export function RestaurantPOS({
       if (order.serverName) setServerName(order.serverName);
       showToast(`Table ${cleanT} active order loaded`, "info");
     } else {
+      // Vacant table selected: clear cart so previous order dishes are never shown
       setCart([]);
       setDiscountPercent(0);
       setDiscountFlat(0);
@@ -884,7 +888,7 @@ export function RestaurantPOS({
   async function executeSaveTableOrder(targetTable: string | null, shouldPrintKot: boolean) {
     const settings = getLocalSettings();
     const orderNumber = `KOT-${Date.now().toString().slice(-4)}`;
-
+    console.log("hello")
     if (shouldPrintKot) {
       try {
         printKitchenOrderTicket({
@@ -901,6 +905,7 @@ export function RestaurantPOS({
       }
     }
 
+    // Save running order for table so it remains occupied on the floor
     if (source === "DINE_IN" && targetTable) {
       const cleanTable = targetTable.trim().toUpperCase();
       setSettledTableNumbers((prev) => {
@@ -932,55 +937,81 @@ export function RestaurantPOS({
       };
 
       onPlaced(openOrder);
-      saveActiveTableToStorage(openOrder);
 
-      // Local-first: always write to the durable queue immediately, never
-      // block this action on a network round-trip. orderPhase "OPEN" tells
-      // the sync manager to merge into the table's running order without
-      // closing it (see offlineSync.ts's syncOneOrder) — identical end
-      // result to the old inline Supabase block, just executed in the
-      // background instead of inline here.
-      const kotTempId = `kot-${cleanTable}-${Date.now()}`;
-      enqueueOfflineOrder({
-        tempId: kotTempId,
-        restaurantId,
-        createdByUserId: safeCreatedByUserId,
-        orderNumber: openOrder.id,
-        orderType: "DINE_IN",
-        tableNumber: cleanTable,
-        channel: "DINE_IN",
-        paymentMode,
-        total: grandTotal,
-        status: "PENDING",
-        items: cart.map((item) => ({
-          id: item.id,
-          name: item.name,
-          price: item.price,
-          qty: item.qty,
-          notes: item.notes,
-          category: item.category,
-        })),
-        createdAt: openOrder.createdAt,
-        syncAttempts: 0,
-        orderPhase: "OPEN",
-      });
+      // Persist to Supabase if connected
+      if (isSupabaseConfigured && !restaurantId.startsWith("demo-")) {
+        try {
+          const { data: existingOpen } = await supabase
+            .from("orders")
+            .select("id, order_number, total")
+            .eq("restaurant_id", restaurantId)
+            .eq("table_number", cleanTable)
+            .is("closed_at", null)
+            .neq("status", "cancelled")
+            .order("created_at",{ascending:false})
+            .limit(1)
+            .maybeSingle();
 
-      // Fire-and-forget: pushes now if online, otherwise the 3.5s
-      // background loop (or the next online/focus event) picks it up.
-      // Never awaited — this function must return instantly regardless
-      // of connectivity.
-      offlineSyncManager.syncAll(undefined, restaurantId).catch(() => {});
+          if (existingOpen) {
+            openOrder.databaseId = existingOpen.id;
+            onPlaced({ ...openOrder, databaseId: existingOpen.id });
+
+            await supabase
+              .from("orders")
+              .update({ total: grandTotal })
+              .eq("id", existingOpen.id);
+
+            const orderItems = cart.map((item) => ({
+              order_id: existingOpen.id,
+              menu_item_id: item.id,
+              name_snapshot: item.name,
+              price_snapshot: item.price,
+              qty: item.qty,
+            }));
+            await supabase.from("order_items").insert(orderItems);
+          } else {
+            const { data: insertedOrder } = await supabase
+              .from("orders")
+              .insert({
+                restaurant_id: restaurantId,
+                created_by: createdByUserId || null,
+                order_number: openOrder.id,
+                order_type: "DINE_IN",
+                table_number: cleanTable,
+                channel: "DINE_IN",
+                payment_mode: paymentMode,
+                total: grandTotal,
+                status: "PENDING",
+                closed_at: null,
+              })
+              .select()
+              .maybeSingle();
+
+            if (insertedOrder) {
+              openOrder.databaseId = insertedOrder.id;
+              onPlaced({ ...openOrder, databaseId: insertedOrder.id });
+
+              const orderItems = cart.map((item) => ({
+                order_id: insertedOrder.id,
+                menu_item_id: item.id,
+                name_snapshot: item.name,
+                price_snapshot: item.price,
+                qty: item.qty,
+              }));
+              await supabase.from("order_items").insert(orderItems);
+            }
+          }
+        } catch (dbErr) {
+          console.warn("Table order cloud sync warning:", dbErr);
+        }
+      }
 
       if (shouldPrintKot) {
         showToast(`KOT sent & Table ${cleanTable} order saved!`, "success");
       } else {
         showToast(`Table ${cleanTable} order saved! (No KOT printed)`, "success");
       }
-
-      // Clear cart items but preserve the active table selection for waiter convenience
-      setCart([]);
-      setDiscountPercent(0);
-      setDiscountFlat(0);
+      resetOrderForm();
     } else {
       if (shouldPrintKot) {
         showToast(`KOT ${orderNumber} printed.`, "success");
@@ -1056,6 +1087,7 @@ export function RestaurantPOS({
       if (activeOrd.serverName) setServerName(activeOrd.serverName);
       showToast(`Table ${cleanT} active order loaded (${activeOrd.items.length} items)`, "info");
     } else {
+      // Vacant table selected from picker: reset cart so previous items don't leak
       setCart([]);
       setDiscountPercent(0);
       setDiscountFlat(0);
@@ -1066,6 +1098,7 @@ export function RestaurantPOS({
     }
   }
 
+  // 2. PRINT BILL (Customer Check / Receipt Preview)
   function handlePrintCustomerBill() {
     if (cart.length === 0) {
       showToast("Cart is empty. Please add items to print bill.", "info");
@@ -1102,7 +1135,7 @@ export function RestaurantPOS({
     }
   }
 
-  // 3. SETTLE & BILL WITH FAIL-SAFE 3.5s TIMEOUT & OFFLINE QUEUE
+  // 3. SETTLE & BILL (Completes transaction & clears table)
   async function handleSaveOrder() {
     if (placingOrderRef.current || saving) return;
     if (cart.length === 0) {
@@ -1110,23 +1143,27 @@ export function RestaurantPOS({
       return;
     }
 
-    const cleanTable = source === "DINE_IN" ? (table ? table.trim().toUpperCase() : null) : null;
+    const cleanTable = source === "DINE_IN" ? (table ? table.trim() : null) : null;
     const orderNumber = `ORD-${Date.now().toString().slice(-5)}`;
     const settings = getLocalSettings();
 
     placingOrderRef.current = true;
     setSaving(true);
 
+    // Guaranteed unlock safety timer
+    const safetyTimer = setTimeout(() => {
+      placingOrderRef.current = false;
+      setSaving(false);
+    }, 8000);
+
     function queueOffline() {
       const tempId = `offline-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      const nowIso = new Date().toISOString();
-
       try {
         enqueueOfflineOrder({
           tempId,
           restaurantId,
           orderNumber,
-          createdByUserId: safeCreatedByUserId,
+          createdByUserId: createdByUserId || null,
           orderType: source,
           tableNumber: source === "DINE_IN" ? cleanTable : null,
           channel: source,
@@ -1141,7 +1178,7 @@ export function RestaurantPOS({
             notes: c.notes,
             category: c.category,
           })),
-          createdAt: nowIso,
+          createdAt: new Date().toISOString(),
           syncAttempts: 0,
         });
       } catch (e) {}
@@ -1158,8 +1195,8 @@ export function RestaurantPOS({
         items: cart,
         total: grandTotal,
         payment: paymentMode,
-        createdAt: nowIso,
-        closedAt: nowIso, // Marked closed immediately
+        createdAt: new Date().toISOString(),
+        closedAt: null,
         serverName,
         customerPhone,
         customerName,
@@ -1171,7 +1208,6 @@ export function RestaurantPOS({
 
       if (source === "DINE_IN" && cleanTable) {
         setSettledTableNumbers((prev) => new Set([...prev, cleanTable]));
-        removeActiveTableFromStorage(cleanTable);
       }
 
       resetOrderForm();
@@ -1215,7 +1251,7 @@ export function RestaurantPOS({
             printKitchenOrderTicket({
               restaurantName,
               orderNumber,
-              table: source === "DINE_IN" ? (cleanTable || undefined) : undefined,
+              table: source === "DINE_IN" ? cleanTable : undefined,
               source,
               items: cart,
               serverName,
@@ -1226,22 +1262,238 @@ export function RestaurantPOS({
       }, 50);
     }
 
-    // Local-first: settling a table is now always an instant local write,
-    // never a network round-trip. queueOffline() above already builds the
-    // Order, updates React state, marks the table settled, resets the form,
-    // and prints the bill — all synchronous/local. Sync to Supabase happens
-    // afterward via the same background sync loop used everywhere else
-    // (continuous 3.5s drain, online/focus triggers), so a flaky-but-not-
-    // technically-offline connection can never make this action hang.
     try {
-      queueOffline();
-      offlineSyncManager.syncAll(undefined, restaurantId).catch(() => {});
+      if (
+        !isSupabaseConfigured ||
+        restaurantId.startsWith("demo-") ||
+        (typeof navigator !== "undefined" && !navigator.onLine)
+      ) {
+        queueOffline();
+        return;
+      }
+
+      let orderRecord: any;
+      let finalItems: Item[] = cart;
+      let finalTotal = grandTotal;
+      let finalOrderNumber = orderNumber;
+
+      // ATTEMPT FAST-PATH: Single-roundtrip atomic database procedure (<250ms)
+      let rpcSucceeded = false;
+      try {
+        const { data: rpcData, error: rpcError } = await supabase.rpc(
+          "create_complete_order",
+          {
+            p_restaurant_id: restaurantId,
+            p_order_number: orderNumber,
+            p_order_type: source,
+            p_table_number: cleanTable,
+            p_channel: source,
+            p_payment_mode: paymentMode,
+            p_subtotal: subtotal,
+            p_discount: discountAmount,
+            p_tax: gstAmount,
+            p_total: grandTotal,
+            p_created_by: createdByUserId || null,
+            p_items: cart.map((c) => ({
+              menu_item_id: c.id,
+              name: c.name,
+              price: c.price,
+              qty: c.qty,
+            })),
+            p_is_settled: true,
+          }
+        );
+
+        if (!rpcError && rpcData && rpcData.id) {
+          orderRecord = rpcData;
+          finalOrderNumber = rpcData.order_number || orderNumber;
+          finalTotal = Number(rpcData.total) || grandTotal;
+          rpcSucceeded = true;
+        }
+      } catch (e) {
+        rpcSucceeded = false;
+      }
+
+      // FALLBACK: Sequential 3-hop waterfall if RPC function is not yet installed in Supabase
+      if (!rpcSucceeded) {
+        let targetOrderId: string | null = null;
+        let existingTotal = 0;
+
+        if (source === "DINE_IN" && cleanTable) {
+          const { data: existingOpenOrder } = await supabase
+            .from("orders")
+            .select("id, order_number, total")
+            .eq("restaurant_id", restaurantId)
+            .eq("table_number", cleanTable)
+            .is("closed_at", null)
+            .neq("status", "CANCELLED")
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (existingOpenOrder) {
+            targetOrderId = existingOpenOrder.id;
+            existingTotal = Number(existingOpenOrder.total) || 0;
+          }
+        }
+
+        if (targetOrderId) {
+          finalTotal = existingTotal + grandTotal;
+          const { data: updatedOrder, error: updateError } = await supabase
+            .from("orders")
+            .update({
+              total: finalTotal,
+              payment_mode: paymentMode,
+              status: "COMPLETED",
+              closed_at: new Date().toISOString(),
+            })
+            .eq("id", targetOrderId)
+            .select()
+            .maybeSingle();
+
+          if (updateError) throw updateError;
+          orderRecord = updatedOrder;
+          finalOrderNumber = updatedOrder.order_number;
+
+          const orderItems = cart.map((item) => ({
+            order_id: targetOrderId,
+            menu_item_id: item.id,
+            name_snapshot: item.name,
+            price_snapshot: item.price,
+            qty: item.qty,
+          }));
+
+          const { error: itemError } = await supabase
+            .from("order_items")
+            .insert(orderItems);
+          if (itemError) throw itemError;
+        } else {
+          const { data: newOrder, error: orderError } = await supabase
+            .from("orders")
+            .insert({
+              restaurant_id: restaurantId,
+              created_by: createdByUserId || null,
+              order_number: orderNumber,
+              order_type: source,
+              table_number: source === "DINE_IN" ? cleanTable : null,
+              channel: source,
+              payment_mode: paymentMode,
+              total: grandTotal,
+              status: "COMPLETED",
+              closed_at: new Date().toISOString(),
+            })
+            .select()
+            .maybeSingle();
+
+          if (orderError) throw orderError;
+          orderRecord = newOrder;
+
+          const orderItems = cart.map((item) => ({
+            order_id: newOrder.id,
+            menu_item_id: item.id,
+            name_snapshot: item.name,
+            price_snapshot: item.price,
+            qty: item.qty,
+          }));
+
+          const { error: itemError } = await supabase
+            .from("order_items")
+            .insert(orderItems);
+          if (itemError) throw itemError;
+        }
+      }
+
+      const placedOrder: Order = {
+        id: finalOrderNumber,
+        databaseId: orderRecord.id,
+        time: new Date(orderRecord.created_at).toLocaleTimeString("en-IN", {
+          hour: "numeric",
+          minute: "2-digit",
+        }),
+        source,
+        table: source === "DINE_IN" ? (cleanTable || undefined) : undefined,
+        items: finalItems,
+        total: finalTotal,
+        payment: paymentMode,
+        createdAt: orderRecord.created_at,
+        closedAt: orderRecord.closed_at,
+        serverName,
+        customerPhone,
+        customerName,
+        discountAmount,
+        subtotal,
+      };
+
+      onPlaced(placedOrder);
+
+      if (source === "DINE_IN" && cleanTable) {
+        setSettledTableNumbers((prev) => new Set([...prev, cleanTable]));
+      }
+
+      resetOrderForm();
+      showToast(
+        cleanTable
+          ? `Order ${finalOrderNumber} (Table ${cleanTable}) settled successfully! Bill printed.`
+          : `Order ${finalOrderNumber} settled successfully! Bill printed.`,
+        "success"
+      );
+
+      const billNo = getDailyBillNumber(finalOrderNumber, orderRecord?.id);
+      setTimeout(() => {
+        try {
+          printCustomerBillReceipt({
+            restaurantName,
+            orderNumber: finalOrderNumber,
+            billNo,
+            tokenNo: billNo,
+            table: source === "DINE_IN" ? (cleanTable || undefined) : undefined,
+            source,
+            paymentMode,
+            customerName: customerName.trim() || undefined,
+            cashierName: serverName.trim() || "biller",
+            items: cart,
+            subtotal,
+            discountAmount,
+            taxCgstPercent: applyGst ? 2.5 : 0,
+            taxSgstPercent: applyGst ? 2.5 : 0,
+            total: grandTotal,
+            paperWidth: settings.paperWidth,
+          });
+        } catch (e) {}
+
+        if (autoPrintKot) {
+          try {
+            printKitchenOrderTicket({
+              restaurantName,
+              orderNumber: finalOrderNumber,
+              table: source === "DINE_IN" ? cleanTable : undefined,
+              source,
+              items: cart,
+              serverName,
+              paperWidth: settings.paperWidth,
+            });
+          } catch (e) {}
+        }
+      }, 50);
+    } catch (err: any) {
+      console.error("Order error:", err);
+      const isNet =
+        !navigator.onLine ||  
+        err?.message?.includes("fetch") ||
+        err?.message?.includes("Failed to fetch");
+      if (isNet) {
+        try { queueOffline(); } catch (e) {}
+      } else {
+        showToast(err?.message || "Failed to settle order.", "error");
+      }
     } finally {
+      clearTimeout(safetyTimer);
       placingOrderRef.current = false;
       setSaving(false);
     }
   }
 
+  // Update item price
   async function handleUpdatePrice() {
     if (!editingItem) return;
     const priceNum = Number(editPrice);
@@ -1259,12 +1511,13 @@ export function RestaurantPOS({
       }
       if (onMenuChanged) await onMenuChanged();
       setEditingItem(null);
-      showToast(`Price updated to ₹${priceNum} for${editingItem.name}`, "success");
+      showToast(`Price updated to ₹${priceNum} for ${editingItem.name}`, "success");
     } catch (e: any) {
       showToast(e?.message || "Could not update price.", "error");
     }
   }
 
+  // Add new dish
   async function handleAddDish() {
     if (!newItemName.trim() || !newItemPrice || Number(newItemPrice) <= 0) {
       showToast("Provide a dish name and valid price.", "error");
@@ -1295,6 +1548,7 @@ export function RestaurantPOS({
     }
   }
 
+  // Bulk Menu Helpers
   function handleAddBulkRow() {
     const lastCat = bulkRows.length > 0 ? bulkRows[bulkRows.length - 1].category : "Mains";
     setBulkRows((prev) => [
@@ -1342,6 +1596,7 @@ export function RestaurantPOS({
     const parsed: BulkDishRow[] = [];
 
     lines.forEach((line, idx) => {
+      // Ignore common header lines if user pasted with header
       if (/^(category|dish|name|item|cost|price)/i.test(line)) return;
 
       const delimiter = line.includes("\t") ? "\t" : line.includes(",") ? "," : ";";
@@ -1421,6 +1676,7 @@ export function RestaurantPOS({
 
   return (
     <div className="restaurant-iq-pos">
+      {/* Toast Notification Banner */}
       {toast && (
         <div className={`pos-toast-banner ${toast.type}`}>
           <span className="toast-icon">
@@ -1439,6 +1695,7 @@ export function RestaurantPOS({
 
       {/* 1. TOP CONTROL BAR */}
       <header className="pos-top-bar">
+        {/* Left Brand Badge */}
         <div className="pos-brand-cluster">
           <div className="pos-brand-logo">
             <img src="/logo.png" alt="RestaurantIQ" className="pos-brand-img" />
@@ -1449,6 +1706,7 @@ export function RestaurantPOS({
           </div>
         </div>
 
+        {/* View Switcher: ONLY shown for DINE_IN since Takeaway / Swiggy / Zomato have NO tables */}
         {source === "DINE_IN" ? (
           <div className="pos-view-switcher">
             <button
@@ -1482,6 +1740,7 @@ export function RestaurantPOS({
 
         <div className="top-divider" />
 
+        {/* Order Channel Selector */}
         <div className="pos-channel-group">
           {ORDER_CHANNELS.map((ch) => (
             <button
@@ -1495,6 +1754,7 @@ export function RestaurantPOS({
           ))}
         </div>
 
+        {/* Dine-In Table Picker Trigger */}
         {source === "DINE_IN" && (
           <div className="pos-table-selector-container">
             <button
@@ -1539,6 +1799,7 @@ export function RestaurantPOS({
           </div>
         )}
 
+        {/* Server input */}
         {source === "DINE_IN" && (
           <div className="pos-mini-input server-input">
             <Utensils size={12} />
@@ -1550,9 +1811,12 @@ export function RestaurantPOS({
           </div>
         )}
 
+        {/* Spacer */}
         <div className="top-spacer" />
 
+        {/* Top Right Utility Actions: Only Logout retained */}
         <div className="pos-top-actions">
+          {/* Logout Button */}
           <button
             type="button"
             className="pos-tool-btn logout-btn"
@@ -1576,7 +1840,7 @@ export function RestaurantPOS({
         </div>
       </header>
 
-      {/* 2. MAIN BODY */}
+      {/* 2. MAIN BODY (POS MENU & BILLING OR 30 TABLES FLOOR SCREEN) */}
       <div className="pos-main-body">
         {activeView === "TABLES" && source === "DINE_IN" ? (
           <div className="pos-tables-screen">
@@ -1690,573 +1954,592 @@ export function RestaurantPOS({
           <>
             {/* COLUMN 1: VERTICAL CATEGORY RAIL */}
             <aside className="pos-vertical-category-rail">
-              <div className="vertical-cat-header">
-                <span className="rail-title">Categories</span>
-                <span className="rail-count">{categoriesWithCounts.length}</span>
-              </div>
+          <div className="vertical-cat-header">
+            <span className="rail-title">Categories</span>
+            <span className="rail-count">{categoriesWithCounts.length}</span>
+          </div>
 
-              <div className="vertical-cat-list">
-                {categoriesWithCounts.map((cat) => {
-                  const icon = CATEGORY_ICONS[cat.name] || "🍴";
-                  const isSelected = selectedCat === cat.name;
+          <div className="vertical-cat-list">
+            {categoriesWithCounts.map((cat) => {
+              const icon = CATEGORY_ICONS[cat.name] || "🍴";
+              const isSelected = selectedCat === cat.name;
 
-                  return (
-                    <button
-                      key={cat.name}
-                      type="button"
-                      className={`vertical-cat-btn ${isSelected ? "active" : ""}`}
-                      onClick={() => setSelectedCat(cat.name)}
-                    >
-                      <span className="cat-icon">{icon}</span>
-                      <span className="cat-name">{cat.name}</span>
-                      <span className="cat-badge">{cat.count}</span>
-                      {isSelected && <div className="cat-active-indicator" />}
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div className="vertical-cat-footer">
+              return (
                 <button
+                  key={cat.name}
                   type="button"
-                  className="quick-add-dish-btn"
-                  onClick={() => setShowAddModal(true)}
+                  className={`vertical-cat-btn ${isSelected ? "active" : ""}`}
+                  onClick={() => setSelectedCat(cat.name)}
                 >
-                  <Plus size={13} />
-                  <span>+ Add Dish</span>
+                  <span className="cat-icon">{icon}</span>
+                  <span className="cat-name">{cat.name}</span>
+                  <span className="cat-badge">{cat.count}</span>
+                  {isSelected && <div className="cat-active-indicator" />}
                 </button>
+              );
+            })}
+          </div>
+
+          <div className="vertical-cat-footer">
+            <button
+              type="button"
+              className="quick-add-dish-btn"
+              onClick={() => setShowAddModal(true)}
+            >
+              <Plus size={13} />
+              <span>+ Add Dish</span>
+            </button>
+            <button
+              type="button"
+              className="quick-add-dish-btn bulk-btn"
+              onClick={() => setShowBulkModal(true)}
+              style={{
+                background: "#fef9ee",
+                borderColor: "#fde68a",
+                color: "#c88719",
+                fontWeight: 700,
+              }}
+              title="Create multiple menu items at once"
+            >
+              <Plus size={13} />
+              <span>⚡ Bulk Create Menu</span>
+            </button>
+
+            <div className="terminal-shift-pill">
+              <div className="shift-dot-row">
+                <span className="live-dot" />
+                <span>POS Active</span>
+              </div>
+              <div className="shift-info-row">
+                <span>Shift: <b>{restaurantName || "Counter"}</b></span>
+                <span>Bills: <b>{orders?.length || 0}</b></span>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        {/* COLUMN 2: DISH CATALOG GRID */}
+        <main className="pos-catalog-panel">
+          {/* Catalog Toolbar */}
+          <div className="catalog-toolbar">
+            <div className="catalog-title-wrap">
+              <h2>{selectedCat}</h2>
+              <span className="item-count-sub">
+                {filteredProducts.length} items
+              </span>
+            </div>
+
+            {/* FSSAI Veg / Non-Veg Standard Filter */}
+            <div className="veg-filter-pills">
+              <button
+                type="button"
+                className={`veg-pill ${vegFilter === "ALL" ? "active" : ""}`}
+                onClick={() => setVegFilter("ALL")}
+              >
+                All
+              </button>
+              <button
+                type="button"
+                className={`veg-pill veg ${vegFilter === "VEG" ? "active" : ""}`}
+                onClick={() => setVegFilter("VEG")}
+              >
+                <span className="veg-dot" />
+                Veg
+              </button>
+              <button
+                type="button"
+                className={`veg-pill non-veg ${
+                  vegFilter === "NON_VEG" ? "active" : ""
+                }`}
+                onClick={() => setVegFilter("NON_VEG")}
+              >
+                <span className="non-veg-triangle" />
+                Non-Veg
+              </button>
+            </div>
+
+            {/* Instant Search Bar */}
+            <div className="pos-search-box">
+              <Search size={14} />
+              <input
+                placeholder="Search dish name..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+              {searchQuery && (
                 <button
                   type="button"
-                  className="quick-add-dish-btn bulk-btn"
-                  onClick={() => setShowBulkModal(true)}
-                  style={{
-                    background: "#fef9ee",
-                    borderColor: "#fde68a",
-                    color: "#c88719",
-                    fontWeight: 700,
+                  className="clear-search"
+                  onClick={() => setSearchQuery("")}
+                >
+                  <X size={12} />
+                </button>
+              )}
+            </div>
+
+            {/* Bulk Menu Create Button */}
+            <button
+              type="button"
+              className="toolbar-bulk-btn"
+              onClick={() => setShowBulkModal(true)}
+              title="Bulk create dishes with category, name and cost"
+            >
+              <Plus size={12} />
+              <span>⚡ Bulk Menu</span>
+            </button>
+          </div>
+
+          {/* Dishes Cards Grid */}
+          <div className="dishes-grid">
+            {filteredProducts.map((p) => {
+              const veg = isVeg(p.name, p.category);
+              const qtyInCart = cartQtyMap.get(p.id) || 0;
+
+              return (
+                <div
+                  key={p.id}
+                  className={`dish-card ${qtyInCart > 0 ? "in-cart" : ""}`}
+                  onClick={() => addToCart(p)}
+                >
+                  <div className="dish-card-top">
+                    {/* FSSAI Standard Indicator */}
+                    <div className={`fssai-symbol ${veg ? "veg" : "non-veg"}`}>
+                      <div className="symbol-inner" />
+                    </div>
+
+                    <span className="dish-price">{money(p.price)}</span>
+                  </div>
+
+                  <div className="dish-info">
+                    <h3 className="dish-name" title={cleanDishDisplayName(p.name, p.category)}>
+                      {cleanDishDisplayName(p.name, p.category)}
+                    </h3>
+                  </div>
+
+                  <div className="dish-card-bottom">
+                    {qtyInCart > 0 ? (
+                      <div
+                        className="card-stepper"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          className="card-step-btn minus"
+                          onClick={() => decrementCart(p.id)}
+                          title="Decrease"
+                        >
+                          <Minus size={11} />
+                        </button>
+                        <span className="card-qty">{qtyInCart}</span>
+                        <button
+                          type="button"
+                          className="card-step-btn plus"
+                          onClick={() => addToCart(p)}
+                          title="Increase"
+                        >
+                          <Plus size={11} />
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        className="card-add-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          addToCart(p);
+                        }}
+                      >
+                        <Plus size={11} />
+                        <span>Add</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      className="edit-dish-price-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditingItem(p);
+                        setEditPrice(String(p.price));
+                      }}
+                      title="Edit Price"
+                    >
+                      <Edit2 size={11} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+
+            {filteredProducts.length === 0 && (
+              <div className="empty-catalog-state">
+                <Utensils size={32} />
+                <p>No dishes found matching your filter.</p>
+                <button
+                  type="button"
+                  className="reset-filters-btn"
+                  onClick={() => {
+                    setSelectedCat("All Dishes");
+                    setVegFilter("ALL");
+                    setSearchQuery("");
                   }}
-                  title="Create multiple menu items at once"
                 >
-                  <Plus size={13} />
-                  <span>⚡ Bulk Create Menu</span>
+                  Reset Filters
                 </button>
-
-                <div className="terminal-shift-pill">
-                  <div className="shift-dot-row">
-                    <span className="live-dot" />
-                    <span>POS Active</span>
-                  </div>
-                  <div className="shift-info-row">
-                    <span>Shift: <b>{restaurantName || "Counter"}</b></span>
-                    <span>Bills: <b>{orders?.length || 0}</b></span>
-                  </div>
-                </div>
               </div>
-            </aside>
+            )}
+          </div>
+        </main>
 
-            {/* COLUMN 2: DISH CATALOG GRID */}
-            <main className="pos-catalog-panel">
-              <div className="catalog-toolbar">
-                <div className="catalog-title-wrap">
-                  <h2>{selectedCat}</h2>
-                  <span className="item-count-sub">
-                    {filteredProducts.length} items
-                  </span>
-                </div>
-
-                <div className="veg-filter-pills">
-                  <button
-                    type="button"
-                    className={`veg-pill ${vegFilter === "ALL" ? "active" : ""}`}
-                    onClick={() => setVegFilter("ALL")}
-                  >
-                    All
-                  </button>
-                  <button
-                    type="button"
-                    className={`veg-pill veg ${vegFilter === "VEG" ? "active" : ""}`}
-                    onClick={() => setVegFilter("VEG")}
-                  >
-                    <span className="veg-dot" />
-                    Veg
-                  </button>
-                  <button
-                    type="button"
-                    className={`veg-pill non-veg ${
-                      vegFilter === "NON_VEG" ? "active" : ""
-                    }`}
-                    onClick={() => setVegFilter("NON_VEG")}
-                  >
-                    <span className="non-veg-triangle" />
-                    Non-Veg
-                  </button>
-                </div>
-
-                <div className="pos-search-box">
-                  <Search size={14} />
-                  <input
-                    placeholder="Search dish name..."
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                  />
-                  {searchQuery && (
-                    <button
-                      type="button"
-                      className="clear-search"
-                      onClick={() => setSearchQuery("")}
-                    >
-                      <X size={12} />
-                    </button>
-                  )}
-                </div>
-
+        {/* COLUMN 3: BILLING & CHECKOUT TERMINAL */}
+        <aside className="pos-checkout-panel">
+          {/* Order Ticket Header */}
+          <div className="ticket-header">
+            <div className="ticket-channel-info">
+              <span
+                className="ticket-channel-badge clickable"
+                onClick={() => {
+                  if (source === "DINE_IN") {
+                    setShowTablePickerModal(true);
+                  } else {
+                    handleSelectChannel("DINE_IN");
+                  }
+                }}
+                title={
+                  source === "DINE_IN"
+                    ? "Click to pick or change table"
+                    : "Click to switch to Dine-In Tables"
+                }
+                style={{ cursor: "pointer" }}
+              >
+                {source === "DINE_IN"
+                  ? (table ? `🍽️ Dine-In • Table ${table}` : "🍽️ Dine-In (No Table)")
+                  : source === "TAKEAWAY"
+                  ? "🛍️ Takeaway (No Table)"
+                  : source === "SWIGGY"
+                  ? "🛵 Swiggy (No Table)"
+                  : "🛵 Zomato (No Table)"}
+              </span>
+              {source === "DINE_IN" && table && (
                 <button
                   type="button"
-                  className="toolbar-bulk-btn"
-                  onClick={() => setShowBulkModal(true)}
-                  title="Bulk create dishes with category, name and cost"
+                  className="ticket-clear-table-pill"
+                  onClick={() => {
+                    setTable(null);
+                    showToast("Table unassigned (Dine-In without table)", "info");
+                  }}
+                  title="Unassign table number"
                 >
-                  <Plus size={12} />
-                  <span>⚡ Bulk Menu</span>
+                  Clear Table
                 </button>
+              )}
+              <span className="ticket-clock">
+                <Clock size={11} />
+                {new Date().toLocaleTimeString("en-IN", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
+              </span>
+            </div>
+
+            {cart.length > 0 && (
+              <button
+                type="button"
+                className="clear-cart-btn"
+                onClick={() => setCart([])}
+                title="Clear Cart"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+
+          {/* Cart Items List */}
+          <div className="cart-items-container">
+            {cart.length === 0 ? (
+              <div className="empty-cart-message">
+                <Utensils size={28} />
+                <b>Order Cart is Empty</b>
+                <span>Click any dish to add to the bill</span>
               </div>
-
-              <div className="dishes-grid">
-                {filteredProducts.map((p) => {
-                  const veg = isVeg(p.name, p.category);
-                  const qtyInCart = cartQtyMap.get(p.id) || 0;
-
+            ) : (
+              <div className="cart-items-list">
+                {cart.map((item) => {
+                  const veg = isVeg(item.name, item.category);
+                  const displayName = cleanDishDisplayName(item.name, item.category);
                   return (
-                    <div
-                      key={p.id}
-                      className={`dish-card ${qtyInCart > 0 ? "in-cart" : ""}`}
-                      onClick={() => addToCart(p)}
-                    >
-                      <div className="dish-card-top">
-                        <div className={`fssai-symbol ${veg ? "veg" : "non-veg"}`}>
-                          <div className="symbol-inner" />
-                        </div>
-                        <span className="dish-price">{money(p.price)}</span>
-                      </div>
-
-                      <div className="dish-info">
-                        <h3 className="dish-name" title={cleanDishDisplayName(p.name, p.category)}>
-                          {cleanDishDisplayName(p.name, p.category)}
-                        </h3>
-                      </div>
-
-                      <div className="dish-card-bottom">
-                        {qtyInCart > 0 ? (
-                          <div
-                            className="card-stepper"
-                            onClick={(e) => e.stopPropagation()}
+                    <div key={item.id} className="cart-item-row">
+                      {/* Left: Veg Dot, Dish Name, Inline Note */}
+                      <div className="cart-item-left" title={displayName}>
+                        <span
+                          className={`cart-veg-dot ${
+                            veg ? "veg" : "non-veg"
+                          }`}
+                        />
+                        <span className="cart-item-name">{displayName}</span>
+                        {item.notes ? (
+                          <span
+                            className="item-note-pill inline"
+                            onClick={() => {
+                              setEditingItemNoteId(item.id);
+                              setTempNoteText(item.notes || "");
+                            }}
+                            title={`Note: ${item.notes} (Click to edit)`}
                           >
-                            <button
-                              type="button"
-                              className="card-step-btn minus"
-                              onClick={() => decrementCart(p.id)}
-                              title="Decrease"
-                            >
-                              <Minus size={11} />
-                            </button>
-                            <span className="card-qty">{qtyInCart}</span>
-                            <button
-                              type="button"
-                              className="card-step-btn plus"
-                              onClick={() => addToCart(p)}
-                              title="Increase"
-                            >
-                              <Plus size={11} />
-                            </button>
-                          </div>
+                            <span>{item.notes}</span>
+                            <X
+                              size={9}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                saveItemNote(item.id, "");
+                              }}
+                            />
+                          </span>
                         ) : (
                           <button
                             type="button"
-                            className="card-add-btn"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              addToCart(p);
+                            className="add-note-btn inline"
+                            onClick={() => {
+                              setEditingItemNoteId(item.id);
+                              setTempNoteText("");
                             }}
+                            title="Add cooking note"
                           >
-                            <Plus size={11} />
-                            <span>Add</span>
+                            +note
                           </button>
                         )}
+                      </div>
+
+                      {/* Right: Quantity Stepper, Price & Remove Trash Icon */}
+                      <div className="cart-item-right">
+                        <div className="cart-stepper">
+                          <button
+                            type="button"
+                            onClick={() => decrementCart(item.id)}
+                            title="Decrease quantity"
+                          >
+                            <Minus size={10} />
+                          </button>
+                          <span>{item.qty}</span>
+                          <button
+                            type="button"
+                            onClick={() => addToCart(item)}
+                            title="Increase quantity"
+                          >
+                            <Plus size={10} />
+                          </button>
+                        </div>
+
+                        <span className="cart-item-price">
+                          {money(item.price * item.qty)}
+                        </span>
 
                         <button
                           type="button"
-                          className="edit-dish-price-btn"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setEditingItem(p);
-                            setEditPrice(String(p.price));
-                          }}
-                          title="Edit Price"
+                          className="remove-item-btn"
+                          onClick={() => removeFromCart(item.id)}
+                          title="Remove item"
                         >
-                          <Edit2 size={11} />
+                          <Trash2 size={12} />
                         </button>
                       </div>
                     </div>
                   );
                 })}
-
-                {filteredProducts.length === 0 && (
-                  <div className="empty-catalog-state">
-                    <Utensils size={32} />
-                    <p>No dishes found matching your filter.</p>
-                    <button
-                      type="button"
-                      className="reset-filters-btn"
-                      onClick={() => {
-                        setSelectedCat("All Dishes");
-                        setVegFilter("ALL");
-                        setSearchQuery("");
-                      }}
-                    >
-                      Reset Filters
-                    </button>
-                  </div>
-                )}
               </div>
-            </main>
+            )}
+          </div>
 
-            {/* COLUMN 3: BILLING & CHECKOUT TERMINAL */}
-            <aside className="pos-checkout-panel">
-              <div className="ticket-header">
-                <div className="ticket-channel-info">
-                  <span
-                    className="ticket-channel-badge clickable"
-                    onClick={() => {
-                      if (source === "DINE_IN") {
-                        setShowTablePickerModal(true);
-                      } else {
-                        handleSelectChannel("DINE_IN");
-                      }
-                    }}
-                    title={
-                      source === "DINE_IN"
-                        ? "Click to pick or change table"
-                        : "Click to switch to Dine-In Tables"
-                    }
-                    style={{ cursor: "pointer" }}
-                  >
-                    {source === "DINE_IN"
-                      ? (table ? `🍽️ Dine-In • Table ${table}` : "🍽️ Dine-In (No Table)")
-                      : source === "TAKEAWAY"
-                      ? "🛍️ Takeaway (No Table)"
-                      : source === "SWIGGY"
-                      ? "🛵 Swiggy (No Table)"
-                      : "🛵 Zomato (No Table)"}
-                  </span>
-                  {source === "DINE_IN" && table && (
+          {/* Bill Calculation & Settlements */}
+          <div className="bill-calculations-section">
+            {/* Subtotal */}
+            <div className="calc-row">
+              <span>Subtotal ({cart.reduce((s, i) => s + i.qty, 0)} items)</span>
+              <b>{money(subtotal)}</b>
+            </div>
+
+            {/* Discount Selector */}
+            <div className="calc-row discount-row">
+              <div className="discount-label-group">
+                <span>Discount:</span>
+                <div className="discount-pills">
+                  {[0, 5, 10, 15].map((pct) => (
                     <button
+                      key={pct}
                       type="button"
-                      className="ticket-clear-table-pill"
-                      onClick={() => {
-                        setTable(null);
-                        showToast("Table unassigned (Dine-In without table)", "info");
-                      }}
-                      title="Unassign table number"
-                    >
-                      Clear Table
-                    </button>
-                  )}
-                  <span className="ticket-clock">
-                    <Clock size={11} />
-                    {new Date().toLocaleTimeString("en-IN", {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
-                  </span>
-                </div>
-
-                {cart.length > 0 && (
-                  <button
-                    type="button"
-                    className="clear-cart-btn"
-                    onClick={() => setCart([])}
-                    title="Clear Cart"
-                  >
-                    Clear
-                  </button>
-                )}
-              </div>
-
-              <div className="cart-items-container">
-                {cart.length === 0 ? (
-                  <div className="empty-cart-message">
-                    <Utensils size={28} />
-                    <b>Order Cart is Empty</b>
-                    <span>Click any dish to add to the bill</span>
-                  </div>
-                ) : (
-                  <div className="cart-items-list">
-                    {cart.map((item) => {
-                      const veg = isVeg(item.name, item.category);
-                      const displayName = cleanDishDisplayName(item.name, item.category);
-                      return (
-                        <div key={item.id} className="cart-item-row">
-                          <div className="cart-item-left" title={displayName}>
-                            <span
-                              className={`cart-veg-dot ${
-                                veg ? "veg" : "non-veg"
-                              }`}
-                            />
-                            <span className="cart-item-name">{displayName}</span>
-                            {item.notes ? (
-                              <span
-                                className="item-note-pill inline"
-                                onClick={() => {
-                                  setEditingItemNoteId(item.id);
-                                  setTempNoteText(item.notes || "");
-                                }}
-                                title={`Note: ${item.notes} (Click to edit)`}
-                              >
-                                <span>{item.notes}</span>
-                                <X
-                                  size={9}
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    saveItemNote(item.id, "");
-                                  }}
-                                />
-                              </span>
-                            ) : (
-                              <button
-                                type="button"
-                                className="add-note-btn inline"
-                                onClick={() => {
-                                  setEditingItemNoteId(item.id);
-                                  setTempNoteText("");
-                                }}
-                                title="Add cooking note"
-                              >
-                                +note
-                              </button>
-                            )}
-                          </div>
-
-                          <div className="cart-item-right">
-                            <div className="cart-stepper">
-                              <button
-                                type="button"
-                                onClick={() => decrementCart(item.id)}
-                                title="Decrease quantity"
-                              >
-                                <Minus size={10} />
-                              </button>
-                              <span>{item.qty}</span>
-                              <button
-                                type="button"
-                                onClick={() => addToCart(item)}
-                                title="Increase quantity"
-                              >
-                                <Plus size={10} />
-                              </button>
-                            </div>
-
-                            <span className="cart-item-price">
-                              {money(item.price * item.qty)}
-                            </span>
-
-                            <button
-                              type="button"
-                              className="remove-item-btn"
-                              onClick={() => removeFromCart(item.id)}
-                              title="Remove item"
-                            >
-                              <Trash2 size={12} />
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              <div className="bill-calculations-section">
-                <div className="calc-row">
-                  <span>Subtotal ({cart.reduce((s, i) => s + i.qty, 0)} items)</span>
-                  <b>{money(subtotal)}</b>
-                </div>
-
-                <div className="calc-row discount-row">
-                  <div className="discount-label-group">
-                    <span>Discount:</span>
-                    <div className="discount-pills">
-                      {[0, 5, 10, 15].map((pct) => (
-                        <button
-                          key={pct}
-                          type="button"
-                          className={`disc-pill ${
-                            discountPercent === pct && discountFlat === 0
-                              ? "active"
-                              : ""
-                          }`}
-                          onClick={() => {
-                            setDiscountPercent(pct);
-                            setDiscountFlat(0);
-                          }}
-                        >
-                          {pct}%
-                        </button>
-                      ))}
-                      <button
-                        type="button"
-                        className={`disc-pill ${discountFlat > 0 ? "active" : ""}`}
-                        onClick={() => {
-                          const flat = prompt("Enter flat discount in ₹:", "50");
-                          if (flat && !isNaN(Number(flat))) {
-                            setDiscountFlat(Number(flat));
-                            setDiscountPercent(0);
-                          }
-                        }}
-                      >
-                        {discountFlat > 0 ? `₹${discountFlat}` : "Flat ₹"}
-                      </button>
-                    </div>
-                  </div>
-                  {discountAmount > 0 && (
-                    <span className="discount-applied-val">
-                      −{money(discountAmount)}
-                    </span>
-                  )}
-                </div>
-
-                <div className="calc-row tax-row">
-                  <label className="gst-toggle-label">
-                    <input
-                      type="checkbox"
-                      checked={applyGst}
-                      onChange={(e) => setApplyGst(e.target.checked)}
-                    />
-                    <span>Apply 5% GST (2.5% + 2.5%)</span>
-                  </label>
-                  <span>{money(gstAmount)}</span>
-                </div>
-
-                <div className="calc-row grand-total-row">
-                  <span>GRAND TOTAL</span>
-                  <strong className="grand-total-amount">
-                    {money(grandTotal)}
-                  </strong>
-                </div>
-
-                <div className="payment-modes-grid">
-                  {PAYMENT_MODES.map((mode) => (
-                    <button
-                      key={mode.id}
-                      type="button"
-                      className={`payment-mode-btn ${
-                        paymentMode === mode.id ? "active" : ""
+                      className={`disc-pill ${
+                        discountPercent === pct && discountFlat === 0
+                          ? "active"
+                          : ""
                       }`}
-                      onClick={() => setPaymentMode(mode.id)}
+                      onClick={() => {
+                        setDiscountPercent(pct);
+                        setDiscountFlat(0);
+                      }}
                     >
-                      <span className="pay-icon">{mode.icon}</span>
-                      <span className="pay-label">{mode.label}</span>
+                      {pct}%
                     </button>
                   ))}
-
-                  <button
-                    key="SAVE_TABLE_BTN"
-                    type="button"
-                    className="payment-mode-btn save-table-mode-btn"
-                    onClick={handleSaveTableWithoutKot}
-                    disabled={cart.length === 0}
-                    title="Save items for table without printing KOT"
-                  >
-                    <span className="pay-icon">💾</span>
-                    <span className="pay-label">Save</span>
-                  </button>
-                </div>
-
-                {paymentMode === "CASH" && (
-                  <div className="cash-calculator-box">
-                    <div className="cash-input-row">
-                      <label>Tendered:</label>
-                      <input
-                        type="number"
-                        placeholder="₹"
-                        value={cashTendered}
-                        onChange={(e) => setCashTendered(e.target.value)}
-                      />
-                      <div className="quick-tender-pills">
-                        {[100, 200, 500, 2000].map((amt) => (
-                          <button
-                            key={amt}
-                            type="button"
-                            onClick={() => setCashTendered(String(amt))}
-                          >
-                            ₹{amt}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                    {tenderNumber > 0 && (
-                      <div className="change-due-row">
-                        <span>Change:</span>
-                        <strong
-                          className={
-                            tenderNumber >= grandTotal ? "change-ok" : "change-short"
-                          }
-                        >
-                          {tenderNumber >= grandTotal
-                            ? money(changeDue)
-                            : `Short by ${money(grandTotal - tenderNumber)}`}
-                        </strong>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                <div className="action-buttons-grid">
                   <button
                     type="button"
-                    className="action-btn kot-btn"
-                    onClick={handlePrintKot}
-                    disabled={cart.length === 0}
-                    title="Print Kitchen Order Ticket"
+                    className={`disc-pill ${discountFlat > 0 ? "active" : ""}`}
+                    onClick={() => {
+                      const flat = prompt("Enter flat discount in ₹:", "50");
+                      if (flat && !isNaN(Number(flat))) {
+                        setDiscountFlat(Number(flat));
+                        setDiscountPercent(0);
+                      }
+                    }}
                   >
-                    <Printer size={14} />
-                    <span>KOT</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    className="action-btn bill-btn"
-                    onClick={handlePrintCustomerBill}
-                    disabled={cart.length === 0}
-                    title="Print Customer Check Receipt"
-                  >
-                    <FileText size={14} />
-                    <span>Bill</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    className="action-btn settle-btn"
-                    onClick={handleSaveOrder}
-                    disabled={cart.length === 0 || saving}
-                  >
-                    {saving ? (
-                      <>
-                        <RefreshCw size={14} className="spin" />
-                        <span>Settling...</span>
-                      </>
-                    ) : (
-                      <>
-                        <CheckCircle2 size={14} />
-                        <span>Settle & Pay</span>
-                      </>
-                    )}
+                    {discountFlat > 0 ? `₹${discountFlat}` : "Flat ₹"}
                   </button>
                 </div>
               </div>
-            </aside>
-          </>
-        )}
-      </div>
+              {discountAmount > 0 && (
+                <span className="discount-applied-val">
+                  −{money(discountAmount)}
+                </span>
+              )}
+            </div>
+
+            {/* GST Calculation (5% total: 2.5% CGST + 2.5% SGST) */}
+            <div className="calc-row tax-row">
+              <label className="gst-toggle-label">
+                <input
+                  type="checkbox"
+                  checked={applyGst}
+                  onChange={(e) => setApplyGst(e.target.checked)}
+                />
+                <span>Apply 5% GST (2.5% + 2.5%)</span>
+              </label>
+              <span>{money(gstAmount)}</span>
+            </div>
+
+            {/* Grand Total */}
+            <div className="calc-row grand-total-row">
+              <span>GRAND TOTAL</span>
+              <strong className="grand-total-amount">
+                {money(grandTotal)}
+              </strong>
+            </div>
+
+            {/* Payment & Save Selector */}
+            <div className="payment-modes-grid">
+              {PAYMENT_MODES.map((mode) => (
+                <button
+                  key={mode.id}
+                  type="button"
+                  className={`payment-mode-btn ${
+                    paymentMode === mode.id ? "active" : ""
+                  }`}
+                  onClick={() => setPaymentMode(mode.id)}
+                >
+                  <span className="pay-icon">{mode.icon}</span>
+                  <span className="pay-label">{mode.label}</span>
+                </button>
+              ))}
+
+              <button
+                key="SAVE_TABLE_BTN"
+                type="button"
+                className="payment-mode-btn save-table-mode-btn"
+                onClick={handleSaveTableWithoutKot}
+                disabled={cart.length === 0}
+                title="Save items for table without printing KOT"
+              >
+                <span className="pay-icon">💾</span>
+                <span className="pay-label">Save</span>
+              </button>
+            </div>
+
+            {/* Cash Tendered & Change Return Calculator */}
+            {paymentMode === "CASH" && (
+              <div className="cash-calculator-box">
+                <div className="cash-input-row">
+                  <label>Tendered:</label>
+                  <input
+                    type="number"
+                    placeholder="₹"
+                    value={cashTendered}
+                    onChange={(e) => setCashTendered(e.target.value)}
+                  />
+                  <div className="quick-tender-pills">
+                    {[100, 200, 500, 2000].map((amt) => (
+                      <button
+                        key={amt}
+                        type="button"
+                        onClick={() => setCashTendered(String(amt))}
+                      >
+                        ₹{amt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {tenderNumber > 0 && (
+                  <div className="change-due-row">
+                    <span>Change:</span>
+                    <strong
+                      className={
+                        tenderNumber >= grandTotal ? "change-ok" : "change-short"
+                      }
+                    >
+                      {tenderNumber >= grandTotal
+                        ? money(changeDue)
+                        : `Short by ${money(grandTotal - tenderNumber)}`}
+                    </strong>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 3-CLICK ACTION BAR */}
+            <div className="action-buttons-grid">
+              <button
+                type="button"
+                className="action-btn kot-btn"
+                onClick={handlePrintKot}
+                disabled={cart.length === 0}
+                title="Print Kitchen Order Ticket"
+              >
+                <Printer size={14} />
+                <span>KOT</span>
+              </button>
+
+              <button
+                type="button"
+                className="action-btn bill-btn"
+                onClick={handlePrintCustomerBill}
+                disabled={cart.length === 0}
+                title="Print Customer Check Receipt"
+              >
+                <FileText size={14} />
+                <span>Bill</span>
+              </button>
+
+              <button
+                type="button"
+                className="action-btn settle-btn"
+                onClick={handleSaveOrder}
+                disabled={cart.length === 0 || saving}
+              >
+                {saving ? (
+                  <>
+                    <RefreshCw size={14} className="spin" />
+                    <span>Settling...</span>
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle2 size={14} />
+                    <span>Settle & Pay</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </aside>
+      </>
+    )}
+  </div>
 
       {/* MODAL 1: DINE-IN TABLE PICKER */}
       {showTablePickerModal && (
@@ -2324,7 +2607,9 @@ export function RestaurantPOS({
                     <button
                       key={t.id}
                       type="button"
-                      className={`table-select-card ${                         isCurrent ? "current" : ""                       } ${isOccupied ? "occupied" : "vacant"}`}
+                      className={`table-select-card ${
+                        isCurrent ? "current" : ""
+                      } ${isOccupied ? "occupied" : "vacant"}`}
                       onClick={() => handleSelectTableFromPicker(t.tableNumber)}
                     >
                       <span className="table-num">{t.tableNumber}</span>
@@ -2409,8 +2694,8 @@ export function RestaurantPOS({
                             items: o.items,
                             subtotal: o.subtotal || o.total,
                             discountAmount: o.discountAmount || 0,
-                            taxCgstPercent: applyGst ? 2.5 : 0,
-                            taxSgstPercent: applyGst ? 2.5 : 0,
+                            taxCgstPercent: 2.5,
+                            taxSgstPercent: 2.5,
                             total: o.total,
                             paperWidth: settings.paperWidth,
                           });
@@ -2689,6 +2974,7 @@ export function RestaurantPOS({
               </button>
             </div>
 
+            {/* Mode Switcher */}
             <div className="bulk-tabs-bar">
               <button
                 type="button"
@@ -2931,7 +3217,9 @@ export function RestaurantPOS({
         </div>
       )}
 
-      {/* STYLES PRESERVED EXACTLY AS PROVIDED */}
+      {/* =========================================================
+          STYLES: Neat, Tight, Dense, Pixel-Perfect Layout
+      ========================================================= */}
       <style jsx>{`
         .restaurant-iq-pos {
           display: flex;

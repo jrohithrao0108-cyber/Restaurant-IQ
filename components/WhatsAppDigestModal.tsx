@@ -118,7 +118,7 @@ export function WhatsAppDigestModal({
       style={{
         position: "fixed",
         inset: 0,
-        backgroundColor: "rgba(15, 23, 42, 0.65)",
+        backgroundColor: "rgba(28, 25, 23, 0.65)",
         backdropFilter: "blur(3px)",
         display: "flex",
         alignItems: "center",
@@ -144,11 +144,11 @@ export function WhatsAppDigestModal({
         <div
           style={{
             padding: "16px 20px",
-            borderBottom: "1px solid #e2e8f0",
+            borderBottom: "1px solid #ede7dc",
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            background: "#f8fafc",
+            background: "#faf7f2",
           }}
         >
           <div>
@@ -157,7 +157,7 @@ export function WhatsAppDigestModal({
                 margin: 0,
                 fontSize: "17px",
                 fontWeight: 800,
-                color: "#0f172a",
+                color: "#1c1917",
                 display: "flex",
                 alignItems: "center",
                 gap: "8px",
@@ -165,7 +165,7 @@ export function WhatsAppDigestModal({
             >
               <span>📲 Daily Reminders & Digests</span>
             </h2>
-            <p style={{ margin: "2px 0 0", fontSize: "12px", color: "#64748b" }}>
+            <p style={{ margin: "2px 0 0", fontSize: "12px", color: "#78716c" }}>
               Send scheduled shift reports to owners and managers
             </p>
           </div>
@@ -176,7 +176,7 @@ export function WhatsAppDigestModal({
               border: "none",
               cursor: "pointer",
               padding: "6px",
-              color: "#64748b",
+              color: "#78716c",
             }}
           >
             <X size={20} />
@@ -189,7 +189,7 @@ export function WhatsAppDigestModal({
             display: "flex",
             gap: "8px",
             padding: "12px 20px 0",
-            borderBottom: "1px solid #f1f5f9",
+            borderBottom: "1px solid #faf7f2",
             background: "#ffffff",
           }}
         >
@@ -202,7 +202,7 @@ export function WhatsAppDigestModal({
               border: "none",
               borderBottom: shift === "LUNCH" ? "2px solid #25d366" : "2px solid transparent",
               background: "transparent",
-              color: shift === "LUNCH" ? "#15803d" : "#64748b",
+              color: shift === "LUNCH" ? "#15803d" : "#78716c",
               cursor: "pointer",
             }}
           >
@@ -218,7 +218,7 @@ export function WhatsAppDigestModal({
               border: "none",
               borderBottom: shift === "EOD" ? "2px solid #25d366" : "2px solid transparent",
               background: "transparent",
-              color: shift === "EOD" ? "#15803d" : "#64748b",
+              color: shift === "EOD" ? "#15803d" : "#78716c",
               cursor: "pointer",
             }}
           >
@@ -234,7 +234,7 @@ export function WhatsAppDigestModal({
               border: "none",
               borderBottom: shift === "PULSE" ? "2px solid #25d366" : "2px solid transparent",
               background: "transparent",
-              color: shift === "PULSE" ? "#15803d" : "#64748b",
+              color: shift === "PULSE" ? "#15803d" : "#78716c",
               cursor: "pointer",
             }}
           >
@@ -254,7 +254,7 @@ export function WhatsAppDigestModal({
           }}
         >
           {loading ? (
-            <div style={{ padding: "30px", textAlign: "center", color: "#64748b" }}>
+            <div style={{ padding: "30px", textAlign: "center", color: "#78716c" }}>
               <RefreshCw size={22} className="animate-spin" color="#0284c7" />
               <div style={{ marginTop: "8px", fontSize: "13px" }}>Loading report figures...</div>
             </div>
@@ -276,7 +276,7 @@ export function WhatsAppDigestModal({
               {/* Message preview */}
               <div>
                 <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
-                  <span style={{ fontSize: "12px", fontWeight: 700, color: "#475569" }}>
+                  <span style={{ fontSize: "12px", fontWeight: 700, color: "#57534e" }}>
                     Formatted WhatsApp Message ({data?.shiftTimeLabel}):
                   </span>
                   <button
@@ -284,7 +284,7 @@ export function WhatsAppDigestModal({
                     style={{
                       background: "transparent",
                       border: "none",
-                      color: "#2563eb",
+                      color: "#d99726",
                       fontSize: "12px",
                       fontWeight: 700,
                       cursor: "pointer",
@@ -297,7 +297,7 @@ export function WhatsAppDigestModal({
                 <div
                   style={{
                     background: "#0c1f17",
-                    color: "#e2e8f0",
+                    color: "#ede7dc",
                     padding: "12px",
                     borderRadius: "8px",
                     fontFamily: "monospace",
@@ -323,7 +323,7 @@ export function WhatsAppDigestModal({
                     marginBottom: "8px",
                   }}
                 >
-                  <span style={{ fontSize: "12.5px", fontWeight: 700, color: "#1e293b" }}>
+                  <span style={{ fontSize: "12.5px", fontWeight: 700, color: "#1c1917" }}>
                     Send To Owners / Managers ({recipients.length}):
                   </span>
                   <button
@@ -333,14 +333,14 @@ export function WhatsAppDigestModal({
                       display: "flex",
                       alignItems: "center",
                       gap: "4px",
-                      background: "#f1f5f9",
-                      border: "1px solid #cbd5e1",
+                      background: "#faf7f2",
+                      border: "1px solid #e7e0d3",
                       borderRadius: "6px",
                       padding: "3px 8px",
                       fontSize: "11.5px",
                       fontWeight: 600,
                       cursor: "pointer",
-                      color: "#334155",
+                      color: "#44403c",
                     }}
                   >
                     <Plus size={12} />
@@ -351,8 +351,8 @@ export function WhatsAppDigestModal({
                 {showAddContact && (
                   <div
                     style={{
-                      background: "#f8fafc",
-                      border: "1px solid #e2e8f0",
+                      background: "#faf7f2",
+                      border: "1px solid #ede7dc",
                       borderRadius: "8px",
                       padding: "10px",
                       marginBottom: "10px",
@@ -370,7 +370,7 @@ export function WhatsAppDigestModal({
                         padding: "6px 10px",
                         fontSize: "12px",
                         borderRadius: "6px",
-                        border: "1px solid #cbd5e1",
+                        border: "1px solid #e7e0d3",
                         width: "120px",
                       }}
                     />
@@ -383,7 +383,7 @@ export function WhatsAppDigestModal({
                         padding: "6px 10px",
                         fontSize: "12px",
                         borderRadius: "6px",
-                        border: "1px solid #cbd5e1",
+                        border: "1px solid #e7e0d3",
                         flexGrow: 1,
                       }}
                     />
@@ -392,7 +392,7 @@ export function WhatsAppDigestModal({
                       onClick={handleAddRecipient}
                       style={{
                         padding: "6px 12px",
-                        background: "#0f172a",
+                        background: "#1c1917",
                         color: "#fff",
                         border: "none",
                         borderRadius: "6px",
@@ -408,7 +408,7 @@ export function WhatsAppDigestModal({
 
                 <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
                   {recipients.length === 0 ? (
-                    <div style={{ fontSize: "12px", color: "#64748b", fontStyle: "italic" }}>
+                    <div style={{ fontSize: "12px", color: "#78716c", fontStyle: "italic" }}>
                       No phone numbers added yet. Click &quot;Add Phone&quot; to add an owner or manager.
                     </div>
                   ) : (
@@ -420,18 +420,18 @@ export function WhatsAppDigestModal({
                           alignItems: "center",
                           justifyContent: "space-between",
                           padding: "8px 12px",
-                          background: "#f8fafc",
+                          background: "#faf7f2",
                           borderRadius: "8px",
-                          border: "1px solid #e2e8f0",
+                          border: "1px solid #ede7dc",
                         }}
                       >
                         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                          <User size={15} color="#64748b" />
+                          <User size={15} color="#78716c" />
                           <div>
-                            <div style={{ fontSize: "12.5px", fontWeight: 700, color: "#1e293b" }}>
+                            <div style={{ fontSize: "12.5px", fontWeight: 700, color: "#1c1917" }}>
                               {rec.name}
                             </div>
-                            <div style={{ fontSize: "11px", color: "#64748b" }}>{rec.phone}</div>
+                            <div style={{ fontSize: "11px", color: "#78716c" }}>{rec.phone}</div>
                           </div>
                         </div>
 
@@ -465,7 +465,7 @@ export function WhatsAppDigestModal({
                               padding: "6px",
                               background: "transparent",
                               border: "none",
-                              color: "#94a3b8",
+                              color: "#a8a29e",
                               cursor: "pointer",
                             }}
                           >
@@ -485,14 +485,14 @@ export function WhatsAppDigestModal({
         <div
           style={{
             padding: "12px 20px",
-            borderTop: "1px solid #e2e8f0",
-            background: "#f8fafc",
+            borderTop: "1px solid #ede7dc",
+            background: "#faf7f2",
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
           }}
         >
-          <div style={{ fontSize: "11.5px", color: "#64748b" }}>
+          <div style={{ fontSize: "11.5px", color: "#78716c" }}>
             Scheduled Auto-Reminders: <strong>4:00 PM</strong> (Lunch) &amp; <strong>10:30 PM</strong> (EOD)
           </div>
 
@@ -505,9 +505,9 @@ export function WhatsAppDigestModal({
               gap: "6px",
               padding: "7px 14px",
               borderRadius: "6px",
-              border: "1px solid #cbd5e1",
+              border: "1px solid #e7e0d3",
               background: "#fff",
-              color: "#334155",
+              color: "#44403c",
               fontSize: "12.5px",
               fontWeight: 600,
               cursor: "pointer",

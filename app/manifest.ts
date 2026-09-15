@@ -7,8 +7,8 @@ export default function manifest(): MetadataRoute.Manifest {
     description: "Intelligent POS, KOT Printing & Restaurant Analytics Platform",
     start_url: "/",
     display: "standalone",
-    background_color: "#0a0f1d",
-    theme_color: "#10b981",
+    background_color: "#faf7f2",
+    theme_color: "#d99726",
     icons: [
       {
         src: "/icon-192.png",

@@ -4,18 +4,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Ban,
   Bell,
-  Brain,
   Calendar,
   CheckCircle2,
   ChevronDown,
-  Clock3,
   Filter,
   LogOut,
   Menu as MenuIcon,
   Plus,
   RefreshCw,
   Search,
-  ShoppingBag,
   Store,
   TrendingUp,
   UserPlus,
@@ -32,7 +29,6 @@ import {
   LabelList,
   Legend,
   Line,
-  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -62,10 +58,10 @@ import {
   saveLocalSettings,
 } from "@/lib/offline/offlineStorage";
 import { OfflineBanner } from "@/components/OfflineBanner";
-import { WhatsAppDigestModal } from "@/components/WhatsAppDigestModal";
 import { SuperAdminRemindersPanel } from "@/components/SuperAdminRemindersPanel";
 import { RestaurantPOS } from "@/components/RestaurantPOS";
 import { ModernLogin } from "@/components/ModernLogin";
+import { RestaurantIQDashboard } from "@/components/RestaurantIQDashboard";
 /* =========================================================
    TYPES
 ========================================================= */
@@ -533,186 +529,6 @@ const TREND_ORDER_SELECT = `
   created_at
 `;
 
-/* =========================================================
-   LOGIN
-========================================================= */
-
-function Login({
-  onLogin,
-}: {
-  onLogin: (u: CurrentUser) => void;
-}) {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [checking, setChecking] =
-    useState(false);
-
-  async function handleLogin() {
-    if (!email.trim() || !password) {
-      alert(
-        "Enter your email and password to continue."
-      );
-      return;
-    }
-
-    setChecking(true);
-
-    try {
-      const {
-        data: authData,
-        error: authError,
-      } = await supabase.auth.signInWithPassword({
-        email: email.trim().toLowerCase(),
-        password,
-      });
-
-      if (authError) {
-        throw authError;
-      }
-
-      if (!authData.user) {
-        throw new Error("Could not verify your login.");
-      }
-
-      const { data, error } = await supabase
-        .from("users")
-        .select(`
-          id,
-          name,
-          phone,
-          email,
-          role,
-          restaurant_id,
-          is_active,
-          restaurants (
-            name
-          )
-        `)
-        .eq("auth_user_id", authData.user.id)
-        .maybeSingle();
-
-      if (error) {
-        throw error;
-      }
-
-      if (!data) {
-        alert(
-          "Your authenticated account is not linked to a RestaurantIQ user profile."
-        );
-        return;
-      }
-
-      const row =
-        data as unknown as UserRow;
-
-      if (row.is_active === false) {
-        await supabase.auth.signOut();
-        alert(
-          "This account has been disabled. Contact your administrator for access."
-        );
-        return;
-      }
-
-      const userObj: CurrentUser = {
-        id: row.id,
-        name: row.name,
-        phone: row.phone || "",
-        role: row.role,
-        restaurantId: row.restaurant_id,
-        restaurantName: row.restaurants?.name || "",
-      };
-      try {
-        localStorage.setItem("restaurant_iq_user", JSON.stringify(userObj));
-      } catch (e) {}
-      onLogin(userObj);
-    } catch (err: any) {
-      console.error(
-        "LOGIN ERROR:",
-        err
-      );
-
-      alert(
-        err?.message ||
-          "Could not log in. Please try again."
-      );
-    } finally {
-      setChecking(false);
-    }
-  }
-
-  return (
-    <div className="login-page">
-      <div className="login-card">
-
-        <div className="brand big">
-          <div className="logo">
-            R
-          </div>
-
-          <span>
-            RestaurantIQ
-          </span>
-        </div>
-
-        <p className="login-sub">
-          AI-Powered Business Intelligence
-          For Restaurants
-        </p>
-
-        <label>Email</label>
-
-        <input
-          type="email"
-          value={email}
-          onChange={(e) =>
-            setEmail(e.target.value)
-          }
-          suppressHydrationWarning
-          placeholder="admin@restaurant.com"
-          onKeyDown={(e) =>
-            e.key === "Enter" &&
-            handleLogin()
-          }
-        />
-
-        <label>
-          Password
-        </label>
-
-        <input
-          type="password"
-          value={password}
-          onChange={(e) =>
-            setPassword(e.target.value)
-          }
-          suppressHydrationWarning
-          placeholder="Enter Your Password"
-          onKeyDown={(e) =>
-            e.key === "Enter" &&
-            handleLogin()
-          }
-        />
-
-        <button
-          className="login-btn"
-          onClick={handleLogin}
-          disabled={checking}
-          suppressHydrationWarning
-        >
-          {checking
-            ? "Checking..."
-            : "Login"}
-        </button>
-
-        <small>
-          Access Is Managed By Your
-          Super Admin
-        </small>
-
-      </div>
-    </div>
-  );
-}
 
 /* =========================================================
    SIDEBAR
@@ -751,7 +567,7 @@ function Sidebar({
         <div className="brand">
 
           <div className="logo">
-            R
+            <img src="/logo.png" alt="RestaurantIQ" className="logo-img" />
           </div>
 
           <span>
@@ -1021,1350 +837,6 @@ function Header({
   );
 }
 
-/* =========================================================
-   NEW ORDER
-========================================================= */
-
-function NewOrder({
-  products,
-  restaurantId,
-  restaurantName,
-  isPoc,
-  createdByUserId,
-  initialTable,
-  restaurantTables,
-  orders,
-  onPlaced,
-  onMenuChanged,
-}: {
-  products: Product[];
-  restaurantId: string;
-  restaurantName: string;
-  isPoc: boolean;
-  createdByUserId: string;
-  initialTable?: string;
-  restaurantTables: RestaurantTable[];
-  orders?: Order[];
-  onPlaced: (o: Order) => void;
-  onMenuChanged?: () => Promise<void> | void;
-}) {
-  const [cat, setCat] =
-    useState("Starters");
-
-  const [cart, setCart] =
-    useState<Item[]>([]);
-
-  const [source, setSource] =
-    useState<
-      OrderSource | ""
-    >("");
-
-  const [paymentMode, setPaymentMode] =
-    useState<(typeof PAYMENT_MODES)[number]>("UPI");
-
-  const [table, setTable] =
-    useState("");
-
-  useEffect(() => {
-    if (initialTable) {
-      setSource("DINE_IN");
-      setTable(initialTable);
-    }
-  }, [initialTable]);
-
-  const [saving, setSaving] =
-    useState(false);
-
-  const [autoPrintKot, setAutoPrintKot] = useState(
-    () => getLocalSettings().autoPrintKot
-  );
-
-  const placingOrderRef = useRef(false);
-
-  const [editingItem, setEditingItem] =
-    useState<Product | null>(null);
-  const [editPrice, setEditPrice] =
-    useState("");
-
-  const [showAddModal, setShowAddModal] =
-    useState(false);
-  const [newItemName, setNewItemName] =
-    useState("");
-  const [newItemPrice, setNewItemPrice] =
-    useState("");
-  const [newItemCategory, setNewItemCategory] =
-    useState("Starters");
-  const [addingItem, setAddingItem] =
-    useState(false);
-
-  const [disablingItem, setDisablingItem] =
-    useState(false);
-
-  const [showDisabledModal, setShowDisabledModal] =
-    useState(false);
-  const [disabledItems, setDisabledItems] =
-    useState<
-      Array<{
-        id: string;
-        name: string;
-        price: number;
-        category: string;
-      }>
-    >([]);
-  const [loadingDisabled, setLoadingDisabled] =
-    useState(false);
-  const [reEnablingId, setReEnablingId] =
-    useState<string | null>(null);
-
-  async function loadDisabledItems() {
-    setLoadingDisabled(true);
-
-    try {
-      const { data, error } = await supabase
-        .from("menu_items")
-        .select("*")
-        .eq(
-          "restaurant_id",
-          restaurantId
-        )
-        .order("name");
-
-      if (error) throw error;
-
-      const inactive = (data || [])
-        .filter(
-          (row: any) =>
-            !isActiveMenuItem(row)
-        )
-        .map((row: any) => ({
-          id: String(row.id),
-          name: getMenuName(row),
-          price: getMenuPrice(row),
-          category:
-            getMenuCategory(row),
-        }));
-
-      setDisabledItems(inactive);
-    } catch (err: any) {
-      console.error(
-        "LOAD DISABLED ITEMS ERROR:",
-        err
-      );
-      alert(
-        err?.message ||
-          "Could not load disabled items."
-      );
-    } finally {
-      setLoadingDisabled(false);
-    }
-  }
-
-  async function handleReEnableItem(
-    itemId: string
-  ) {
-    setReEnablingId(itemId);
-
-    try {
-      const { error } = await supabase
-        .from("menu_items")
-        .update({ active: true })
-        .eq("id", itemId);
-
-      if (error) throw error;
-
-      setDisabledItems((prev) =>
-        prev.filter(
-          (i) => i.id !== itemId
-        )
-      );
-
-      if (onMenuChanged) {
-        await onMenuChanged();
-      }
-    } catch (err: any) {
-      console.error(
-        "RE-ENABLE ITEM ERROR:",
-        err
-      );
-      alert(
-        err?.message ||
-          "Could not re-enable this item."
-      );
-    } finally {
-      setReEnablingId(null);
-    }
-  }
-
-  async function handleDisableItem() {
-    if (!editingItem) return;
-
-    const confirmed = window.confirm(
-      `Remove "${editingItem.name}" from the menu? It won't appear for ordering until re-enabled from the menu management screen.`
-    );
-    if (!confirmed) return;
-
-    setDisablingItem(true);
-
-    try {
-      const { error } = await supabase
-        .from("menu_items")
-        .update({ active: false })
-        .eq("id", editingItem.id);
-
-      if (error) throw error;
-
-      setEditingItem(null);
-      setEditPrice("");
-
-      if (onMenuChanged) {
-        await onMenuChanged();
-      }
-    } catch (err: any) {
-      console.error(
-        "DISABLE ITEM ERROR:",
-        err
-      );
-      alert(
-        err?.message ||
-          "Could not remove this item."
-      );
-    } finally {
-      setDisablingItem(false);
-    }
-  }
-
-  async function handleUpdatePrice() {
-    if (!editingItem || !editPrice.trim()) {
-      alert("Enter a price.");
-      return;
-    }
-
-    const price = Number(editPrice);
-    if (isNaN(price) || price < 0) {
-      alert("Enter a valid price.");
-      return;
-    }
-
-    try {
-      const { error } = await supabase
-        .from("menu_items")
-        .update({ price })
-        .eq("id", editingItem.id);
-
-      if (error) throw error;
-
-      alert("Price updated successfully.");
-      setEditingItem(null);
-      setEditPrice("");
-    } catch (err: any) {
-      console.error(
-        "UPDATE PRICE ERROR:",
-        err
-      );
-      alert(
-        err?.message ||
-          "Could not update price."
-      );
-    }
-  }
-
-  async function handleAddItem() {
-    if (
-      !newItemName.trim() ||
-      !newItemPrice.trim()
-    ) {
-      alert(
-        "Enter item name and price."
-      );
-      return;
-    }
-
-    const price = Number(newItemPrice);
-    if (isNaN(price) || price < 0) {
-      alert("Enter a valid price.");
-      return;
-    }
-
-    setAddingItem(true);
-
-    try {
-      const { error } = await supabase
-        .from("menu_items")
-        .insert({
-          restaurant_id:
-            restaurantId,
-          name: newItemName.trim(),
-          price,
-          category:
-            newItemCategory,
-          active: true,
-        });
-
-      if (error) throw error;
-
-      alert(
-        "Item added successfully."
-      );
-
-      setNewItemName("");
-      setNewItemPrice("");
-      setNewItemCategory(
-        "Starters"
-      );
-      setShowAddModal(false);
-    } catch (err: any) {
-      console.error(
-        "ADD ITEM ERROR:",
-        err
-      );
-      alert(
-        err?.message ||
-          "Could not add item."
-      );
-    } finally {
-      setAddingItem(false);
-    }
-  }
-
-  const add = (p: Product) => {
-    setCart((current) => {
-
-      const existing =
-        current.find(
-          (i) => i.id === p.id
-        );
-
-      if (existing) {
-        return current.map(
-          (i) =>
-            i.id === p.id
-              ? {
-                  ...i,
-                  qty:
-                    i.qty + 1,
-                }
-              : i
-        );
-      }
-
-      return [
-        ...current,
-        {
-          ...p,
-          qty: 1,
-        },
-      ];
-    });
-  };
-
-  const total =
-    cart.reduce(
-      (sum, i) =>
-        sum +
-        Number(i.price) *
-          i.qty,
-      0
-    );
-
-  const itemCount =
-    cart.reduce(
-      (sum, i) =>
-        sum + i.qty,
-      0
-    );
-
-  const filteredProducts =
-    products.filter(
-      (p) =>
-        normalizeCategory(
-          p.category
-        ) === cat
-    );
-
-  // Tables available for the dine-in dropdown: every active table, with
-  // currently occupied ones flagged so the POC can still pick one to add
-  // more items to an ongoing order (occupied orders auto-merge on save).
-  const activeRestaurantTables = restaurantTables
-    .filter((t) => t.isActive)
-    .sort((a, b) =>
-      a.tableNumber.localeCompare(b.tableNumber, undefined, {
-        numeric: true,
-      })
-    );
-
-  const occupiedTableNumbers = new Set(
-    (orders || [])
-      .filter(
-        (o) =>
-          o.source === "DINE_IN" &&
-          o.table &&
-          !o.closedAt
-      )
-      .map((o) => (o.table as string).trim())
-  );
-
-  const displayNumber = (value: string | number) => String(value);
-
-  async function placeOrder(shouldPrintKot?: boolean) {
-    if (placingOrderRef.current) return;
-
-    if (!cart.length) {
-      alert("Please select at least one item.");
-      return;
-    }
-
-    if (!source) {
-      alert("Choose an order source.");
-      return;
-    }
-
-    if (!restaurantId) {
-      alert("Restaurant is not mapped.");
-      return;
-    }
-
-    placingOrderRef.current = true;
-    setSaving(true);
-
-    const cleanTable = table ? table.trim() : null;
-    const settings = getLocalSettings();
-    const willPrintKot = shouldPrintKot ?? settings.autoPrintKot;
-
-    const selectedSource = source as OrderSource;
-
-    function saveOfflineOrder(targetOrderNumber: string) {
-      const tempId = `OFFLINE-${Date.now()}`;
-      const orderType =
-        selectedSource === "DINE_IN"
-          ? "DINE_IN"
-          : selectedSource === "TAKEAWAY"
-          ? "TAKEAWAY"
-          : "DELIVERY";
-
-      enqueueOfflineOrder({
-        tempId,
-        restaurantId,
-        createdByUserId: createdByUserId || null,
-        orderNumber: targetOrderNumber,
-        orderType,
-        tableNumber: selectedSource === "DINE_IN" ? cleanTable : null,
-        channel: selectedSource,
-        paymentMode,
-        total,
-        status: "COMPLETED",
-        items: cart.map((c) => ({
-          id: c.id,
-          name: c.name,
-          price: c.price,
-          qty: c.qty,
-          notes: c.notes,
-          category: c.category,
-        })),
-        createdAt: new Date().toISOString(),
-        syncAttempts: 0,
-      });
-
-      const newOrder: Order = {
-        id: targetOrderNumber,
-        databaseId: tempId,
-        time: new Date().toLocaleTimeString("en-IN", {
-          hour: "numeric",
-          minute: "2-digit",
-        }),
-        source: selectedSource,
-        table: selectedSource === "DINE_IN" ? cleanTable : undefined,
-        items: cart,
-        total,
-        payment: paymentMode,
-        createdAt: new Date().toISOString(),
-        closedAt: null,
-      };
-
-      onPlaced(newOrder);
-
-      if (willPrintKot) {
-        printKitchenOrderTicket({
-          restaurantName,
-          orderNumber: targetOrderNumber,
-          table: source === "DINE_IN" ? cleanTable : undefined,
-          source,
-          items: cart,
-          paperWidth: settings.paperWidth,
-        });
-      }
-
-      setCart([]);
-      setSource("");
-      setPaymentMode("UPI");
-      setTable("");
-      alert(
-        `Order ${targetOrderNumber} queued in Offline Mode. It will sync automatically when cloud reconnects.`
-      );
-    }
-
-    // Check offline status first
-    if (typeof navigator !== "undefined" && !navigator.onLine) {
-      const offlineOrderNumber = `OFF-${Date.now().toString().slice(-6)}`;
-      saveOfflineOrder(offlineOrderNumber);
-      placingOrderRef.current = false;
-      setSaving(false);
-      return;
-    }
-
-    try {
-      let targetOrderId: string | null = null;
-      let targetOrderNumber: string = "";
-      let existingTotal = 0;
-
-      // 1. Check for an open dine-in order on this table
-      if (source === "DINE_IN" && cleanTable) {
-        const { data: existingOpenOrder, error: fetchError } = await supabase
-          .from("orders")
-          .select("id, order_number, total")
-          .eq("restaurant_id", restaurantId)
-          .eq("table_number", cleanTable)
-          .is("closed_at", null)
-          .neq("status", "CANCELLED")
-          .order("created_at", { ascending: false })
-          .limit(1)
-          .maybeSingle();
-
-        if (fetchError) throw fetchError;
-
-        if (existingOpenOrder) {
-          targetOrderId = existingOpenOrder.id;
-          targetOrderNumber = existingOpenOrder.order_number;
-          existingTotal = Number(existingOpenOrder.total) || 0;
-        }
-      }
-
-      let orderRecord;
-      let finalItems: Item[] = cart;
-      let finalTotal = total;
-
-      if (targetOrderId) {
-        // 2. APPEND ITEMS TO EXISTING ORDER
-        const updatedTotal = existingTotal + total;
-
-        const { data: updatedOrder, error: updateError } = await supabase
-          .from("orders")
-          .update({ total: updatedTotal })
-          .eq("id", targetOrderId)
-          .select()
-          .maybeSingle();
-
-        if (updateError) throw updateError;
-        orderRecord = updatedOrder;
-
-        const orderItems = cart.map((item) => ({
-          order_id: targetOrderId,
-          menu_item_id: item.id,
-          name_snapshot: item.name,
-          price_snapshot: item.price,
-          qty: item.qty,
-        }));
-
-        const { error: itemError } = await supabase
-          .from("order_items")
-          .insert(orderItems);
-
-        if (itemError) throw itemError;
-
-        const previousOrder = (orders || []).find(
-          (o) => o.databaseId === targetOrderId
-        );
-
-        const mergedItemsMap = new Map<string, Item>();
-
-        (previousOrder?.items || []).forEach((item) => {
-          mergedItemsMap.set(`${item.id}-${item.price}`, { ...item });
-        });
-
-        cart.forEach((item) => {
-          const key = `${item.id}-${item.price}`;
-          const existing = mergedItemsMap.get(key);
-
-          mergedItemsMap.set(
-            key,
-            existing
-              ? { ...existing, qty: existing.qty + item.qty }
-              : { ...item }
-          );
-        });
-
-        finalItems = Array.from(mergedItemsMap.values());
-        finalTotal = updatedTotal;
-      } else {
-        // 3. CREATE NEW ORDER
-        const orderNumber = `S${Date.now().toString().slice(-6)}`;
-        const orderType =
-          source === "DINE_IN"
-            ? "DINE_IN"
-            : source === "TAKEAWAY"
-            ? "TAKEAWAY"
-            : "DELIVERY";
-
-        const { data: order, error: orderError } = await supabase
-          .from("orders")
-          .insert({
-            restaurant_id: restaurantId,
-            created_by: createdByUserId || null,
-            order_number: orderNumber,
-            order_type: orderType,
-            table_number: source === "DINE_IN" ? cleanTable : null,
-            channel: source,
-            payment_mode: paymentMode,
-            total,
-            status: "COMPLETED",
-          })
-          .select()
-          .maybeSingle();
-
-        if (orderError) throw orderError;
-        orderRecord = order;
-
-        const orderItems = cart.map((item) => ({
-          order_id: order.id,
-          menu_item_id: item.id,
-          name_snapshot: item.name,
-          price_snapshot: item.price,
-          qty: item.qty,
-        }));
-
-        const { error: itemError } = await supabase
-          .from("order_items")
-          .insert(orderItems);
-
-        if (itemError) throw itemError;
-        targetOrderNumber = orderNumber;
-      }
-
-      const newOrder: Order = {
-        id: targetOrderNumber,
-        databaseId: orderRecord.id,
-        time: new Date(orderRecord.created_at).toLocaleTimeString("en-IN", {
-          hour: "numeric",
-          minute: "2-digit",
-        }),
-        source,
-        table: source === "DINE_IN" ? cleanTable : undefined,
-        items: finalItems,
-        total: finalTotal,
-        payment: paymentMode,
-        createdAt: orderRecord.created_at,
-        closedAt: null,
-      };
-
-      onPlaced(newOrder);
-
-      // Print KOT for the new items
-      if (willPrintKot) {
-        printKitchenOrderTicket({
-          restaurantName,
-          orderNumber: targetOrderNumber,
-          table: source === "DINE_IN" ? cleanTable : undefined,
-          source,
-          items: cart,
-          paperWidth: settings.paperWidth,
-        });
-      }
-
-      setCart([]);
-      setSource("");
-      setPaymentMode("UPI");
-      setTable("");
-
-      alert(`Order ${targetOrderNumber} saved successfully.`);
-    } catch (error: any) {
-      console.error("ORDER ERROR:", error);
-      const isNetwork =
-        !navigator.onLine ||
-        error?.message?.toLowerCase().includes("fetch") ||
-        error?.message?.toLowerCase().includes("network");
-
-      if (isNetwork) {
-        const offlineNum = `OFF-${Date.now().toString().slice(-6)}`;
-        saveOfflineOrder(offlineNum);
-      } else {
-        alert(error?.message || error?.details || "Could not save order.");
-      }
-    } finally {
-      placingOrderRef.current = false;
-      setSaving(false);
-    }
-  }
-
-  function printBill() {
-    if (!cart.length) {
-      alert("Please select at least one item before printing.");
-      return;
-    }
-
-    const settings = getLocalSettings();
-    printCustomerBillReceipt({
-      restaurantName,
-      orderNumber: `DRAFT-${Date.now().toString().slice(-4)}`,
-      table: source === "DINE_IN" ? table.trim() : undefined,
-      source: source || "DINE_IN",
-      paymentMode,
-      items: cart,
-      total,
-      paperWidth: settings.paperWidth,
-    });
-  }
-
-  return (
-    <div className="new-layout">
-
-      <section className="card menu-card">
-
-        <div className="section-title">
-
-          <div>
-            <h2>Menu</h2>
-
-            <span>
-              Tap a dish to add it
-            </span>
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              gap: 8,
-            }}
-          >
-            <button
-              className="secondary-btn"
-              onClick={() => {
-                setShowDisabledModal(
-                  true
-                );
-                loadDisabledItems();
-              }}
-            >
-              Disabled items
-            </button>
-
-            <button
-              className="primary-btn"
-              onClick={() =>
-                setShowAddModal(
-                  true
-                )
-              }
-            >
-              <Plus size={16} />
-              Add Item
-            </button>
-          </div>
-
-        </div>
-
-        <div className="cats">
-
-          {CATEGORIES.map(
-            (c) => {
-
-              const count =
-                products.filter(
-                  (p) =>
-                    normalizeCategory(
-                      p.category
-                    ) === c
-                ).length;
-
-              return (
-                <button
-                  key={c}
-                  className={
-                    cat === c
-                      ? "active"
-                      : ""
-                  }
-                  onClick={() =>
-                    setCat(c)
-                  }
-                >
-                  {c}
-
-                  <small>
-                    {displayNumber(count)}
-                  </small>
-                </button>
-              );
-            }
-          )}
-
-        </div>
-
-        <div className="menu-grid">
-
-          {filteredProducts.length ===
-          0 ? (
-            <div className="empty">
-
-              No menu items found in{" "}
-              <b>{cat}</b>
-
-              <br />
-
-              <small>
-                Loaded{" "}
-                {products.length}{" "}
-                menu items from
-                Supabase.
-              </small>
-
-            </div>
-          ) : (
-            filteredProducts.map(
-              (p) => (
-                <div
-                  className="menu-item-wrapper"
-                  key={p.id}
-                >
-                  <button
-                    className="menu-item"
-                    onClick={() =>
-                      add(p)
-                    }
-                  >
-
-                    <b>
-                      {p.name}
-                    </b>
-
-                    <span>
-                      {displayNumber(money(p.price))}
-
-                      <Plus
-                        size={15}
-                      />
-                    </span>
-
-                  </button>
-
-                  <button
-                    className="edit-btn"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setEditingItem(
-                        p
-                      );
-                      setEditPrice(
-                        String(
-                          p.price
-                        )
-                      );
-                    }}
-                  >
-                    Edit Price
-                  </button>
-                </div>
-              )
-            )
-          )}
-
-        </div>
-
-      </section>
-
-      <section className="card cart">
-
-        <div className="section-title">
-
-          <div>
-
-            <h2>
-              Current order
-            </h2>
-
-            <span>
-              {source
-                ? source.replace(/_/g, " ")
-                :
-                "Choose order source"}
-            </span>
-
-          </div>
-
-          <b>
-            {displayNumber(itemCount)} items
-          </b>
-
-        </div>
-
-        {cart.length === 0 ? (
-          <div className="empty">
-            Select items from
-            the menu.
-          </div>
-        ) : (
-          <div className="cart-items">
-
-            {cart.map((i) => (
-
-              <div
-                className="cart-row"
-                key={i.id}
-              >
-
-                <div>
-                  <b>
-                    {i.name}
-                  </b>
-
-                  <small>
-                    {displayNumber(money(i.price))}{" "}
-                    each
-                  </small>
-                </div>
-
-                <div className="qty">
-
-                  <button
-                    onClick={() =>
-                      setCart(
-                        (current) =>
-                          current.flatMap(
-                            (x) =>
-                              x.id ===
-                              i.id
-                                ? x.qty >
-                                  1
-                                  ? [
-                                      {
-                                        ...x,
-                                        qty:
-                                          x.qty -
-                                          1,
-                                      },
-                                    ]
-                                  : []
-                                : [x]
-                          )
-                      )
-                    }
-                  >
-                    −
-                  </button>
-
-                  <b>
-                    {displayNumber(i.qty)}
-                  </b>
-
-                  <button
-                    onClick={() =>
-                      add(i)
-                    }
-                  >
-                    +
-                  </button>
-
-                </div>
-
-                <strong>
-                  {displayNumber(money(i.price * i.qty))}
-                </strong>
-
-              </div>
-            ))}
-
-          </div>
-        )}
-
-        <div className="total">
-
-          <span>
-            Total
-          </span>
-
-          <strong>
-            {displayNumber(money(total))}
-          </strong>
-
-        </div>
-
-        <div className="source-pills">
-
-          {ORDER_SOURCES.map(
-            (s) => (
-              <button
-                key={s}
-                className={
-                  source === s
-                    ? "active"
-                    : ""
-                }
-                onClick={() =>
-                  setSource(s)
-                }
-              >
-                {s.replace(/_/g, " ")}
-              </button>
-            )
-          )}
-
-        </div>
-
-        {source ===
-          "DINE_IN" &&
-          (activeRestaurantTables.length > 0 ? (
-            <select
-              className="table-input"
-              value={table}
-              onChange={(e) =>
-                setTable(
-                  e.target.value
-                )
-              }
-            >
-              <option value="">
-                Select a table
-              </option>
-
-              {activeRestaurantTables.map((t) => (
-                <option key={t.id} value={t.tableNumber}>
-                  Table {t.tableNumber}
-                  {occupiedTableNumbers.has(t.tableNumber)
-                    ? " · Occupied"
-                    : ""}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              className="table-input"
-              type="text"
-              value={table}
-              onChange={(e) =>
-                setTable(
-                  e.target.value
-                )
-              }
-              placeholder="Table number"
-            />
-          ))}
-
-        <div className="payment-pills">
-          {PAYMENT_MODES.map((mode) => (
-            <button
-              key={mode}
-              className={paymentMode === mode ? "active" : ""}
-              onClick={() => setPaymentMode(mode)}
-            >
-              {mode}
-            </button>
-          ))}
-        </div>
-
-        <button
-          className="place"
-          disabled={!cart.length || saving}
-          onClick={() => placeOrder()}
-          style={{ marginTop: "12px" }}
-        >
-          {saving
-            ? "SAVING ORDER..."
-            : `PLACE ORDER · ${displayNumber(money(total))}`}
-        </button>
-
-        {cart.length > 0 && (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              padding: "10px 4px 0",
-              fontSize: "12px",
-            }}
-          >
-            <label
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                cursor: "pointer",
-                color: "#64748b",
-                userSelect: "none",
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={autoPrintKot}
-                onChange={(e) => {
-                  setAutoPrintKot(e.target.checked);
-                  saveLocalSettings({ autoPrintKot: e.target.checked });
-                }}
-              />
-              <span>Print KOT to Kitchen</span>
-            </label>
-
-            <button
-              type="button"
-              onClick={printBill}
-              style={{
-                background: "transparent",
-                border: "none",
-                color: "#2563eb",
-                fontWeight: 700,
-                cursor: "pointer",
-                padding: "2px 6px",
-                textDecoration: "underline",
-              }}
-            >
-              Print Bill
-            </button>
-          </div>
-        )}
-
-      </section>
-
-      {/* Edit Price Modal */}
-      {editingItem && (
-        <div className="modal-overlay">
-          <div className="modal">
-            <h3>
-              Edit Price
-            </h3>
-
-            <p>
-              {editingItem.name}
-            </p>
-
-            <label>
-              Price
-            </label>
-
-            <input
-              type="number"
-              step="0.01"
-              value={editPrice}
-              onChange={(e) =>
-                setEditPrice(
-                  e.target.value
-                )
-              }
-              placeholder="0"
-            />
-
-            <div className="modal-actions">
-              <button
-                className="primary-btn"
-                onClick={
-                  handleUpdatePrice
-                }
-              >
-                Update
-              </button>
-              <button
-                className="secondary-btn"
-                onClick={() =>
-                  setEditingItem(
-                    null
-                  )
-                }
-              >
-                Cancel
-              </button>
-            </div>
-
-            <button
-              className="danger-link-btn"
-              disabled={disablingItem}
-              onClick={
-                handleDisableItem
-              }
-            >
-              {disablingItem
-                ? "Removing..."
-                : "Remove from menu"}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Disabled Items Modal */}
-      {showDisabledModal && (
-        <div className="modal-overlay">
-          <div className="modal">
-            <h3>
-              Disabled items
-            </h3>
-
-            <p>
-              Items removed from the
-              menu. Re-enable one to
-              bring it back for
-              ordering.
-            </p>
-
-            <div className="disabled-items-list">
-              {loadingDisabled ? (
-                <p className="disabled-items-empty">
-                  Loading...
-                </p>
-              ) : disabledItems.length ===
-                0 ? (
-                <p className="disabled-items-empty">
-                  No disabled items.
-                </p>
-              ) : (
-                disabledItems.map(
-                  (item) => (
-                    <div
-                      key={item.id}
-                      className="disabled-item-row"
-                    >
-                      <div>
-                        <b>
-                          {item.name}
-                        </b>
-                        <span>
-                          {item.category}{" "}
-                          ·{" "}
-                          {money(
-                            item.price
-                          )}
-                        </span>
-                      </div>
-
-                      <button
-                        className="icon-action-btn enable"
-                        disabled={
-                          reEnablingId ===
-                          item.id
-                        }
-                        onClick={() =>
-                          handleReEnableItem(
-                            item.id
-                          )
-                        }
-                      >
-                        <CheckCircle2
-                          size={14}
-                        />
-                        {reEnablingId ===
-                        item.id
-                          ? "..."
-                          : "Re-enable"}
-                      </button>
-                    </div>
-                  )
-                )
-              )}
-            </div>
-
-            <div className="modal-actions">
-              <button
-                className="secondary-btn"
-                onClick={() =>
-                  setShowDisabledModal(
-                    false
-                  )
-                }
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Add Item Modal */}
-      {showAddModal && (
-        <div className="modal-overlay">
-          <div className="modal">
-            <h3>
-              Add New Item
-            </h3>
-
-            <label>
-              Item Name
-            </label>
-
-            <input
-              type="text"
-              value={newItemName}
-              onChange={(e) =>
-                setNewItemName(
-                  e.target.value
-                )
-              }
-              placeholder="Enter item name"
-            />
-
-            <label>
-              Price
-            </label>
-
-            <input
-              type="number"
-              step="0.01"
-              value={newItemPrice}
-              onChange={(e) =>
-                setNewItemPrice(
-                  e.target.value
-                )
-              }
-              placeholder="0"
-            />
-
-            <label>
-              Category
-            </label>
-
-            <select
-              value={newItemCategory}
-              onChange={(e) =>
-                setNewItemCategory(
-                  e.target.value
-                )
-              }
-            >
-              {CATEGORIES.map(
-                (c) => (
-                  <option
-                    key={c}
-                    value={c}
-                  >
-                    {c}
-                  </option>
-                )
-              )}
-            </select>
-
-            <div className="modal-actions">
-              <button
-                className="primary-btn"
-                onClick={
-                  handleAddItem
-                }
-                disabled={addingItem}
-              >
-                {addingItem
-                  ? "Adding..."
-                  : "Add Item"}
-              </button>
-              <button
-                className="secondary-btn"
-                onClick={() =>
-                  setShowAddModal(
-                    false
-                  )
-                }
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-    </div>
-  );
-}
 
 /* =========================================================
    ORDERS & TABLE VIEW
@@ -3265,7 +1737,7 @@ function Orders({
                       </button>
                       <button
                         className="reprint-bill"
-                        style={{ background: "#0f172a", color: "#fff", border: "none" }}
+                        style={{ background: "#1c1917", color: "#fff", border: "none" }}
                         onClick={() =>
                           printExistingKot(
                             o,
@@ -5237,11 +3709,11 @@ function Insights({
                     >
                       <stop
                         offset="0%"
-                        stopColor="#c7d2fe"
+                        stopColor="#f3ded6"
                       />
                       <stop
                         offset="100%"
-                        stopColor="#a5b4fc"
+                        stopColor="#dccfb4"
                       />
                     </linearGradient>
                   </defs>
@@ -5354,7 +3826,7 @@ function Insights({
                       style={{
                         fontSize: 11,
                         fontWeight: 600,
-                        fill: "#4b5563",
+                        fill: "#57534e",
                       }}
                     />
                   </Bar>
@@ -5462,7 +3934,7 @@ function Insights({
                       <CartesianGrid
                         strokeDasharray="3 3"
                         vertical={false}
-                        stroke="#f1f5f9"
+                        stroke="#faf7f2"
                       />
                       <XAxis dataKey="label" fontSize={10.5} tickLine={false} />
                       <YAxis fontSize={11} tickLine={false} axisLine={false} />
@@ -5480,13 +3952,13 @@ function Insights({
                       />
                       <Bar dataKey="sameTimeValue" radius={[4, 4, 0, 0]}>
                         {sevenWeeksSameDayData.map((entry, idx) => {
-                          let barColor = "#475569";
+                          let barColor = "#57534e";
                           if (entry.isToday) {
                             barColor = entry.isLaggingSameTime
                               ? "#ef4444"
                               : "#10b981";
                           } else if (idx === 5) {
-                            barColor = "#334155";
+                            barColor = "#44403c";
                           }
                           return <Cell key={entry.dateKey} fill={barColor} />;
                         })}
@@ -5499,7 +3971,7 @@ function Insights({
                           style={{
                             fontSize: 10,
                             fontWeight: 700,
-                            fill: "#475569",
+                            fill: "#57534e",
                           }}
                         />
                       </Bar>
@@ -5528,7 +4000,7 @@ function Insights({
                           ? latestWeekItem.isLaggingSameTime
                             ? "#ef4444"
                             : "#10b981"
-                          : "#475569",
+                          : "#57534e",
                       }}
                     />
                     {latestWeekItem?.isToday
@@ -5538,7 +4010,7 @@ function Insights({
                   <span className="legend-item">
                     <span
                       className="legend-bar-swatch"
-                      style={{ background: "#475569" }}
+                      style={{ background: "#57534e" }}
                     />
                     Prior Weeks
                   </span>
@@ -5562,7 +4034,7 @@ function Insights({
                   {latestWeekItem?.isToday && (
                     <span
                       className="weekday-status-pill pos"
-                      style={{ background: "#eff6ff", color: "#1d4ed8" }}
+                      style={{ background: "#fef9ee", color: "#c88719" }}
                     >
                       Pacing to{" "}
                       {dayWiseValueFormatter(latestWeekItem.projectedTotal)}
@@ -5579,7 +4051,7 @@ function Insights({
                       <CartesianGrid
                         strokeDasharray="3 3"
                         vertical={false}
-                        stroke="#f1f5f9"
+                        stroke="#faf7f2"
                       />
                       <XAxis dataKey="label" fontSize={10.5} tickLine={false} />
                       <YAxis fontSize={11} tickLine={false} axisLine={false} />
@@ -5603,13 +4075,13 @@ function Insights({
                         radius={[4, 4, 0, 0]}
                       >
                         {sevenWeeksSameDayData.map((entry, idx) => {
-                          let barColor = "#475569";
+                          let barColor = "#57534e";
                           if (entry.isToday) {
                             barColor = entry.isLaggingSameTime
                               ? "#ef4444"
                               : "#10b981";
                           } else if (idx === 5) {
-                            barColor = "#334155";
+                            barColor = "#44403c";
                           }
                           return <Cell key={entry.dateKey} fill={barColor} />;
                         })}
@@ -5622,14 +4094,14 @@ function Insights({
                           style={{
                             fontSize: 10,
                             fontWeight: 700,
-                            fill: "#334155",
+                            fill: "#44403c",
                           }}
                         />
                       </Bar>
                       <Bar
                         dataKey="projectedRemaining"
                         stackId="fullDayStack"
-                        fill="#cbd5e1"
+                        fill="#e7e0d3"
                         radius={[4, 4, 0, 0]}
                         name="Projected Evening Pace"
                       />
@@ -5653,14 +4125,14 @@ function Insights({
                   <span className="legend-item">
                     <span
                       className="legend-bar-swatch"
-                      style={{ background: "#475569" }}
+                      style={{ background: "#57534e" }}
                     />
                     Full Day Actual
                   </span>
                   <span className="legend-item">
                     <span
                       className="legend-bar-swatch"
-                      style={{ background: "#cbd5e1" }}
+                      style={{ background: "#e7e0d3" }}
                     />
                     Projected Finish
                   </span>
@@ -5791,7 +4263,7 @@ function Insights({
                   width: 10,
                   height: 10,
                   borderRadius: 2,
-                  background: "#334155",
+                  background: "#44403c",
                   display: "inline-block",
                 }}
               />
@@ -5803,7 +4275,7 @@ function Insights({
                   width: 10,
                   height: 10,
                   borderRadius: 2,
-                  background: "#64748b",
+                  background: "#78716c",
                   display: "inline-block",
                 }}
               />
@@ -5854,7 +4326,7 @@ function Insights({
               const totalDisplay =
                 categoryViewMode === "weekday" ? (
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <span style={{ fontWeight: 700, color: "#0f172a" }}>
+                    <span style={{ fontWeight: 700, color: "#1c1917" }}>
                       {categoryFormatter(category.todayVal)} Today
                     </span>
                     {category.lwVal > 0 && (
@@ -5935,9 +4407,9 @@ function Insights({
                               if (entry.isToday) {
                                 barColor = category.isLagging ? "#ef4444" : "#10b981";
                               } else if (i === 5) {
-                                barColor = "#334155"; // Last Week
+                                barColor = "#44403c"; // Last Week
                               } else {
-                                barColor = "#64748b"; // Prior weeks
+                                barColor = "#78716c"; // Prior weeks
                               }
                             }
                             return (
@@ -5996,7 +4468,7 @@ type KpiCompareDatum = {
 };
 
 const KPI_COMPARE_COLORS = [
-  "#5b5ce2",
+  "#d99726",
   "#f59e0b",
   "#14b8a6",
 ];
@@ -6043,9 +4515,9 @@ function Kpi({
       return isPerformingPoorly ? "#ef4444" : "#10b981";
     }
     if (index === 1) {
-      return "#475569"; // Slate Blue
+      return "#57534e"; // Neutral Stone
     }
-    return "#94a3b8"; // Cool Gray
+    return "#a8a29e"; // Warm Gray
   };
 
   return (
@@ -6102,14 +4574,14 @@ function Kpi({
             <span className="kpi-caption-item">
               <span
                 className="kpi-caption-swatch bar"
-                style={{ backgroundColor: "#475569" }}
+                style={{ backgroundColor: "#57534e" }}
               />
               Last wk
             </span>
             <span className="kpi-caption-item">
               <span
                 className="kpi-caption-swatch bar"
-                style={{ backgroundColor: "#94a3b8" }}
+                style={{ backgroundColor: "#a8a29e" }}
               />
               7-wk avg
             </span>
@@ -6160,7 +4632,7 @@ function Kpi({
               <CartesianGrid
                 strokeDasharray="3 3"
                 vertical={false}
-                stroke="#f1f5f9"
+                stroke="#faf7f2"
               />
 
               <XAxis
@@ -6177,7 +4649,7 @@ function Kpi({
                 contentStyle={{
                   borderRadius: 8,
                   fontSize: 12,
-                  border: "1px solid #e2e8f0",
+                  border: "1px solid #ede7dc",
                 }}
               />
 
@@ -6201,7 +4673,7 @@ function Kpi({
                   style={{
                     fontSize: 11,
                     fontWeight: 700,
-                    fill: "#334155",
+                    fill: "#44403c",
                   }}
                 />
               </Bar>
@@ -7268,6 +5740,9 @@ export default function HomePage() {
   const [selectedTable, setSelectedTable] =
     useState("");
 
+  const [tableSelectToken, setTableSelectToken] =
+    useState(0);
+
   const [
     mobileNav,
     setMobileNav,
@@ -7769,13 +6244,13 @@ export default function HomePage() {
       );
 
       // Offline fallback: load cached menu & tables if available, or demo data
-      const cachedMenu = getCachedMenuItems(restaurantId);
+      const cachedMenu = await getCachedMenuItems(restaurantId);
       if (cachedMenu && cachedMenu.length > 0) {
         setProducts(cachedMenu);
       } else {
         setProducts(DEMO_PRODUCTS);
       }
-      const cachedTbls = getCachedTables(restaurantId);
+      const cachedTbls = await getCachedTables(restaurantId);
       if (cachedTbls && cachedTbls.length > 0) {
         setRestaurantTables(cachedTbls);
       } else {
@@ -7890,6 +6365,7 @@ export default function HomePage() {
 
   function handleTableOrder(table?: string) {
     setSelectedTable(table || "");
+    setTableSelectToken((prev) => prev + 1);
     setTab("new");
   }
 
@@ -7910,7 +6386,7 @@ export default function HomePage() {
 
     const closedAtIso = new Date().toISOString();
 
-    if (!isSupabaseConfigured || currentUser?.id?.startsWith("demo-")) {
+    if (!isSupabaseConfigured || currentUser?.restaurantId === "demo-restaurant-1") {
       setTodayOrders((current) =>
         current.map((order) =>
           openOrderIds.includes(order.databaseId as string)
@@ -8019,9 +6495,9 @@ export default function HomePage() {
           alignItems: "center",
           justifyContent: "center",
           minHeight: "100vh",
-          background: "radial-gradient(ellipse at top, #111b2e, #070a12)",
-          color: "#ffffff",
-          fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+          background: "#faf7f2",
+          color: "#1c1917",
+          fontFamily: "Inter, system-ui, -apple-system, sans-serif",
           padding: "24px",
         }}
       >
@@ -8038,32 +6514,22 @@ export default function HomePage() {
           <div
             style={{
               position: "relative",
-              width: "96px",
-              height: "96px",
-              marginBottom: "24px",
+              width: "80px",
+              height: "80px",
+              marginBottom: "20px",
             }}
           >
-            <div
-              style={{
-                position: "absolute",
-                inset: "-8px",
-                borderRadius: "26px",
-                background: "radial-gradient(circle, rgba(16,185,129,0.35) 0%, rgba(16,185,129,0) 70%)",
-                filter: "blur(12px)",
-              }}
-            />
             <img
-              src="/icon-192.png"
+              src="/logo.png"
               alt="RestaurantIQ"
-              width={96}
-              height={96}
+              width={80}
+              height={80}
               style={{
-                position: "relative",
-                width: "96px",
-                height: "96px",
-                borderRadius: "22px",
-                boxShadow: "0 12px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.12)",
+                width: "80px",
+                height: "80px",
+                borderRadius: "18px",
                 objectFit: "cover",
+                boxShadow: "0 8px 24px rgba(0, 0, 0, 0.08), 0 0 0 1px #ede7dc",
               }}
             />
           </div>
@@ -8074,9 +6540,7 @@ export default function HomePage() {
               fontSize: "26px",
               fontWeight: 800,
               letterSpacing: "-0.02em",
-              background: "linear-gradient(135deg, #ffffff 40%, #10b981 100%)",
-              WebkitBackgroundClip: "text",
-              WebkitTextFillColor: "transparent",
+              color: "#1c1917",
             }}
           >
             RestaurantIQ
@@ -8086,7 +6550,7 @@ export default function HomePage() {
             style={{
               margin: "0 0 24px 0",
               fontSize: "14px",
-              color: "#94a3b8",
+              color: "#78716c",
               fontWeight: 500,
             }}
           >
@@ -8097,7 +6561,7 @@ export default function HomePage() {
             style={{
               width: "160px",
               height: "4px",
-              background: "rgba(255, 255, 255, 0.08)",
+              background: "#ede7dc",
               borderRadius: "999px",
               overflow: "hidden",
               position: "relative",
@@ -8111,7 +6575,7 @@ export default function HomePage() {
                 left: 0,
                 height: "100%",
                 width: "40%",
-                background: "linear-gradient(90deg, #10b981, #34d399)",
+                background: "linear-gradient(90deg, #d99726, #167a49)",
                 borderRadius: "999px",
                 animation: "shimmer 1.5s infinite ease-in-out",
               }}
@@ -8121,7 +6585,7 @@ export default function HomePage() {
           <span
             style={{
               fontSize: "12px",
-              color: "#64748b",
+              color: "#78716c",
               fontWeight: 500,
             }}
           >
@@ -8196,6 +6660,20 @@ export default function HomePage() {
     },
   };
 
+  if (currentUser.role === "ADMIN") {
+    return (
+      <RestaurantIQDashboard
+        orders={todayOrders}
+        restaurantId={currentUser.restaurantId || ""}
+        restaurantName={currentUser.restaurantName}
+        currentUserPhone={currentUser.phone}
+        onLogout={handleLogout}
+        onRefresh={handleRefreshAll}
+        isRefreshing={isRefreshingAll}
+      />
+    );
+  }
+
   return (
     <div className={`shell ${currentUser.role === "POC" ? "poc-shell" : ""}`}>
 
@@ -8228,7 +6706,6 @@ export default function HomePage() {
           <Header
             user={currentUser}
             onMenu={() => setMobileNav(true)}
-            onRefresh={currentUser.role === "ADMIN" ? handleRefreshAll : undefined}
             lastUpdated={lastUpdatedTime}
             isRefreshing={isRefreshingAll}
             tab={tab}
@@ -8257,7 +6734,7 @@ export default function HomePage() {
           </div>
         )}
 
-        {currentUser.role !== "POC" && currentUser.role !== "ADMIN" && (
+        {currentUser.role === "SUPER_ADMIN" && (
           <div className="toolbar">
 
             <div>
@@ -8361,6 +6838,9 @@ export default function HomePage() {
                 initialTable={
                   selectedTable
                 }
+                tableSelectionToken={
+                  tableSelectToken
+                }
                 restaurantTables={
                   restaurantTables
                 }
@@ -8418,28 +6898,6 @@ export default function HomePage() {
             </div>
           )}
 
-        {currentUser.role ===
-          "ADMIN" &&
-          visitedTabs.has("insights") && (
-            <div style={{ display: tab === "insights" ? "block" : "none" }}>
-              <Insights
-                orders={
-                  todayOrders
-                }
-                restaurantId={
-                  currentUser.restaurantId ||
-                  ""
-                }
-                restaurantName={
-                  currentUser.restaurantName
-                }
-                currentUserPhone={
-                  currentUser.phone
-                }
-              />
-            </div>
-          )}
-
         {currentUser.role !== "POC" && (
           <footer>
             RestaurantIQ MVP · Supabase
@@ -8460,7 +6918,7 @@ export default function HomePage() {
             Arial,
             sans-serif;
           background: #f7f7fb;
-          color: #111827;
+          color: #1c1917;
         }
 
         button,
@@ -8485,8 +6943,7 @@ export default function HomePage() {
         .side {
           width: 250px;
           background: #ffffff;
-          border-right:
-            1px solid #e5e7eb;
+          border-right: 1px solid #ede7dc;
           position: fixed;
           left: 0;
           top: 0;
@@ -8495,6 +6952,7 @@ export default function HomePage() {
           z-index: 50;
           display: flex;
           flex-direction: column;
+          color: #1c1917;
         }
 
         .brand {
@@ -8504,6 +6962,7 @@ export default function HomePage() {
           padding: 4px 8px 20px;
           font-size: 20px;
           font-weight: 800;
+          color: #1c1917;
         }
 
         .brand.big {
@@ -8519,14 +6978,16 @@ export default function HomePage() {
           display: flex;
           align-items: center;
           justify-content: center;
-          color: white;
-          background:
-            linear-gradient(
-              135deg,
-              #5b5ce2,
-              #8b5cf6
-            );
-          font-weight: 800;
+          background: #faf7f2;
+          border: 1px solid #ede7dc;
+          overflow: hidden;
+        }
+
+        .logo-img {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+          display: block;
         }
 
         nav {
@@ -8543,24 +7004,31 @@ export default function HomePage() {
           gap: 12px;
           padding: 12px 14px;
           border-radius: 10px;
-          color: #6b7280;
+          color: #78716c;
           font-weight: 600;
           text-decoration: none;
+          transition: all 0.15s ease;
         }
 
         nav a:hover,
         .bottom a:hover {
-          background: #f5f5ff;
-          color: #5b5ce2;
+          background: #fbf8f3;
+          color: #1c1917;
         }
 
         nav a.active {
-          background: #eeeeff;
-          color: #5b5ce2;
+          background: #fef9ee;
+          color: #b47814;
+          font-weight: 700;
         }
 
         .bottom {
           margin-top: auto;
+        }
+
+        .bottom a:hover {
+          color: #ef4444;
+          background: #fef2f2;
         }
 
         .close {
@@ -8581,30 +7049,9 @@ export default function HomePage() {
           padding: 14px 16px;
           margin: 4px 0 10px;
           border-radius: 14px;
-          background:
-            linear-gradient(
-              135deg,
-              rgba(
-                91,
-                92,
-                226,
-                0.08
-              ),
-              rgba(
-                139,
-                92,
-                246,
-                0.05
-              )
-            );
-          border:
-            1px solid
-            rgba(
-              91,
-              92,
-              226,
-              0.18
-            );
+          background: #faf7f2;
+          border: 1px solid #ede7dc;
+          color: #1c1917;
         }
 
         .restaurant-id-badge {
@@ -8617,31 +7064,22 @@ export default function HomePage() {
           justify-content: center;
           font-weight: 700;
           color: #fff;
-          background:
-            linear-gradient(
-              135deg,
-              #5b5ce2,
-              #8b5cf6
-            );
+          background: #d99726;
         }
 
         .platform-badge {
-          background:
-            linear-gradient(
-              135deg,
-              #1f2937,
-              #4b5563
-            );
+          background: #1c1917;
         }
 
         .restaurant-id b {
           display: block;
           font-size: 15px;
+          color: #1c1917;
         }
 
         .restaurant-id small {
           font-size: 12px;
-          color: #6b7280;
+          color: #78716c;
         }
 
         /* ===============================
@@ -8661,7 +7099,7 @@ export default function HomePage() {
           height: 100vh !important;
           max-height: 100vh !important;
           overflow: hidden !important;
-          background: #0f172a !important;
+          background: #1c1917 !important;
         }
 
         main.pos-main {
@@ -8690,7 +7128,7 @@ export default function HomePage() {
 
         header p {
           margin: 5px 0 0;
-          color: #6b7280;
+          color: #78716c;
         }
 
         .profile {
@@ -8701,8 +7139,8 @@ export default function HomePage() {
           display: flex;
           align-items: center;
           justify-content: center;
-          background: #eeeeff;
-          color: #5b5ce2;
+          background: #fef9ee;
+          color: #d99726;
           font-weight: 800;
         }
 
@@ -8714,7 +7152,7 @@ export default function HomePage() {
 
         .toolbar {
           background: white;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           padding: 15px 18px;
           border-radius: 14px;
           margin-bottom: 20px;
@@ -8726,13 +7164,13 @@ export default function HomePage() {
         }
 
         .toolbar span {
-          color: #6b7280;
+          color: #78716c;
           font-size: 13px;
         }
 
         .card {
           background: white;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 16px;
           padding: 20px;
         }
@@ -8757,7 +7195,7 @@ export default function HomePage() {
         .section-title span {
           display: block;
           margin-top: 4px;
-          color: #6b7280;
+          color: #78716c;
           font-size: 13px;
         }
 
@@ -8777,12 +7215,12 @@ export default function HomePage() {
         }
 
         .trend-delta.neutral {
-          color: #9ca3af;
+          color: #a8a29e;
           font-weight: 500;
         }
 
         .empty-state {
-          color: #9ca3af;
+          color: #a8a29e;
           font-size: 13px;
           text-align: center;
           padding: 30px 0;
@@ -8796,17 +7234,17 @@ export default function HomePage() {
         .top-items-table th {
           text-align: left;
           font-size: 12px;
-          color: #9ca3af;
+          color: #a8a29e;
           font-weight: 600;
           padding: 8px 10px;
-          border-bottom: 1px solid #e5e7eb;
+          border-bottom: 1px solid #ede7dc;
         }
 
         .top-items-table td {
           padding: 9px 10px;
           font-size: 13px;
-          color: #111827;
-          border-bottom: 1px solid #f3f4f6;
+          color: #1c1917;
+          border-bottom: 1px solid #f5efe6;
         }
 
         .top-items-table tr:last-child td {
@@ -8840,7 +7278,7 @@ export default function HomePage() {
         }
 
         .cats button {
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           background: white;
           padding: 9px 12px;
           border-radius: 10px;
@@ -8848,9 +7286,9 @@ export default function HomePage() {
         }
 
         .cats button.active {
-          background: #5b5ce2;
+          background: #d99726;
           color: white;
-          border-color: #5b5ce2;
+          border-color: #d99726;
         }
 
         .cats small {
@@ -8873,7 +7311,7 @@ export default function HomePage() {
 
         .menu-item {
           text-align: left;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           background: white;
           border-radius: 12px;
           padding: 15px;
@@ -8884,7 +7322,7 @@ export default function HomePage() {
         }
 
         .menu-item:hover {
-          border-color: #5b5ce2;
+          border-color: #d99726;
           transform: translateY(-1px);
         }
 
@@ -8893,7 +7331,7 @@ export default function HomePage() {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          color: #5b5ce2;
+          color: #d99726;
           font-weight: 700;
         }
 
@@ -8907,8 +7345,8 @@ export default function HomePage() {
           margin-top: 6px;
           border-radius: 8px;
           border: 1px solid #d1d5db;
-          background: #f3f4f6;
-          color: #4b5563;
+          background: #f5efe6;
+          color: #57534e;
           font-weight: 600;
           font-size: 12px;
           cursor: pointer;
@@ -8916,8 +7354,8 @@ export default function HomePage() {
         }
 
         .edit-btn:hover {
-          background: #e5e7eb;
-          border-color: #9ca3af;
+          background: #ede7dc;
+          border-color: #a8a29e;
         }
 
         .modal-overlay {
@@ -8942,12 +7380,12 @@ export default function HomePage() {
         .modal h3 {
           margin: 0 0 10px;
           font-size: 20px;
-          color: #111827;
+          color: #1c1917;
         }
 
         .modal p {
           margin: 0 0 15px;
-          color: #6b7280;
+          color: #78716c;
           font-size: 14px;
         }
 
@@ -8964,7 +7402,7 @@ export default function HomePage() {
         .modal select {
           width: 100%;
           padding: 10px 12px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 8px;
           font-size: 14px;
           font-family: inherit;
@@ -8973,8 +7411,8 @@ export default function HomePage() {
         .modal input:focus,
         .modal select:focus {
           outline: none;
-          border-color: #5b5ce2;
-          box-shadow: 0 0 0 3px rgba(91, 92, 226, 0.1);
+          border-color: #d99726;
+          box-shadow: 0 0 0 3px rgba(217, 151, 38, 0.1);
         }
 
         .modal-actions {
@@ -8991,9 +7429,9 @@ export default function HomePage() {
           flex: 1;
           padding: 11px 16px;
           border-radius: 10px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           background: white;
-          color: #6b7280;
+          color: #78716c;
           font-weight: 600;
           cursor: pointer;
           transition: all 0.2s ease;
@@ -9037,7 +7475,7 @@ export default function HomePage() {
         }
 
         .disabled-items-empty {
-          color: #9ca3af;
+          color: #a8a29e;
           font-size: 13px;
           text-align: center;
           padding: 20px 0;
@@ -9049,20 +7487,20 @@ export default function HomePage() {
           justify-content: space-between;
           gap: 10px;
           padding: 10px 12px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 10px;
         }
 
         .disabled-item-row b {
           display: block;
           font-size: 14px;
-          color: #111827;
+          color: #1c1917;
         }
 
         .disabled-item-row span {
           display: block;
           font-size: 12px;
-          color: #9ca3af;
+          color: #a8a29e;
           margin-top: 2px;
         }
 
@@ -9093,7 +7531,7 @@ export default function HomePage() {
         .cart-row small {
           display: block;
           margin-top: 4px;
-          color: #6b7280;
+          color: #78716c;
         }
 
         .qty {
@@ -9106,7 +7544,7 @@ export default function HomePage() {
           width: 28px;
           height: 28px;
           border-radius: 8px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           background: white;
         }
 
@@ -9114,7 +7552,7 @@ export default function HomePage() {
           margin-top: 18px;
           padding-top: 18px;
           border-top:
-            1px solid #e5e7eb;
+            1px solid #ede7dc;
           display: flex;
           justify-content: space-between;
           font-size: 18px;
@@ -9132,14 +7570,14 @@ export default function HomePage() {
           min-width: 90px;
           padding: 10px 12px;
           border-radius: 10px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           background: #fff;
           font-weight: 600;
         }
 
         .source-pills button.active {
-          background: #5b5ce2;
-          border-color: #5b5ce2;
+          background: #d99726;
+          border-color: #d99726;
           color: #fff;
         }
 
@@ -9175,16 +7613,16 @@ export default function HomePage() {
         .metric-pills button {
           padding: 7px 14px;
           border-radius: 999px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           background: #fff;
-          color: #4b5563;
+          color: #57534e;
           font-weight: 600;
           font-size: 12.5px;
         }
 
         .metric-pills button.active {
-          background: #5b5ce2;
-          border-color: #5b5ce2;
+          background: #d99726;
+          border-color: #d99726;
           color: #fff;
         }
 
@@ -9207,14 +7645,14 @@ export default function HomePage() {
           border-radius: 999px;
           border: 1px solid #ddd6fe;
           background: #fff;
-          color: #4f46e5;
+          color: #c88719;
           font-weight: 600;
           font-size: 12.5px;
         }
 
         .date-range-pills button.active {
-          background: #4f46e5;
-          border-color: #4f46e5;
+          background: #c88719;
+          border-color: #c88719;
           color: #fff;
         }
 
@@ -9231,7 +7669,7 @@ export default function HomePage() {
           gap: 4px;
           font-size: 12px;
           font-weight: 600;
-          color: #6b7280;
+          color: #78716c;
         }
 
         .custom-range-inputs input {
@@ -9250,7 +7688,7 @@ export default function HomePage() {
           margin: 8px 0;
           padding: 10px 12px;
           border-radius: 10px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
         }
 
         .place,
@@ -9259,7 +7697,7 @@ export default function HomePage() {
           padding: 13px;
           border: none;
           border-radius: 11px;
-          background: #5b5ce2;
+          background: #d99726;
           color: white;
           font-weight: 800;
           margin-top: 12px;
@@ -9297,7 +7735,7 @@ export default function HomePage() {
         .empty {
           padding: 35px;
           text-align: center;
-          color: #6b7280;
+          color: #78716c;
         }
 
         .empty small {
@@ -9313,7 +7751,7 @@ export default function HomePage() {
           display: flex;
           align-items: center;
           gap: 8px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 10px;
           padding: 8px 10px;
         }
@@ -9328,7 +7766,7 @@ export default function HomePage() {
           align-items: center;
           gap: 8px;
           padding: 12px 0;
-          color: #6b7280;
+          color: #78716c;
           font-size: 13px;
           flex-wrap: wrap;
         }
@@ -9336,7 +7774,7 @@ export default function HomePage() {
         .date-filter input {
           padding: 6px 10px;
           border-radius: 8px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
         }
 
         .order-wrap {
@@ -9363,17 +7801,17 @@ export default function HomePage() {
         }
 
         .order-items {
-          color: #4b5563;
+          color: #57534e;
         }
 
         .order-source {
-          color: #6b7280;
+          color: #78716c;
           font-size: 12px;
         }
 
         .order-detail {
           padding: 15px 20px;
-          background: #fafafa;
+          background: #faf7f2;
         }
 
         .order-detail > div {
@@ -9473,13 +7911,13 @@ export default function HomePage() {
         .date-header {
           margin-bottom: 20px;
           padding-bottom: 15px;
-          border-bottom: 2px solid #e5e7eb;
+          border-bottom: 2px solid #ede7dc;
         }
 
         .date-header h2 {
           margin: 0;
           font-size: 22px;
-          color: #111827;
+          color: #1c1917;
           font-weight: 700;
         }
 
@@ -9487,7 +7925,7 @@ export default function HomePage() {
           display: block;
           margin-top: 4px;
           font-size: 12px;
-          color: #9ca3af;
+          color: #a8a29e;
         }
 
         .kpis {
@@ -9502,13 +7940,13 @@ export default function HomePage() {
         }
 
         .kpi span {
-          color: #6b7280;
+          color: #78716c;
           font-size: 13px;
         }
 
         .kpi-title {
           display: inline-block;
-          color: #4f46e5 !important;
+          color: #c88719 !important;
           font-size: 12px !important;
           font-weight: 800 !important;
           text-transform: uppercase;
@@ -9528,7 +7966,7 @@ export default function HomePage() {
           align-items: center;
           gap: 6px;
           font-size: 11px;
-          color: #6b7280;
+          color: #78716c;
           font-weight: 600;
         }
 
@@ -9543,13 +7981,13 @@ export default function HomePage() {
           border-radius: 2px;
           background: linear-gradient(
             180deg,
-            #5b5ce2,
-            #5b5ce2aa
+            #d99726,
+            #d99726aa
           );
         }
 
         .kpi-caption-swatch.line {
-          border-top: 2px dashed #1e293b;
+          border-top: 2px dashed #1c1917;
         }
 
         .kpi strong {
@@ -9588,7 +8026,7 @@ export default function HomePage() {
           gap: 10px;
           flex: 1 1 240px;
           padding-left: 22px;
-          border-left: 1px solid #f3f4f6;
+          border-left: 1px solid #f5efe6;
           color: #4338ca;
           font-size: 13px;
           line-height: 1.55;
@@ -9597,7 +8035,7 @@ export default function HomePage() {
         .kpi-insight svg {
           flex-shrink: 0;
           margin-top: 2px;
-          color: #5b5ce2;
+          color: #d99726;
         }
 
         .kpi-compare-rows {
@@ -9606,7 +8044,7 @@ export default function HomePage() {
           gap: 6px;
           margin-top: 6px;
           padding-top: 10px;
-          border-top: 1px solid #f3f4f6;
+          border-top: 1px solid #f5efe6;
         }
 
         .kpi-compare-row {
@@ -9618,7 +8056,7 @@ export default function HomePage() {
         }
 
         .kpi-compare-label {
-          color: #9ca3af;
+          color: #a8a29e;
           font-weight: 600;
           min-width: 58px;
         }
@@ -9629,7 +8067,7 @@ export default function HomePage() {
           gap: 14px;
           margin-top: 14px;
           padding-top: 12px;
-          border-top: 1px solid #f3f4f6;
+          border-top: 1px solid #f5efe6;
         }
 
         .weekday-legend-item {
@@ -9637,7 +8075,7 @@ export default function HomePage() {
           align-items: center;
           gap: 6px;
           font-size: 12px;
-          color: #6b7280;
+          color: #78716c;
         }
 
         .weekday-legend-swatch {
@@ -9655,7 +8093,7 @@ export default function HomePage() {
           display: flex;
           align-items: center;
           gap: 10px;
-          background: #eeeeff;
+          background: #fef9ee;
           color: #4338ca;
           padding: 15px;
           border-radius: 12px;
@@ -9693,7 +8131,7 @@ export default function HomePage() {
         .filter-group select,
         .filter-group input {
           padding: 10px 12px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 8px;
           font-family: inherit;
           font-size: 14px;
@@ -9703,9 +8141,9 @@ export default function HomePage() {
         .filter-group select:focus,
         .filter-group input:focus {
           outline: none;
-          border-color: #5b5ce2;
+          border-color: #d99726;
           box-shadow: 0 0 0 3px
-            rgba(91, 92, 226, 0.1);
+            rgba(217, 151, 38, 0.1);
         }
 
         .charts-grid {
@@ -9736,9 +8174,9 @@ export default function HomePage() {
 
         .source-item {
           padding: 15px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 12px;
-          background: #fafafa;
+          background: #faf7f2;
         }
 
         .source-header {
@@ -9751,20 +8189,20 @@ export default function HomePage() {
 
         .source-name {
           font-weight: 600;
-          color: #111827;
+          color: #1c1917;
           font-size: 14px;
         }
 
         .source-percentage {
           font-weight: 700;
-          color: #5b5ce2;
+          color: #d99726;
           font-size: 16px;
         }
 
         .source-bar {
           width: 100%;
           height: 8px;
-          background: #e5e7eb;
+          background: #ede7dc;
           border-radius: 4px;
           overflow: hidden;
           margin-bottom: 8px;
@@ -9775,7 +8213,7 @@ export default function HomePage() {
           background:
             linear-gradient(
               90deg,
-              #5b5ce2,
+              #d99726,
               #8b5cf6
             );
           border-radius: 4px;
@@ -9785,7 +8223,7 @@ export default function HomePage() {
 
         .source-count {
           font-size: 12px;
-          color: #6b7280;
+          color: #78716c;
           text-align: center;
         }
 
@@ -9804,8 +8242,8 @@ export default function HomePage() {
           width: 40px;
           height: 40px;
           border-radius: 12px;
-          background: #eeeeff;
-          color: #5b5ce2;
+          background: #fef9ee;
+          color: #d99726;
           display: flex;
           align-items: center;
           justify-content: center;
@@ -9818,7 +8256,7 @@ export default function HomePage() {
 
         .ai-title span {
           font-size: 12px;
-          color: #6b7280;
+          color: #78716c;
         }
 
         .alert,
@@ -9832,7 +8270,7 @@ export default function HomePage() {
         .alert p,
         .recommend p {
           margin-bottom: 0;
-          color: #6b7280;
+          color: #78716c;
           font-size: 13px;
         }
 
@@ -9852,8 +8290,8 @@ export default function HomePage() {
           display: flex;
           align-items: center;
           justify-content: center;
-          background: #eeeeff;
-          color: #5b5ce2;
+          background: #fef9ee;
+          color: #d99726;
           font-weight: 800;
         }
 
@@ -9863,7 +8301,7 @@ export default function HomePage() {
 
         .pname small {
           display: block;
-          color: #6b7280;
+          color: #78716c;
           margin-top: 3px;
         }
 
@@ -9876,7 +8314,7 @@ export default function HomePage() {
 
         .quick span {
           display: block;
-          color: #6b7280;
+          color: #78716c;
           font-size: 13px;
           margin-top: 3px;
         }
@@ -9896,7 +8334,7 @@ export default function HomePage() {
           min-width: 200px;
           padding: 11px 12px;
           border-radius: 10px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
         }
 
         .user-form {
@@ -9916,7 +8354,7 @@ export default function HomePage() {
         .user-form select {
           padding: 11px 12px;
           border-radius: 10px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           font-size: 14px;
         }
 
@@ -9928,7 +8366,7 @@ export default function HomePage() {
           padding: 11px 16px;
           border-radius: 10px;
           border: none;
-          background: #5b5ce2;
+          background: #d99726;
           color: white;
           font-weight: 700;
         }
@@ -9961,7 +8399,7 @@ export default function HomePage() {
         }
 
         th {
-          color: #6b7280;
+          color: #78716c;
           font-size: 12px;
           text-transform: uppercase;
         }
@@ -9993,15 +8431,15 @@ export default function HomePage() {
 
         .table-view-summary > div {
           padding: 14px 16px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 12px;
-          background: #fafafa;
+          background: #faf7f2;
         }
 
         .table-view-summary span,
         .table-card-meta,
         .table-label {
-          color: #6b7280;
+          color: #78716c;
           font-size: 12px;
         }
 
@@ -10025,7 +8463,7 @@ export default function HomePage() {
           margin-top: 0;
           padding: 18px;
           overflow: visible;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 14px;
           background: #ffffff;
         }
@@ -10081,11 +8519,11 @@ export default function HomePage() {
           display: flex;
           align-items: center;
           gap: 4px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 999px;
           padding: 5px 10px;
-          background: #fafafa;
-          color: #5b5ce2;
+          background: #faf7f2;
+          color: #d99726;
           font-size: 12px;
           font-weight: 700;
           white-space: nowrap;
@@ -10096,10 +8534,10 @@ export default function HomePage() {
         }
 
         .table-items-detail {
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 10px;
           padding: 4px 12px;
-          background: #fafafa;
+          background: #faf7f2;
           overflow-x: auto;
         }
 
@@ -10155,12 +8593,12 @@ export default function HomePage() {
           display: flex;
           align-items: center;
           gap: 8px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 10px;
           padding: 8px 12px;
           flex: 1 1 240px;
           min-width: 200px;
-          color: #9ca3af;
+          color: #a8a29e;
         }
 
         .user-filters-search input {
@@ -10168,23 +8606,23 @@ export default function HomePage() {
           outline: none;
           flex: 1;
           font-size: 14px;
-          color: #111827;
+          color: #1c1917;
           background: transparent;
         }
 
         .user-filters select {
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 10px;
           padding: 8px 12px;
           font-size: 14px;
-          color: #111827;
+          color: #1c1917;
           background: #fff;
         }
 
         .ghost-btn {
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           background: #fff;
-          color: #6b7280;
+          color: #78716c;
           border-radius: 10px;
           padding: 8px 12px;
           font-size: 13px;
@@ -10244,7 +8682,7 @@ export default function HomePage() {
             linear-gradient(
               135deg,
               #f7f7fb,
-              #eeeeff
+              #fef9ee
             );
           padding: 20px;
         }
@@ -10253,7 +8691,7 @@ export default function HomePage() {
           width: 100%;
           max-width: 420px;
           background: white;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 20px;
           padding: 35px;
           box-shadow:
@@ -10277,18 +8715,18 @@ export default function HomePage() {
         .login-card input {
           width: 100%;
           padding: 12px;
-          border: 1px solid #e5e7eb;
+          border: 1px solid #ede7dc;
           border-radius: 10px;
           outline: none;
         }
 
         .login-card input:focus {
-          border-color: #5b5ce2;
+          border-color: #d99726;
         }
 
         .login-sub {
           text-align: center;
-          color: #6b7280;
+          color: #78716c;
           margin-bottom: 25px;
         }
 
@@ -10296,12 +8734,12 @@ export default function HomePage() {
           display: block;
           text-align: center;
           margin-top: 15px;
-          color: #9ca3af;
+          color: #a8a29e;
         }
 
         footer {
           text-align: center;
-          color: #9ca3af;
+          color: #a8a29e;
           font-size: 12px;
           margin-top: 30px;
         }
@@ -10423,7 +8861,7 @@ export default function HomePage() {
             padding-left: 0;
             padding-top: 14px;
             border-left: none;
-            border-top: 1px solid #f3f4f6;
+            border-top: 1px solid #f5efe6;
           }
         }
 
@@ -10570,7 +9008,7 @@ export default function HomePage() {
         .section-title h2,
         .card h2 {
           font-family: Inter, system-ui, -apple-system, sans-serif;
-          color: #0f172a;
+          color: #1c1917;
         }
 
         header h1 {
@@ -10582,7 +9020,7 @@ export default function HomePage() {
         .toolbar span,
         .section-title span,
         .as-of-time {
-          color: #64748b;
+          color: #78716c;
         }
 
         .profile {
@@ -10608,7 +9046,7 @@ export default function HomePage() {
         .card {
           margin-bottom: 18px;
           padding: 18px 20px 14px;
-          border: 1px solid #e2e8f0;
+          border: 1px solid #ede7dc;
           border-radius: 12px;
           background: #ffffff;
           box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
@@ -10621,12 +9059,12 @@ export default function HomePage() {
         .section-title h2 {
           font-size: 16px;
           font-weight: 700;
-          color: #0f172a;
+          color: #1c1917;
         }
 
         .section-title span {
           font-size: 12px;
-          color: #64748b;
+          color: #78716c;
         }
 
         .date-header {
@@ -10658,7 +9096,7 @@ export default function HomePage() {
           padding: 16px 14px 12px;
           min-width: 0;
           background: #ffffff;
-          border: 1px solid #e2e8f0;
+          border: 1px solid #ede7dc;
           border-radius: 12px;
           box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
         }
@@ -10669,7 +9107,7 @@ export default function HomePage() {
         }
 
         .kpi-title {
-          color: #64748b !important;
+          color: #78716c !important;
           font-family: Inter, system-ui, -apple-system, sans-serif !important;
           font-size: 12px !important;
           font-weight: 600 !important;
@@ -10685,14 +9123,14 @@ export default function HomePage() {
           font-family: 'IBM Plex Mono', monospace;
           font-size: 24px;
           font-weight: 700;
-          color: #0f172a;
+          color: #1c1917;
           margin: 4px 0 6px;
           display: block;
         }
 
         .kpi-compare-caption,
         .kpi-caption-item {
-          color: #64748b;
+          color: #78716c;
           font-size: 11px;
         }
 
@@ -10701,13 +9139,13 @@ export default function HomePage() {
         }
 
         .kpi-compare-chart .recharts-cartesian-axis-tick-value {
-          fill: #64748b;
+          fill: #78716c;
           font-size: 11px;
         }
 
         .date-range-card {
           background: #ffffff;
-          border-color: #e2e8f0;
+          border-color: #ede7dc;
           margin-bottom: 18px;
         }
 
@@ -10721,10 +9159,10 @@ export default function HomePage() {
         .date-range-pills button,
         .metric-pills button {
           padding: 6px 14px;
-          border: 1px solid #e2e8f0;
+          border: 1px solid #ede7dc;
           border-radius: 8px;
-          background: #f8fafc;
-          color: #475569;
+          background: #faf7f2;
+          color: #57534e;
           font-size: 12px;
           font-weight: 500;
           cursor: pointer;
@@ -10733,22 +9171,22 @@ export default function HomePage() {
 
         .date-range-pills button:hover,
         .metric-pills button:hover {
-          background: #f1f5f9;
-          color: #0f172a;
-          border-color: #cbd5e1;
+          background: #faf7f2;
+          color: #1c1917;
+          border-color: #e7e0d3;
         }
 
         .date-range-pills button.active,
         .metric-pills button.active {
-          background: #2563eb;
-          border-color: #2563eb;
+          background: #d99726;
+          border-color: #d99726;
           color: #ffffff;
           font-weight: 600;
-          box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
+          box-shadow: 0 1px 2px rgba(217, 151, 38, 0.2);
         }
 
         .custom-range-inputs input {
-          border-color: #cbd5e1;
+          border-color: #e7e0d3;
           border-radius: 6px;
           background: #ffffff;
           padding: 6px 10px;
@@ -10790,10 +9228,10 @@ export default function HomePage() {
 
         .category-filter-pills button {
           padding: 6px 14px;
-          border: 1px solid #e2e8f0;
+          border: 1px solid #ede7dc;
           border-radius: 8px;
-          background: #f8fafc;
-          color: #475569;
+          background: #faf7f2;
+          color: #57534e;
           font-weight: 600;
           font-size: 12px;
           cursor: pointer;
@@ -10801,15 +9239,15 @@ export default function HomePage() {
         }
 
         .category-filter-pills button:hover {
-          background: #f1f5f9;
-          color: #0f172a;
+          background: #faf7f2;
+          color: #1c1917;
         }
 
         .category-filter-pills button.active {
-          background: #2563eb;
-          border-color: #2563eb;
+          background: #d99726;
+          border-color: #d99726;
           color: #fff;
-          box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
+          box-shadow: 0 1px 2px rgba(217, 151, 38, 0.2);
         }
 
         .category-grid {
@@ -10821,7 +9259,7 @@ export default function HomePage() {
         .category-chart-card {
           min-width: 0;
           padding: 16px 16px 10px;
-          border: 1px solid #e2e8f0;
+          border: 1px solid #ede7dc;
           border-radius: 12px;
           background: #ffffff;
           box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
@@ -10843,11 +9281,11 @@ export default function HomePage() {
           font-family: Inter, system-ui, -apple-system, sans-serif;
           font-size: 15px;
           font-weight: 700;
-          color: #0f172a;
+          color: #1c1917;
         }
 
         .category-chart-head span {
-          color: #64748b;
+          color: #78716c;
           font: 12px 'IBM Plex Mono', monospace;
           white-space: nowrap;
         }
@@ -10859,7 +9297,7 @@ export default function HomePage() {
         }
 
         .category-mini-chart .recharts-cartesian-axis-tick-value {
-          fill: #64748b;
+          fill: #78716c;
           font-family: 'IBM Plex Sans', sans-serif;
         }
 
@@ -10930,7 +9368,7 @@ export default function HomePage() {
         .toolbar {
           margin: 0 0 16px;
           padding: 0 0 10px;
-          border-bottom: 1px solid #e2e8f0;
+          border-bottom: 1px solid #ede7dc;
         }
 
         .toolbar b {
@@ -10947,7 +9385,7 @@ export default function HomePage() {
         .date-header {
           margin: 0 0 14px;
           padding: 0 0 10px;
-          border-bottom: 1px dashed #e2e8f0;
+          border-bottom: 1px dashed #ede7dc;
         }
 
         .date-header h2 {

@@ -161,7 +161,7 @@ export function SuperAdminRemindersPanel({
         style={{
           background: "#ffffff",
           borderRadius: "14px",
-          border: "1px solid #e2e8f0",
+          border: "1px solid #ede7dc",
           padding: "20px",
           boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
         }}
@@ -173,7 +173,7 @@ export function SuperAdminRemindersPanel({
             justifyContent: "space-between",
             flexWrap: "wrap",
             gap: "12px",
-            borderBottom: "1px solid #f1f5f9",
+            borderBottom: "1px solid #faf7f2",
             paddingBottom: "14px",
             marginBottom: "16px",
           }}
@@ -195,10 +195,10 @@ export function SuperAdminRemindersPanel({
               <Bell size={20} />
             </div>
             <div>
-              <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 800, color: "#0f172a" }}>
+              <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 800, color: "#1c1917" }}>
                 Daily Reminder Schedules ({settings.triggerCount} Triggers Active)
               </h2>
-              <p style={{ margin: "2px 0 0", fontSize: "12.5px", color: "#64748b" }}>
+              <p style={{ margin: "2px 0 0", fontSize: "12.5px", color: "#78716c" }}>
                 Set automatic reminder times and send daily digests to restaurant owners
               </p>
             </div>
@@ -210,7 +210,7 @@ export function SuperAdminRemindersPanel({
               display: "flex",
               alignItems: "center",
               gap: "6px",
-              background: savedSuccess ? "#16a34a" : "#0f172a",
+              background: savedSuccess ? "#16a34a" : "#1c1917",
               color: "#fff",
               border: "none",
               borderRadius: "8px",
@@ -269,11 +269,11 @@ export function SuperAdminRemindersPanel({
                 style={{
                   padding: "6px 8px",
                   borderRadius: "6px",
-                  border: "1px solid #cbd5e1",
+                  border: "1px solid #e7e0d3",
                   fontSize: "13px",
                   fontWeight: 700,
                   background: "#fff",
-                  color: "#0f172a",
+                  color: "#1c1917",
                 }}
               />
             </div>
@@ -314,11 +314,11 @@ export function SuperAdminRemindersPanel({
                 style={{
                   padding: "6px 8px",
                   borderRadius: "6px",
-                  border: "1px solid #cbd5e1",
+                  border: "1px solid #e7e0d3",
                   fontSize: "13px",
                   fontWeight: 700,
                   background: "#fff",
-                  color: "#0f172a",
+                  color: "#1c1917",
                 }}
               />
             </div>
@@ -331,7 +331,7 @@ export function SuperAdminRemindersPanel({
         style={{
           background: "#ffffff",
           borderRadius: "14px",
-          border: "1px solid #e2e8f0",
+          border: "1px solid #ede7dc",
           padding: "20px",
           boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
         }}
@@ -347,10 +347,10 @@ export function SuperAdminRemindersPanel({
           }}
         >
           <div>
-            <h3 style={{ margin: 0, fontSize: "15px", fontWeight: 800, color: "#0f172a" }}>
+            <h3 style={{ margin: 0, fontSize: "15px", fontWeight: 800, color: "#1c1917" }}>
               Restaurants &amp; Manual Triggers ({restaurants.length})
             </h3>
-            <p style={{ margin: "2px 0 0", fontSize: "12px", color: "#64748b" }}>
+            <p style={{ margin: "2px 0 0", fontSize: "12px", color: "#78716c" }}>
               Send digests right now on demand to any restaurant owner
             </p>
           </div>
@@ -363,8 +363,8 @@ export function SuperAdminRemindersPanel({
               gap: "6px",
               padding: "6px 12px",
               borderRadius: "6px",
-              border: "1px solid #cbd5e1",
-              background: "#f8fafc",
+              border: "1px solid #e7e0d3",
+              background: "#faf7f2",
               fontSize: "12px",
               fontWeight: 600,
               cursor: "pointer",
@@ -376,7 +376,7 @@ export function SuperAdminRemindersPanel({
         </div>
 
         {restaurants.length === 0 ? (
-          <div style={{ padding: "30px", textAlign: "center", color: "#64748b" }}>
+          <div style={{ padding: "30px", textAlign: "center", color: "#78716c" }}>
             No restaurants registered on the platform yet.
           </div>
         ) : (
@@ -396,8 +396,8 @@ export function SuperAdminRemindersPanel({
                     gap: "12px",
                     padding: "14px 16px",
                     borderRadius: "10px",
-                    border: "1px solid #e2e8f0",
-                    background: "#f8fafc",
+                    border: "1px solid #ede7dc",
+                    background: "#faf7f2",
                   }}
                 >
                   {/* Restaurant Details */}
@@ -407,11 +407,11 @@ export function SuperAdminRemindersPanel({
                         width: "36px",
                         height: "36px",
                         borderRadius: "8px",
-                        background: "#e2e8f0",
+                        background: "#ede7dc",
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "center",
-                        color: "#475569",
+                        color: "#57534e",
                         fontWeight: 800,
                       }}
                     >
@@ -419,10 +419,10 @@ export function SuperAdminRemindersPanel({
                     </div>
 
                     <div>
-                      <div style={{ fontSize: "14px", fontWeight: 800, color: "#0f172a" }}>
+                      <div style={{ fontSize: "14px", fontWeight: 800, color: "#1c1917" }}>
                         {rest.name}
                       </div>
-                      <div style={{ fontSize: "12px", color: "#64748b", display: "flex", alignItems: "center", gap: "4px" }}>
+                      <div style={{ fontSize: "12px", color: "#78716c", display: "flex", alignItems: "center", gap: "4px" }}>
                         <User size={12} />
                         <span>
                           {owner?.name ? `${owner.name} (${owner.phone || "No phone"})` : "No registered owner"}
@@ -434,7 +434,7 @@ export function SuperAdminRemindersPanel({
                   {/* Real-time Sales Snapshot */}
                   <div style={{ display: "flex", gap: "16px", alignItems: "center" }}>
                     <div>
-                      <span style={{ display: "block", fontSize: "10.5px", color: "#64748b", textTransform: "uppercase" }}>
+                      <span style={{ display: "block", fontSize: "10.5px", color: "#78716c", textTransform: "uppercase" }}>
                         Today&apos;s Revenue
                       </span>
                       <strong style={{ fontSize: "14px", color: "#16a34a" }}>
@@ -443,10 +443,10 @@ export function SuperAdminRemindersPanel({
                     </div>
 
                     <div>
-                      <span style={{ display: "block", fontSize: "10.5px", color: "#64748b", textTransform: "uppercase" }}>
+                      <span style={{ display: "block", fontSize: "10.5px", color: "#78716c", textTransform: "uppercase" }}>
                         Orders
                       </span>
-                      <strong style={{ fontSize: "14px", color: "#0f172a" }}>
+                      <strong style={{ fontSize: "14px", color: "#1c1917" }}>
                         {stats.orders}
                       </strong>
                     </div>
@@ -464,9 +464,9 @@ export function SuperAdminRemindersPanel({
                         gap: "4px",
                         padding: "7px 11px",
                         borderRadius: "6px",
-                        border: "1px solid #cbd5e1",
+                        border: "1px solid #e7e0d3",
                         background: "#fff",
-                        color: "#0f172a",
+                        color: "#1c1917",
                         fontSize: "12px",
                         fontWeight: 700,
                         cursor: "pointer",
