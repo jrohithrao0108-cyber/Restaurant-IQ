@@ -44,6 +44,11 @@ export type QueuedOfflineOrder = {
 
 export const MAX_SYNC_ATTEMPTS = 5;
 
+// Queue writes may arrive from rapid Save/KOT taps. Serialize the small
+// read-merge-write operation so two saves for the same running table cannot
+// both decide that no pending table record exists.
+let enqueueChain: Promise<void> = Promise.resolve();
+
 // ---------------------------------------------------------------------------
 // Order queue — now backed by IndexedDB (see ./offlineDB) instead of a single
 // localStorage JSON blob. Same function names/signatures as before EXCEPT:
@@ -95,10 +100,57 @@ export async function retryOfflineOrder(tempId: string): Promise<void> {
  * write happens in the background; failures are logged, not thrown, so the
  * settle flow's UI never blocks or breaks on this.
  */
-export function enqueueOfflineOrder(order: QueuedOfflineOrder): void {
-  dbPutOrder(order).catch((err) => {
-    console.error("Failed to enqueue offline order:", err);
+export async function enqueueOfflineOrder(order: QueuedOfflineOrder): Promise<void> {
+  const write = enqueueChain.catch(() => {}).then(async () => {
+    // A running dine-in table is one local order, even when the waiter saves
+    // several rounds. Merge unsynced OPEN rounds into the existing record;
+    // settled/takeaway/delivery orders always remain distinct records.
+    //
+    // INVARIANT this relies on: `order.items` / `order.total` always
+    // represent the FULL current state of the table's cart at the moment
+    // Save/KOT was pressed — never just "items added since the last save".
+    // (RestaurantPOS.tsx keeps the cart populated with the table's running
+    // total after Save/KOT instead of clearing it, specifically so this
+    // holds even when the waiter navigates away and back to the table.)
+    //
+    // Because of that, a second save for the same still-open table must
+    // REPLACE the locally queued record wholesale, not add quantities on
+    // top of it. Summing used to double-count items that were already
+    // included in both saves, and could never reflect an item the waiter
+    // removed from the cart (removal would just add "0 more", never take
+    // anything away) — replacing fixes both.
+    if (order.orderPhase === "OPEN" && order.orderType === "DINE_IN" && order.tableNumber) {
+      const queue = await getOfflineOrdersQueue(order.restaurantId);
+      const existing = queue.find(
+        (queued) =>
+          !queued.permanentlyFailed &&
+          queued.orderPhase === "OPEN" &&
+          queued.orderType === "DINE_IN" &&
+          queued.tableNumber === order.tableNumber
+      );
+
+      if (existing) {
+        // Keep the original queue identity (tempId) so this stays one local
+        // record per open table — everything else (items, total, syncAttempts,
+        // etc.) is taken fresh from the incoming full-state order.
+        await dbPutOrder({
+          ...order,
+          tempId: existing.tempId,
+        });
+        return;
+      }
+    }
+
+    await dbPutOrder(order);
   });
+
+  enqueueChain = write;
+  try {
+    await write;
+  } catch (err) {
+    console.error("Failed to enqueue offline order:", err);
+    throw err;
+  }
 }
 
 export async function removeOfflineOrder(tempId: string): Promise<void> {

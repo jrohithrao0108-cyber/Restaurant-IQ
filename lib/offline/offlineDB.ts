@@ -17,6 +17,10 @@ const STORE_TABLES_CACHE = "tables_cache";
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
+function isClosingConnectionError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "InvalidStateError";
+}
+
 function openDB(): Promise<IDBDatabase> {
   if (typeof indexedDB === "undefined") {
     return Promise.reject(new Error("IndexedDB is not available in this environment."));
@@ -51,14 +55,43 @@ function openDB(): Promise<IDBDatabase> {
       }
     };
 
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      // DevTools "Clear storage" / "Delete database" can close a live
+      // IndexedDB connection underneath the app. Drop the cached promise so
+      // the next queue operation opens a fresh connection.
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      dbPromise = null;
+      reject(req.error);
+    };
   });
 
   return dbPromise;
 }
 
 async function run<T>(
+  storeName: string,
+  mode: IDBTransactionMode,
+  fn: (store: IDBObjectStore) => IDBRequest<T>
+): Promise<T> {
+  try {
+    return await runOnce(storeName, mode, fn);
+  } catch (error) {
+    // A database deleted through DevTools may not emit versionchange before
+    // transaction() throws. Reopen and retry the one safe operation once.
+    if (!isClosingConnectionError(error)) throw error;
+    dbPromise = null;
+    return runOnce(storeName, mode, fn);
+  }
+}
+
+async function runOnce<T>(
   storeName: string,
   mode: IDBTransactionMode,
   fn: (store: IDBObjectStore) => IDBRequest<T>
@@ -80,6 +113,16 @@ export async function dbGetAllOrders<T>(): Promise<T[]> {
 }
 
 export async function dbGetOrdersByRestaurant<T>(restaurantId: string): Promise<T[]> {
+  try {
+    return await dbGetOrdersByRestaurantOnce<T>(restaurantId);
+  } catch (error) {
+    if (!isClosingConnectionError(error)) throw error;
+    dbPromise = null;
+    return dbGetOrdersByRestaurantOnce<T>(restaurantId);
+  }
+}
+
+async function dbGetOrdersByRestaurantOnce<T>(restaurantId: string): Promise<T[]> {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_QUEUE, "readonly");

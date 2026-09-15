@@ -35,6 +35,9 @@ class OfflineSyncManager {
   // triggering its own IndexedDB read.
   private queuedCountCache = 0;
   private failedCountCache = 0;
+  // Set when a syncAll() call arrives while one is already in flight, so
+  // its would-be work isn't silently dropped until the next 3.5s tick.
+  private rerunRequested = false;
 
   constructor() {
     if (typeof window !== "undefined") {
@@ -138,6 +141,10 @@ class OfflineSyncManager {
     const isSettle = item.orderPhase !== "OPEN";
 
     let orderRecord: any = null;
+    // Set when we're updating an already-open remote order rather than
+    // inserting a fresh one — signals that order_items must be replaced
+    // (deleted + reinserted) below instead of appended to.
+    let replacingExistingItems = false;
 
     if (item.orderType === "DINE_IN" && item.tableNumber) {
       const { data: existingOpenOrder, error: lookupError } = await supabase
@@ -154,11 +161,15 @@ class OfflineSyncManager {
       if (lookupError) throw lookupError;
 
       if (existingOpenOrder) {
-        const newTotal = (Number(existingOpenOrder.total) || 0) + item.total;
+        // Full replace, not additive: `item.total`/`item.items` already
+        // represent the complete current state of the table's cart (see the
+        // matching invariant in offlineStorage.ts's enqueueOfflineOrder), so
+        // adding on top of the existing remote total would double-count
+        // everything that was already synced in a previous round.
         const { data: updatedOrder, error: updateError } = await supabase
           .from("orders")
           .update({
-            total: newTotal,
+            total: item.total,
             payment_mode: item.paymentMode,
             // OPEN rounds (KOT/Save) keep the tab running as "PENDING";
             // only a SETTLED round marks it COMPLETED.
@@ -175,6 +186,7 @@ class OfflineSyncManager {
 
         if (updateError) throw updateError;
         orderRecord = updatedOrder;
+        replacingExistingItems = true;
       }
     }
 
@@ -208,6 +220,19 @@ class OfflineSyncManager {
       orderRecord = newOrder;
     }
 
+    if (replacingExistingItems) {
+      // item.items is the full current cart for this table, not a delta —
+      // clear out whatever rows this order already has before reinserting,
+      // otherwise every round would leave the previous round's rows behind
+      // as duplicates alongside the fresh full set.
+      const { error: deleteItemsError } = await supabase
+        .from("order_items")
+        .delete()
+        .eq("order_id", orderRecord.id);
+
+      if (deleteItemsError) throw deleteItemsError;
+    }
+
     if (item.items && item.items.length > 0) {
       const orderItems = item.items.map((i) => ({
         order_id: orderRecord.id,
@@ -231,17 +256,35 @@ class OfflineSyncManager {
     onOrderSynced?: (tempId: string, realOrder: any) => void,
     restaurantId?: string
   ): Promise<{ synced: number; failed: number; permanentlyFailed: number }> {
+    // CRITICAL: the lock must be claimed synchronously, before any `await`.
+    // The old version checked `this.isSyncing` and only set it to `true`
+    // AFTER awaiting getPendingOfflineOrders() — that gap let two syncAll()
+    // calls fired close together (e.g. KOT-save's fire-and-forget call
+    // overlapping with Settle & Pay's, seconds apart) both pass the guard
+    // and run concurrently. Each one independently checked "does this table
+    // have an open order?", both got "no" before either's insert had
+    // committed, and both inserted their own row for the same table/round
+    // instead of one merging into the other's — producing two DB rows with
+    // the same order_number/created_at, one still holding the earlier
+    // partial total. Setting the flag here, with no await in between,
+    // makes claiming the lock atomic from JS's single-threaded perspective.
     if (this.isSyncing || !this.isOnline) {
-      return { synced: 0, failed: 0, permanentlyFailed: 0 };
-    }
-
-    const queue = await getPendingOfflineOrders(restaurantId ?? this.activeRestaurantId ?? undefined);
-    if (queue.length === 0) {
+      // Something is (or was about to be) queued and this call is being
+      // skipped rather than run — remember to sync again right after the
+      // in-flight run finishes, so whatever prompted this call isn't lost.
+      if (this.isSyncing) this.rerunRequested = true;
       return { synced: 0, failed: 0, permanentlyFailed: 0 };
     }
 
     this.isSyncing = true;
     this.notifyListeners();
+
+    const queue = await getPendingOfflineOrders(restaurantId ?? this.activeRestaurantId ?? undefined);
+    if (queue.length === 0) {
+      this.isSyncing = false;
+      this.notifyListeners();
+      return { synced: 0, failed: 0, permanentlyFailed: 0 };
+    }
 
     let synced = 0;
     let failed = 0;
@@ -278,6 +321,15 @@ class OfflineSyncManager {
 
     this.isSyncing = false;
     await this.refreshCounts();
+
+    // If another syncAll() call came in while this one was running (e.g. a
+    // KOT round got queued mid-sync), it was skipped rather than allowed to
+    // race — run once more now so that order doesn't wait for the next
+    // 3.5s tick or an online/focus event.
+    if (this.rerunRequested) {
+      this.rerunRequested = false;
+      return this.syncAll(onOrderSynced, restaurantId);
+    }
 
     return { synced, failed, permanentlyFailed };
   }

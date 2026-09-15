@@ -34,7 +34,9 @@ import { printKitchenOrderTicket } from "@/lib/printing/kotPrinter";
 import { printCustomerBillReceipt } from "@/lib/printing/receiptPrinter";
 import {
   enqueueOfflineOrder,
+  getOfflineOrdersQueue,
   getLocalSettings,
+  type QueuedOfflineOrder,
   saveLocalSettings,
 } from "@/lib/offline/offlineStorage";
 import { offlineSyncManager } from "@/lib/offline/offlineSync";
@@ -329,8 +331,21 @@ export function RestaurantPOS({
 
   const [autoPrintKot, setAutoPrintKot] = useState(() => getLocalSettings().autoPrintKot);
   const [isOnline, setIsOnline] = useState(true);
+  const [isSyncingQueue, setIsSyncingQueue] = useState(false);
+  const [queuedOrders, setQueuedOrders] = useState<QueuedOfflineOrder[]>([]);
+  const [showSyncDetails, setShowSyncDetails] = useState(false);
   const [saving, setSaving] = useState(false);
   const placingOrderRef = useRef(false);
+  // Saving a running table order changes both the cart and the table's
+  // local/remote representation. Keep a synchronous lock as React state
+  // alone cannot prevent two very fast clicks from creating two rounds.
+  const savingTableOrderRef = useRef(false);
+  // Tracks, per table, the item list as of the last KOT print (id+notes -> qty).
+  // Cart no longer clears after Save/KOT (see executeSaveTableOrder), so a
+  // KOT print needs to diff against this to send the kitchen only newly
+  // added items / quantity increases — never a dish already fired.
+  const lastKotItemsRef = useRef<Record<string, Array<{ id: string; qty: number; notes?: string }>>>({});
+  const [savingTableOrder, setSavingTableOrder] = useState(false);
 
   const [settledTableNumbers, setSettledTableNumbers] = useState<Set<string>>(new Set());
   const [settlingTableNumber, setSettlingTableNumber] = useState<string | null>(null);
@@ -432,6 +447,34 @@ export function RestaurantPOS({
     return new Set(tableOrderMap.keys());
   }, [tableOrderMap]);
 
+  const pendingSyncOrders = useMemo(
+    () => queuedOrders.filter((order) => !order.permanentlyFailed),
+    [queuedOrders]
+  );
+
+  const failedSyncOrders = useMemo(
+    () => queuedOrders.filter((order) => order.permanentlyFailed),
+    [queuedOrders]
+  );
+
+  function getTableSyncStatus(tableNumber: string): {
+    label: string;
+    tone: "synced" | "pending" | "failed" | "syncing";
+  } {
+    const matching = queuedOrders.filter(
+      (order) => order.orderType === "DINE_IN" && order.tableNumber === tableNumber
+    );
+    if (matching.some((order) => order.permanentlyFailed)) {
+      return { label: "Sync failed", tone: "failed" };
+    }
+    if (matching.length > 0) {
+      return isSyncingQueue
+        ? { label: "Syncing", tone: "syncing" }
+        : { label: isOnline ? "Waiting to sync" : "Saved offline", tone: "pending" };
+    }
+    return { label: "Cloud synced", tone: "synced" };
+  }
+
   const activeTables = thirtyTables;
 
   const categoriesWithCounts = useMemo(() => {
@@ -486,6 +529,43 @@ export function RestaurantPOS({
       if (table !== null) setTable(null);
     }
   }, [source, activeView, table]);
+
+  // Scope offlineSyncManager's own internal triggers (3.5s interval, focus,
+  // visibilitychange, its own online listener) to this restaurant. Without
+  // this, those background triggers run with an unscoped queue lookup —
+  // harmless on a single-restaurant device, but this keeps behavior
+  // correct if the same browser/device is ever used for more than one
+  // restaurant (e.g. a shared demo machine).
+  useEffect(() => {
+    if (restaurantId && typeof (offlineSyncManager as any).setActiveRestaurantId === "function") {
+      (offlineSyncManager as any).setActiveRestaurantId(restaurantId);
+    }
+  }, [restaurantId]);
+
+  // The Tables view doubles as the floor manager's operational view. Read
+  // the durable queue here so every table can say whether its latest changes
+  // are already in the cloud or still waiting on this device.
+  useEffect(() => {
+    let active = true;
+    const refreshQueue = async () => {
+      const queue = await getOfflineOrdersQueue(restaurantId || undefined);
+      if (active) setQueuedOrders(queue);
+    };
+
+    const unsubscribe = offlineSyncManager.subscribe((state) => {
+      if (!active) return;
+      setIsSyncingQueue(state.isSyncing);
+      refreshQueue();
+    });
+
+    refreshQueue();
+    const interval = window.setInterval(refreshQueue, 2000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      unsubscribe();
+    };
+  }, [restaurantId]);
 
   // Track network and trigger background sync on reconnect
   useEffect(() => {
@@ -670,6 +750,9 @@ export function RestaurantPOS({
   }
 
   function resetOrderForm() {
+    if (table) {
+      delete lastKotItemsRef.current[table.trim().toUpperCase()];
+    }
     setCart([]);
     setDiscountPercent(0);
     setDiscountFlat(0);
@@ -766,6 +849,7 @@ export function RestaurantPOS({
         setSettledTableNumbers((prev) => new Set([...prev, cleanTable]));
         setSettlingTableNumber(cleanTable);
         removeActiveTableFromStorage(cleanTable);
+        delete lastKotItemsRef.current[cleanTable];
       }
 
       if (table && table.trim().toUpperCase() === cleanTable) {
@@ -784,41 +868,41 @@ export function RestaurantPOS({
       };
       onPlaced(closedOrder);
 
-      if (isSupabaseConfigured && !restaurantId.startsWith("demo-")) {
-        if (cleanTable) {
-          Promise.resolve(
-            supabase
-              .from("orders")
-              .update({
-                status: "COMPLETED",
-                closed_at: new Date().toISOString(),
-              })
-              .eq("restaurant_id", restaurantId)
-              .eq("table_number", cleanTable)
-              .is("closed_at", null)
-          )
-            .then(() => setSettlingTableNumber(null))
-            .catch(() => setSettlingTableNumber(null));
-        }
-
-        if (
-          order.databaseId &&
-          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-            order.databaseId
-          )
-        ) {
-          supabase
-            .from("orders")
-            .update({
-              status: "COMPLETED",
-              closed_at: new Date().toISOString(),
-            })
-            .eq("id", order.databaseId)
-            .then();
-        }
-      } else {
-        setSettlingTableNumber(null);
-      }
+      // Route through the same durable offline queue as Settle & Pay,
+      // instead of updating Supabase directly. This table's most recent
+      // Save/KOT round may still be an unsynced local record (orderPhase
+      // "OPEN") — a direct `.is("closed_at", null)` update here could run
+      // before that row even exists remotely and silently affect nothing.
+      // Queuing a SETTLED-phase record lets the normal sync pipeline
+      // find-or-create the row and close it reliably, online or offline.
+      const tempId = `quick-settle-${cleanTable || "notable"}-${Date.now()}`;
+      enqueueOfflineOrder({
+        tempId,
+        restaurantId,
+        createdByUserId: safeCreatedByUserId,
+        orderNumber: order.id,
+        orderType: order.source || "DINE_IN",
+        tableNumber: cleanTable || null,
+        channel: order.source || "DINE_IN",
+        paymentMode: order.payment || "CASH",
+        total: order.total,
+        status: "COMPLETED",
+        items: (order.items || []).map((c) => ({
+          id: c.id,
+          name: c.name,
+          price: c.price,
+          qty: c.qty,
+          notes: c.notes,
+          category: c.category,
+        })),
+        createdAt: order.createdAt || new Date().toISOString(),
+        syncAttempts: 0,
+      })
+        .catch((err) => {
+          console.error("Failed to queue quick-settle:", err);
+          showToast("Settle failed to save locally. Please try again.", "error");
+        })
+        .finally(() => setSettlingTableNumber(null));
 
       if (order && order.items && order.items.length > 0) {
         setTimeout(() => {
@@ -852,8 +936,27 @@ export function RestaurantPOS({
     }
   }
 
+  // True when the current Dine-In cart has changes that haven't been Saved/
+  // KOT'd for the currently selected table yet — used to warn before a table
+  // switch would silently discard them.
+  function hasUnsavedCartChanges(): boolean {
+    if (source !== "DINE_IN" || !table) return false;
+    const savedItems = tableOrderMap.get(table.trim().toUpperCase())?.items || [];
+    if (savedItems.length !== cart.length) return true;
+    const savedQtyByKey = new Map(savedItems.map((i) => [`${i.id}-${i.notes || ""}`, i.qty]));
+    return cart.some((i) => savedQtyByKey.get(`${i.id}-${i.notes || ""}`) !== i.qty);
+  }
+
+  function confirmDiscardUnsavedCart(nextTableLabel: string): boolean {
+    if (!hasUnsavedCartChanges()) return true;
+    return window.confirm(
+      `Table ${table} has unsaved changes that haven't been Saved or KOT'd. Switching to ${nextTableLabel} will discard them. Continue?`
+    );
+  }
+
   function handleOpenTableOrder(tNum: string, order?: Order) {
     const cleanT = tNum.trim().toUpperCase();
+    if (cleanT !== table && !confirmDiscardUnsavedCart(`Table ${cleanT}`)) return;
     setSettledTableNumbers((prev) => {
       if (!prev.has(cleanT)) return prev;
       const next = new Set(prev);
@@ -882,26 +985,62 @@ export function RestaurantPOS({
 
   // 1. SAVE RUNNING TABLE ORDER & OPTIONAL KOT PRINTING
   async function executeSaveTableOrder(targetTable: string | null, shouldPrintKot: boolean) {
+    if (savingTableOrderRef.current) return;
+    savingTableOrderRef.current = true;
+    setSavingTableOrder(true);
+
+    // savedItems/savedGrandTotal always represent the FULL current state of
+    // this cart, not a delta — this is the invariant offlineStorage.ts's
+    // enqueueOfflineOrder and offlineSync.ts's syncOneOrder now rely on to
+    // replace (not add to) the table's queued/remote record on every save.
+    const savedItems = cart.map((item) => ({ ...item }));
+    const savedSubtotal = subtotal;
+    const savedDiscountAmount = discountAmount;
+    const savedGrandTotal = grandTotal;
     const settings = getLocalSettings();
     const orderNumber = `KOT-${Date.now().toString().slice(-4)}`;
+    const kotKey = source === "DINE_IN" && targetTable ? targetTable.trim().toUpperCase() : "__no_table__";
 
-    if (shouldPrintKot) {
-      try {
-        printKitchenOrderTicket({
-          restaurantName,
-          orderNumber,
-          table: source === "DINE_IN" && targetTable ? targetTable : undefined,
-          source,
-          items: cart,
-          serverName: serverName.trim() || undefined,
-          paperWidth: settings.paperWidth,
-        });
-      } catch (e) {
-        console.warn("KOT print skipped or dialog closed:", e);
+    try {
+      if (shouldPrintKot) {
+        // Diff against what was last sent to the kitchen for this table, so
+        // a dish that's already cooking/served never gets reprinted just
+        // because the cart (now left populated after Save) still shows it.
+        const prevSnapshot = lastKotItemsRef.current[kotKey] || [];
+        const prevQtyByKey = new Map(prevSnapshot.map((i) => [`${i.id}-${i.notes || ""}`, i.qty]));
+        const diffItems = savedItems
+          .map((item) => {
+            const key = `${item.id}-${item.notes || ""}`;
+            const deltaQty = item.qty - (prevQtyByKey.get(key) || 0);
+            return deltaQty > 0 ? { ...item, qty: deltaQty } : null;
+          })
+          .filter((i): i is (typeof savedItems)[number] => i !== null);
+
+        if (diffItems.length > 0) {
+          try {
+            printKitchenOrderTicket({
+              restaurantName,
+              orderNumber,
+              table: source === "DINE_IN" && targetTable ? targetTable : undefined,
+              source,
+              items: diffItems,
+              serverName: serverName.trim() || undefined,
+              paperWidth: settings.paperWidth,
+            });
+          } catch (e) {
+            console.warn("KOT print skipped or dialog closed:", e);
+          }
+          lastKotItemsRef.current[kotKey] = savedItems.map((i) => ({
+            id: i.id,
+            qty: i.qty,
+            notes: i.notes,
+          }));
+        } else {
+          showToast("No new items to send to the kitchen since the last KOT.", "info");
+        }
       }
-    }
 
-    if (source === "DINE_IN" && targetTable) {
+      if (source === "DINE_IN" && targetTable) {
       const cleanTable = targetTable.trim().toUpperCase();
       setSettledTableNumbers((prev) => {
         if (!prev.has(cleanTable)) return prev;
@@ -919,18 +1058,24 @@ export function RestaurantPOS({
         }),
         source: "DINE_IN",
         table: cleanTable,
-        items: [...cart],
-        total: grandTotal,
+        items: savedItems,
+        total: savedGrandTotal,
         payment: paymentMode,
         createdAt: new Date().toISOString(),
         closedAt: null,
         serverName,
         customerPhone,
         customerName,
-        discountAmount,
-        subtotal,
+        discountAmount: savedDiscountAmount,
+        subtotal: savedSubtotal,
       };
 
+      // Cart intentionally stays populated (not cleared) after Save/KOT —
+      // it always reflects the table's current running total. This is what
+      // lets a second Save safely REPLACE the queued/remote record instead
+      // of needing to merge deltas together (see enqueueOfflineOrder /
+      // syncOneOrder), and it's also what makes decrementing or removing an
+      // already-saved item actually take effect on the next Save.
       onPlaced(openOrder);
       saveActiveTableToStorage(openOrder);
 
@@ -941,35 +1086,42 @@ export function RestaurantPOS({
       // result to the old inline Supabase block, just executed in the
       // background instead of inline here.
       const kotTempId = `kot-${cleanTable}-${Date.now()}`;
-      enqueueOfflineOrder({
-        tempId: kotTempId,
-        restaurantId,
-        createdByUserId: safeCreatedByUserId,
-        orderNumber: openOrder.id,
-        orderType: "DINE_IN",
-        tableNumber: cleanTable,
-        channel: "DINE_IN",
-        paymentMode,
-        total: grandTotal,
-        status: "PENDING",
-        items: cart.map((item) => ({
-          id: item.id,
-          name: item.name,
-          price: item.price,
-          qty: item.qty,
-          notes: item.notes,
-          category: item.category,
-        })),
-        createdAt: openOrder.createdAt,
-        syncAttempts: 0,
-        orderPhase: "OPEN",
-      });
+      try {
+        await enqueueOfflineOrder({
+          tempId: kotTempId,
+          restaurantId,
+          createdByUserId: safeCreatedByUserId,
+          orderNumber: openOrder.id,
+          orderType: "DINE_IN",
+          tableNumber: cleanTable,
+          channel: "DINE_IN",
+          paymentMode,
+          total: savedGrandTotal,
+          status: "PENDING",
+          items: savedItems.map((item) => ({
+            id: item.id,
+            name: item.name,
+            price: item.price,
+            qty: item.qty,
+            notes: item.notes,
+            category: item.category,
+          })),
+          createdAt: openOrder.createdAt,
+          syncAttempts: 0,
+          orderPhase: "OPEN",
+        });
+      } catch (error) {
+        showToast("Table saved locally, but its sync queue failed. Reload and retry.", "error");
+        return;
+      }
 
-      // Fire-and-forget: pushes now if online, otherwise the 3.5s
-      // background loop (or the next online/focus event) picks it up.
-      // Never awaited — this function must return instantly regardless
-      // of connectivity.
-      offlineSyncManager.syncAll(undefined, restaurantId).catch(() => {});
+      // No immediate syncAll() here on purpose: the item is already safely
+      // in IndexedDB the instant enqueueOfflineOrder() above returns, so
+      // nothing is lost if this tab closes right now. Pushing to Supabase
+      // is left entirely to offlineSyncManager's own 3.5s interval (plus
+      // its online/focus/visibilitychange listeners) so a burst of rapid
+      // saves on the same table batches into fewer round-trips instead of
+      // firing a Supabase call after every single tap.
 
       if (shouldPrintKot) {
         showToast(`KOT sent & Table ${cleanTable} order saved!`, "success");
@@ -977,14 +1129,16 @@ export function RestaurantPOS({
         showToast(`Table ${cleanTable} order saved! (No KOT printed)`, "success");
       }
 
-      // Clear cart items but preserve the active table selection for waiter convenience
-      setCart([]);
-      setDiscountPercent(0);
-      setDiscountFlat(0);
-    } else {
-      if (shouldPrintKot) {
-        showToast(`KOT ${orderNumber} printed.`, "success");
+        // Table selection and populated cart are both preserved for waiter
+        // convenience — the cart now IS the table's running order.
+      } else {
+        if (shouldPrintKot) {
+          showToast(`KOT ${orderNumber} printed.`, "success");
+        }
       }
+    } finally {
+      savingTableOrderRef.current = false;
+      setSavingTableOrder(false);
     }
   }
 
@@ -993,6 +1147,10 @@ export function RestaurantPOS({
   }
 
   async function handleSaveTableWithoutKot() {
+    if (source !== "DINE_IN") {
+      showToast("Save is only available for Dine-In table orders.", "info");
+      return;
+    }
     if (cart.length === 0) {
       showToast("Cart is empty. Please add items to save.", "info");
       return;
@@ -1016,6 +1174,9 @@ export function RestaurantPOS({
 
   function handleSelectTableFromPicker(tNum: string | null) {
     if (!tNum) {
+      if (!pendingKotOnTableSelect && !pendingSaveOnTableSelect && !confirmDiscardUnsavedCart("no table")) {
+        return;
+      }
       setTable(null);
       setSource("DINE_IN");
       setShowTablePickerModal(false);
@@ -1032,6 +1193,16 @@ export function RestaurantPOS({
     }
 
     const cleanT = tNum.trim().toUpperCase();
+
+    if (
+      cleanT !== table &&
+      !pendingKotOnTableSelect &&
+      !pendingSaveOnTableSelect &&
+      !confirmDiscardUnsavedCart(`Table ${cleanT}`)
+    ) {
+      return;
+    }
+
     setTable(cleanT);
     setSource("DINE_IN");
     setShowTablePickerModal(false);
@@ -1113,16 +1284,20 @@ export function RestaurantPOS({
     const cleanTable = source === "DINE_IN" ? (table ? table.trim().toUpperCase() : null) : null;
     const orderNumber = `ORD-${Date.now().toString().slice(-5)}`;
     const settings = getLocalSettings();
+    const savedItems = cart.map((item) => ({ ...item }));
+    const savedSubtotal = subtotal;
+    const savedDiscountAmount = discountAmount;
+    const savedGrandTotal = grandTotal;
 
     placingOrderRef.current = true;
     setSaving(true);
 
-    function queueOffline() {
+    async function queueOffline() {
       const tempId = `offline-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const nowIso = new Date().toISOString();
 
       try {
-        enqueueOfflineOrder({
+        await enqueueOfflineOrder({
           tempId,
           restaurantId,
           orderNumber,
@@ -1131,9 +1306,9 @@ export function RestaurantPOS({
           tableNumber: source === "DINE_IN" ? cleanTable : null,
           channel: source,
           paymentMode,
-          total: grandTotal,
+          total: savedGrandTotal,
           status: "COMPLETED",
-          items: cart.map((c) => ({
+          items: savedItems.map((c) => ({
             id: c.id,
             name: c.name,
             price: c.price,
@@ -1144,7 +1319,10 @@ export function RestaurantPOS({
           createdAt: nowIso,
           syncAttempts: 0,
         });
-      } catch (e) {}
+      } catch (e) {
+        showToast("Order was not saved locally. Please try again.", "error");
+        return;
+      }
 
       const newOrder: Order = {
         id: orderNumber,
@@ -1155,16 +1333,16 @@ export function RestaurantPOS({
         }),
         source,
         table: source === "DINE_IN" ? (cleanTable || undefined) : undefined,
-        items: cart,
-        total: grandTotal,
+        items: savedItems,
+        total: savedGrandTotal,
         payment: paymentMode,
         createdAt: nowIso,
         closedAt: nowIso, // Marked closed immediately
         serverName,
         customerPhone,
         customerName,
-        discountAmount,
-        subtotal,
+        discountAmount: savedDiscountAmount,
+        subtotal: savedSubtotal,
       };
 
       onPlaced(newOrder);
@@ -1200,12 +1378,12 @@ export function RestaurantPOS({
             paymentMode,
             customerName: customerName.trim() || undefined,
             cashierName: serverName.trim() || "biller",
-            items: cart,
-            subtotal,
-            discountAmount,
+            items: savedItems,
+            subtotal: savedSubtotal,
+            discountAmount: savedDiscountAmount,
             taxCgstPercent: applyGst ? 2.5 : 0,
             taxSgstPercent: applyGst ? 2.5 : 0,
-            total: grandTotal,
+            total: savedGrandTotal,
             paperWidth: settings.paperWidth,
           });
         } catch (e) {}
@@ -1217,7 +1395,7 @@ export function RestaurantPOS({
               orderNumber,
               table: source === "DINE_IN" ? (cleanTable || undefined) : undefined,
               source,
-              items: cart,
+              items: savedItems,
               serverName,
               paperWidth: settings.paperWidth,
             });
@@ -1229,13 +1407,15 @@ export function RestaurantPOS({
     // Local-first: settling a table is now always an instant local write,
     // never a network round-trip. queueOffline() above already builds the
     // Order, updates React state, marks the table settled, resets the form,
-    // and prints the bill — all synchronous/local. Sync to Supabase happens
-    // afterward via the same background sync loop used everywhere else
-    // (continuous 3.5s drain, online/focus triggers), so a flaky-but-not-
-    // technically-offline connection can never make this action hang.
+    // and prints the bill — all synchronous/local. The item is durably in
+    // IndexedDB the instant queueOffline() returns, so nothing is lost even
+    // if this tab closes immediately after. Pushing to Supabase is left to
+    // offlineSyncManager's own 3.5s interval (plus its online/focus
+    // recovery) rather than an extra call from here, so a quick run of
+    // saves-then-settles on the same table batches into one push instead of
+    // firing a separate Supabase round-trip per action.
     try {
-      queueOffline();
-      offlineSyncManager.syncAll(undefined, restaurantId).catch(() => {});
+      await queueOffline();
     } finally {
       placingOrderRef.current = false;
       setSaving(false);
@@ -1591,6 +1771,21 @@ export function RestaurantPOS({
                   <span className="status-dot red" />
                   <span>Occupied: <b>{occupiedTableNumbers.size}</b></span>
                 </div>
+                <button
+                  type="button"
+                  className={`tables-stat-badge sync-summary ${failedSyncOrders.length > 0 ? "failed" : pendingSyncOrders.length > 0 ? "pending" : "synced"}`}
+                  onClick={() => setShowSyncDetails((current) => !current)}
+                  title="Show orders waiting to sync"
+                >
+                  <span className="status-dot" />
+                  <span>
+                    {failedSyncOrders.length > 0
+                      ? `Failed: ${failedSyncOrders.length}`
+                      : pendingSyncOrders.length > 0
+                      ? `${isSyncingQueue ? "Syncing" : "Waiting"}: ${pendingSyncOrders.length}`
+                      : "Cloud synced"}
+                  </span>
+                </button>
               </div>
 
               <div className="tables-toolbar-right">
@@ -1605,11 +1800,44 @@ export function RestaurantPOS({
               </div>
             </div>
 
+            {showSyncDetails && (
+              <div className="sync-detail-panel">
+                <div className="sync-detail-head">
+                  <div>
+                    <b>Order sync status</b>
+                    <span>Saved on this device, awaiting cloud confirmation.</span>
+                  </div>
+                  <button type="button" onClick={() => setShowSyncDetails(false)} aria-label="Close sync details">
+                    <X size={16} />
+                  </button>
+                </div>
+                {queuedOrders.length === 0 ? (
+                  <div className="sync-empty-state">All saved orders are synced to the cloud.</div>
+                ) : (
+                  <div className="sync-order-list">
+                    {queuedOrders.map((order) => {
+                      const itemCount = order.items.reduce((sum, item) => sum + (Number(item.qty) || 0), 0);
+                      const failed = Boolean(order.permanentlyFailed);
+                      return (
+                        <div className={`sync-order-row ${failed ? "failed" : "pending"}`} key={order.tempId}>
+                          <span className="sync-order-status">{failed ? "Needs review" : isSyncingQueue ? "Syncing" : isOnline ? "Waiting to sync" : "Saved offline"}</span>
+                          <b>{order.tableNumber ? `Table ${order.tableNumber}` : order.orderType}</b>
+                          <span>{itemCount} item{itemCount === 1 ? "" : "s"} · {money(order.total)}</span>
+                          <small>{new Date(order.createdAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}{failed && order.lastError ? ` · ${order.lastError}` : ""}</small>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="tables-30-grid">
               {thirtyTables.map((t) => {
                 const isOccupied = occupiedTableNumbers.has(t.tableNumber);
                 const activeOrder = tableOrderMap.get(t.tableNumber);
                 const isCurrent = table === t.tableNumber;
+                const syncStatus = isOccupied ? getTableSyncStatus(t.tableNumber) : null;
 
                 return (
                   <div
@@ -1640,6 +1868,11 @@ export function RestaurantPOS({
                             )}{" "}
                             items • {activeOrder.time || ""}
                           </span>
+                          {syncStatus && (
+                            <span className={`tile-sync-status ${syncStatus.tone}`}>
+                              {syncStatus.label}
+                            </span>
+                          )}
                         </div>
                       ) : (
                         <div className="tile-vacant-content">
@@ -2163,8 +2396,12 @@ export function RestaurantPOS({
                     type="button"
                     className="payment-mode-btn save-table-mode-btn"
                     onClick={handleSaveTableWithoutKot}
-                    disabled={cart.length === 0}
-                    title="Save items for table without printing KOT"
+                    disabled={cart.length === 0 || savingTableOrder || source !== "DINE_IN"}
+                    title={
+                      source !== "DINE_IN"
+                        ? "Save is only available for Dine-In table orders"
+                        : "Save items for table without printing KOT"
+                    }
                   >
                     <span className="pay-icon">💾</span>
                     <span className="pay-label">Save</span>
@@ -3408,6 +3645,78 @@ export function RestaurantPOS({
           color: #b91c1c;
         }
 
+        button.tables-stat-badge {
+          border: 0;
+          cursor: pointer;
+        }
+
+        .tables-stat-badge.sync-summary.synced {
+          background: #dcfce7;
+          color: #15803d;
+        }
+
+        .tables-stat-badge.sync-summary.pending {
+          background: #fef3c7;
+          color: #a16207;
+        }
+
+        .tables-stat-badge.sync-summary.failed {
+          background: #fee2e2;
+          color: #b91c1c;
+        }
+
+        .sync-summary.synced .status-dot { background: #16a34a; }
+        .sync-summary.pending .status-dot { background: #d97706; }
+        .sync-summary.failed .status-dot { background: #dc2626; }
+
+        .sync-detail-panel {
+          flex-shrink: 0;
+          margin: 0 6px 8px;
+          padding: 10px 12px;
+          border: 1px solid #e7ded1;
+          border-radius: 8px;
+          background: #ffffff;
+          box-shadow: 0 2px 7px rgba(45, 35, 20, 0.06);
+        }
+
+        .sync-detail-head {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          align-items: flex-start;
+          color: #292524;
+        }
+
+        .sync-detail-head b, .sync-detail-head span { display: block; }
+        .sync-detail-head span { margin-top: 2px; font-size: 11px; color: #78716c; }
+        .sync-detail-head button { border: 0; background: transparent; color: #78716c; cursor: pointer; padding: 0; }
+        .sync-empty-state { padding-top: 9px; font-size: 12px; color: #15803d; font-weight: 600; }
+
+        .sync-order-list {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+          gap: 7px;
+          margin-top: 9px;
+        }
+
+        .sync-order-row {
+          position: relative;
+          padding: 7px 8px;
+          border-radius: 6px;
+          border: 1px solid #fde68a;
+          background: #fffbeb;
+          display: grid;
+          gap: 2px;
+          font-size: 11px;
+          color: #57534e;
+        }
+
+        .sync-order-row.failed { border-color: #fecaca; background: #fff1f2; }
+        .sync-order-row b { color: #292524; font-size: 12px; }
+        .sync-order-row small { color: #78716c; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .sync-order-status { font-size: 10px; font-weight: 800; color: #a16207; }
+        .sync-order-row.failed .sync-order-status { color: #be123c; }
+
         .status-dot {
           width: 7px;
           height: 7px;
@@ -3558,6 +3867,21 @@ export function RestaurantPOS({
           overflow: hidden;
           text-overflow: ellipsis;
         }
+
+        .tile-sync-status {
+          display: inline-flex;
+          width: fit-content;
+          margin-top: 3px;
+          padding: 2px 5px;
+          border-radius: 999px;
+          font-size: 8.5px;
+          font-weight: 800;
+          line-height: 1;
+        }
+
+        .tile-sync-status.synced { background: #dcfce7; color: #15803d; }
+        .tile-sync-status.pending, .tile-sync-status.syncing { background: #fef3c7; color: #a16207; }
+        .tile-sync-status.failed { background: #fee2e2; color: #b91c1c; }
 
         .tile-vacant-content {
           font-size: 10.5px;
