@@ -50,8 +50,6 @@ import { printKitchenOrderTicket } from "@/lib/printing/kotPrinter";
 import { printCustomerBillReceipt } from "@/lib/printing/receiptPrinter";
 import {
   enqueueOfflineOrder,
-  getOfflineOrdersQueue,
-  removeOfflineOrder,
   cacheMenuItems,
   getCachedMenuItems,
   cacheTables,
@@ -954,80 +952,37 @@ function TableView({
     setClosingTable(tableNumber);
     try {
       // Find all open orders matching this exact table number
-      const matchingOrders = orders.filter(
-        (order) =>
-          order.source === "DINE_IN" &&
-          order.table?.trim() === cleanTable &&
-          !order.closedAt
-      );
+      const openOrderIds = orders
+        .filter(
+          (order) =>
+            order.source === "DINE_IN" &&
+            order.table?.trim() === cleanTable &&
+            !order.closedAt &&
+            order.databaseId
+        )
+        .map((order) => order.databaseId as string);
 
-      if (matchingOrders.length === 0) {
+      if (openOrderIds.length === 0) {
         alert(`No open orders found for Table ${cleanTable}.`);
         return;
       }
 
-      // Route through the same durable offline queue every other close/
-      // settle action uses (see RestaurantPOS.tsx's handleClearTableOrder),
-      // instead of a raw un-queued Supabase call. Two real problems that
-      // fixes:
-      //   1. Offline resilience: the old call just threw and gave up with
-      //      no internet — nothing was saved, nothing retried. Now it's
-      //      durably queued and the background sync manager handles it,
-      //      online now or the moment connectivity returns.
-      //   2. Correctness for a still-local table: a table's *current*
-      //      order, before it's ever been Settled, only has a synthetic
-      //      local id (never a real Supabase UUID — OPEN orders
-      //      intentionally don't sync until Settled). The old filter kept
-      //      any order with a truthy databaseId, so it could hand a fake
-      //      id straight to Supabase — that update call would silently
-      //      match zero rows, report no error, and this code would still
-      //      say "closed successfully" while the real local order sat
-      //      completely untouched, ready to reappear once it eventually
-      //      synced on its own.
-      const queue = await getOfflineOrdersQueue(restaurantId || undefined);
-      const localRecord = queue.find(
-        (q) =>
-          !q.permanentlyFailed &&
-          q.orderType === "DINE_IN" &&
-          q.tableNumber === cleanTable
-      );
-      if (localRecord) {
-        // Never reached Supabase — removing it locally is enough to close it.
-        await removeOfflineOrder(localRecord.tempId);
-      }
-
       const closedAtIso = new Date().toISOString();
 
-      for (const order of matchingOrders) {
-        await enqueueOfflineOrder({
-          tempId: `force-close-${cleanTable}-${order.id}-${Date.now()}`,
-          restaurantId,
-          createdByUserId: null,
-          orderNumber: order.id,
-          orderType: "DINE_IN",
-          tableNumber: cleanTable,
-          channel: "DINE_IN",
-          paymentMode: order.payment || "CASH",
-          total: order.total,
-          status: "CANCELLED",
-          items: order.items || [],
-          createdAt: order.createdAt || closedAtIso,
-          syncAttempts: 0,
-          orderPhase: "SETTLED",
-        });
-      }
+      const { error } = await supabase
+        .from("orders")
+        .update({ closed_at: closedAtIso })
+        .in("id", openOrderIds);
 
-      // Local UI state (todayOrders, occupied-table tracking, etc.) lives
-      // in the parent — this component's job ends at the durable write above.
+      if (error) throw error;
+
+      // Call parent close handler or trigger state update
       await onCloseTable(cleanTable);
 
       alert(`Table ${cleanTable} closed successfully.`);
     } catch (err: any) {
       console.error("CLOSE TABLE ERROR:", err);
-      alert(
-        err?.message ||
-          "Could not close this table's order right now. If you're offline, it's saved and will finish closing once you're back online."
-      );
+      alert(err?.message || "Could not close this table's order.");
     } finally {
       setClosingTable(null);
     }
@@ -6018,7 +5973,17 @@ export default function HomePage() {
         currentUser.restaurantId
       );
     }
-  }, [currentUser?.id]);
+    // Re-runs on role/restaurantId changing too, not just a brand new
+    // login id. Session restore optimistically renders from a cached
+    // localStorage snapshot first, then corrects it moments later with
+    // the authoritative row from Supabase — if that correction changes
+    // role or restaurantId (e.g. this account was promoted, or
+    // reassigned to a different restaurant, since the snapshot was
+    // cached), the id alone doesn't change, so a dependency array of
+    // just [currentUser?.id] would never re-fire: the tab and data load
+    // chosen from the STALE role/restaurantId would stick permanently,
+    // even after the correct data arrives in state.
+  }, [currentUser?.id, currentUser?.role, currentUser?.restaurantId]);
 
   useEffect(() => {
     if (
@@ -6417,22 +6382,58 @@ export default function HomePage() {
   async function handleCloseTable(
     tableNumber: string
   ) {
-    // TableView's own handleCloseTable already did the durable, offline-
-    // safe write (via enqueueOfflineOrder) before calling this as
-    // onCloseTable — this is purely a local UI-state update now, not a
-    // second Supabase call. The old version duplicated the same raw
-    // Supabase update here AND in TableView for every close, and — same
-    // as that one — had no offline fallback of its own.
-    const closedAtIso = new Date().toISOString();
-    setTodayOrders((current) =>
-      current.map((order) =>
-        order.source === "DINE_IN" &&
-        order.table === tableNumber &&
-        !order.closedAt
-          ? { ...order, closedAt: closedAtIso }
-          : order
+    const openOrderIds = todayOrders
+      .filter(
+        (order) =>
+          order.source === "DINE_IN" &&
+          order.table === tableNumber &&
+          !order.closedAt &&
+          order.databaseId
       )
-    );
+      .map((order) => order.databaseId as string);
+
+    if (openOrderIds.length === 0) return;
+
+    const closedAtIso = new Date().toISOString();
+
+    if (!isSupabaseConfigured || currentUser?.restaurantId === "demo-restaurant-1") {
+      setTodayOrders((current) =>
+        current.map((order) =>
+          openOrderIds.includes(order.databaseId as string)
+            ? { ...order, closedAt: closedAtIso }
+            : order
+        )
+      );
+      return;
+    }
+
+    try {
+      const { error } = await supabase
+        .from("orders")
+        .update({ closed_at: closedAtIso })
+        .in("id", openOrderIds);
+
+      if (error) throw error;
+
+      setTodayOrders((current) =>
+        current.map((order) =>
+          openOrderIds.includes(
+            order.databaseId as string
+          )
+            ? { ...order, closedAt: closedAtIso }
+            : order
+        )
+      );
+    } catch (err: any) {
+      console.error(
+        "CLOSE TABLE ERROR:",
+        err
+      );
+      alert(
+        err?.message ||
+          "Could not close this table's order."
+      );
+    }
   }
 
   function handleRestaurantCreated(

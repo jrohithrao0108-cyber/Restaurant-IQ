@@ -294,6 +294,12 @@ export function RestaurantIQDashboard({
   // Data State
   const [internalTodayOrders, setInternalTodayOrders] = useState<Order[]>([]);
   const [internalHistoricalOrders, setInternalHistoricalOrders] = useState<Order[]>([]);
+  // How far back internalHistoricalOrders currently covers (IST date
+  // string). Used to detect when a custom range picks a start date further
+  // back than what's loaded, so that can be fetched on demand instead of
+  // baking every possible custom selection into the default load.
+  const [loadedHistoryStartStr, setLoadedHistoryStartStr] = useState<string | null>(null);
+  const wideningHistoryRef = useRef(false);
   const [loading, setLoading] = useState(true);
   const [hasFetched, setHasFetched] = useState(false);
   const [localRefreshing, setLocalRefreshing] = useState(false);
@@ -326,6 +332,43 @@ export function RestaurantIQDashboard({
   const [customEnd, setCustomEnd] = useState(todayISTStr);
 
   // Fast, clean, and reliable data loading from Supabase with Hyderabad IST boundaries
+  //
+  // Historical fetch used to be capped at a flat 3,000 rows (3 pages of
+  // 1,000, most-recent-first) regardless of how far back the dashboard
+  // actually needed to look. At real volume (hundreds of orders/day), that
+  // window covers only a few days — so the "30 days" range and the 3-week
+  // same-day baseline comparison would silently run out of data with no
+  // warning, well before either actually spans 21-30 days back.
+  //
+  // Fixed to scope the fetch by DATE instead of row count: pull everything
+  // from HISTORY_LOOKBACK_DAYS back through yesterday, paging in loops of
+  // 1,000 until each window is exhausted (not stopping at a fixed page
+  // count), so results scale with actual order volume within that window
+  // rather than silently truncating. The recent/lightweight select tiering
+  // is kept — full item detail for the most recent stretch (menu trend
+  // analysis needs it), lighter columns further back (only totals/counts
+  // matter for the 30-day and baseline views).
+  async function fetchAllPages(
+    query: any,
+    pageSize = 1000,
+    maxPages = 50 // safety ceiling (50k rows) against a runaway fetch, not a normal-case limit
+  ): Promise<any[]> {
+    const rows: any[] = [];
+    for (let page = 0; page < maxPages; page++) {
+      const from = page * pageSize;
+      const to = from + pageSize - 1;
+      const { data, error } = await query.range(from, to);
+      if (error) {
+        console.warn("Notice: historical page fetch error:", error.message || error);
+        break;
+      }
+      const batch = data || [];
+      rows.push(...batch);
+      if (batch.length < pageSize) break; // exhausted this window
+    }
+    return rows;
+  }
+
   async function loadData(options?: { fullHistorical?: boolean }) {
     const shouldFetchHistory = options?.fullHistorical ?? (internalHistoricalOrders.length === 0);
     setLocalRefreshing(true);
@@ -347,8 +390,24 @@ export function RestaurantIQDashboard({
       const todayStartUtcIso = new Date(`${freshTodayISTStr}T00:00:00+05:30`).toISOString();
 
       if (shouldFetchHistory) {
-        // Parallel fetch: today's detailed orders + historical lightweight pages in 1 roundtrip
-        const [todayRes, page1, page2, page3] = await Promise.all([
+        // 35 days back covers the 30-day range view (with a few days'
+        // margin) and the 3-week (21-day) baseline engine in one fetch.
+        // A custom range picked further back than this triggers its own
+        // wider fetch (see the effect below), rather than this default
+        // load trying to cover every possible custom selection up front.
+        const RECENT_DETAIL_DAYS = 10;
+        const HISTORY_LOOKBACK_DAYS = 35;
+
+        const recentCutoff = new Date(freshNow.getTime() - RECENT_DETAIL_DAYS * 86400000);
+        const recentCutoffIso = new Date(
+          `${getISTDateStr(recentCutoff)}T00:00:00+05:30`
+        ).toISOString();
+        const lookbackStart = new Date(freshNow.getTime() - HISTORY_LOOKBACK_DAYS * 86400000);
+        const lookbackStartIso = new Date(
+          `${getISTDateStr(lookbackStart)}T00:00:00+05:30`
+        ).toISOString();
+
+        const [todayRes, recentRows, olderRows] = await Promise.all([
           supabase
             .from("orders")
             .select(TODAY_ORDER_SELECT)
@@ -356,30 +415,26 @@ export function RestaurantIQDashboard({
             .gte("created_at", todayStartUtcIso)
             .neq("status", "CANCELLED")
             .order("created_at", { ascending: false }),
-          supabase
-            .from("orders")
-            .select(RECENT_HIST_ORDER_SELECT)
-            .eq("restaurant_id", restaurantId)
-            .lt("created_at", todayStartUtcIso)
-            .neq("status", "CANCELLED")
-            .order("created_at", { ascending: false })
-            .range(0, 999),
-          supabase
-            .from("orders")
-            .select(HIST_ORDER_SELECT)
-            .eq("restaurant_id", restaurantId)
-            .lt("created_at", todayStartUtcIso)
-            .neq("status", "CANCELLED")
-            .order("created_at", { ascending: false })
-            .range(1000, 1999),
-          supabase
-            .from("orders")
-            .select(HIST_ORDER_SELECT)
-            .eq("restaurant_id", restaurantId)
-            .lt("created_at", todayStartUtcIso)
-            .neq("status", "CANCELLED")
-            .order("created_at", { ascending: false })
-            .range(2000, 2999),
+          fetchAllPages(
+            supabase
+              .from("orders")
+              .select(RECENT_HIST_ORDER_SELECT)
+              .eq("restaurant_id", restaurantId)
+              .lt("created_at", todayStartUtcIso)
+              .gte("created_at", recentCutoffIso)
+              .neq("status", "CANCELLED")
+              .order("created_at", { ascending: false })
+          ),
+          fetchAllPages(
+            supabase
+              .from("orders")
+              .select(HIST_ORDER_SELECT)
+              .eq("restaurant_id", restaurantId)
+              .lt("created_at", recentCutoffIso)
+              .gte("created_at", lookbackStartIso)
+              .neq("status", "CANCELLED")
+              .order("created_at", { ascending: false })
+          ),
         ]);
 
         if (todayRes.error) {
@@ -387,16 +442,13 @@ export function RestaurantIQDashboard({
         }
 
         const parsedToday = (todayRes.data || []).map(parseOrder);
-        const allHistRows = [
-          ...(page1.data || []),
-          ...(page2.data || []),
-          ...(page3.data || []),
-        ];
+        const allHistRows = [...recentRows, ...olderRows];
         const parsedHist = allHistRows.map(parseOrder);
 
         // Single batched state update prevents cascading re-render loops
         setInternalTodayOrders(parsedToday);
         setInternalHistoricalOrders(parsedHist);
+        setLoadedHistoryStartStr(getISTDateStr(lookbackStart));
       } else {
         // Real-time incremental path: Only re-fetch today's orders (~50ms)
         const todayRes = await supabase
@@ -426,6 +478,53 @@ export function RestaurantIQDashboard({
   // Ref keeps loadData fresh for subscriptions without tearing down connection
   const loadDataRef = useRef(loadData);
   loadDataRef.current = loadData;
+
+  // Widens historical coverage on demand when a custom range starts earlier
+  // than what's currently loaded — rather than guessing how far back to
+  // fetch by default (which is exactly the bug being fixed above: a flat
+  // cutoff that doesn't know what the user will actually ask for).
+  async function loadOlderHistory(untilStr: string) {
+    if (!isSupabaseConfigured || restaurantId === "demo-restaurant-1") return;
+    if (!loadedHistoryStartStr || wideningHistoryRef.current) return;
+    if (untilStr >= loadedHistoryStartStr) return; // already covers this
+
+    wideningHistoryRef.current = true;
+    setLocalRefreshing(true);
+    try {
+      const loadedStartIso = new Date(`${loadedHistoryStartStr}T00:00:00+05:30`).toISOString();
+      const untilIso = new Date(`${untilStr}T00:00:00+05:30`).toISOString();
+
+      const olderRows = await fetchAllPages(
+        supabase
+          .from("orders")
+          .select(HIST_ORDER_SELECT)
+          .eq("restaurant_id", restaurantId)
+          .lt("created_at", loadedStartIso)
+          .gte("created_at", untilIso)
+          .neq("status", "CANCELLED")
+          .order("created_at", { ascending: false })
+      );
+
+      if (olderRows.length > 0) {
+        setInternalHistoricalOrders((prev) => [...prev, ...olderRows.map(parseOrder)]);
+      }
+      setLoadedHistoryStartStr(untilStr);
+    } catch (err: any) {
+      console.warn("Notice: could not widen historical range:", err?.message || err);
+    } finally {
+      wideningHistoryRef.current = false;
+      setLocalRefreshing(false);
+    }
+  }
+
+  useEffect(() => {
+    if (dateRange === "custom" && customStart && loadedHistoryStartStr) {
+      if (customStart < loadedHistoryStartStr) {
+        loadOlderHistory(customStart);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dateRange, customStart, loadedHistoryStartStr]);
 
   useEffect(() => {
     loadData({ fullHistorical: true });
@@ -1272,17 +1371,23 @@ export function RestaurantIQDashboard({
             0% { background-position: 200% 0; }
             100% { background-position: -200% 0; }
           }
-          .skel-title { width: 220px; height: 28px; }
+          .skel-title { width: 220px; max-width: 60vw; height: 28px; }
           .skel-badge { width: 95px; height: 22px; border-radius: 999px; }
-          .skel-chip { width: 140px; height: 22px; border-radius: 999px; }
+          .skel-chip { width: 140px; max-width: 45vw; height: 22px; border-radius: 999px; }
           .skel-line-sm { width: 120px; height: 16px; margin-bottom: 8px; }
           .skel-num { width: 160px; height: 36px; margin-bottom: 12px; }
           .skel-line-full { width: 100%; height: 20px; }
-          .skel-tabs { width: 340px; height: 38px; border-radius: 12px; }
+          .skel-tabs { width: 340px; max-width: 100%; height: 38px; border-radius: 12px; }
           .skel-line-md { width: 50%; height: 20px; margin-bottom: 12px; }
           .skel-card-body { width: 100%; height: 50px; }
           .skel-line-lg { width: 45%; height: 26px; margin-bottom: 16px; }
           .skel-chart-box { width: 100%; height: 200px; border-radius: 12px; }
+          @media (max-width: 640px) {
+            .restaurant-iq-page {
+              padding: 10px;
+              overflow-x: hidden;
+            }
+          }
         `}</style>
       </div>
     );
@@ -2944,6 +3049,199 @@ export function RestaurantIQDashboard({
           -webkit-background-clip: text;
           -webkit-text-fill-color: transparent;
           font-weight: 800;
+        }
+
+        /* =========================================================
+           MOBILE LAYOUT — phones and small tablets. Everything above
+           already leans on flex-wrap in places, but wrapping alone
+           doesn't make a dense analytics dashboard actually pleasant
+           on a narrow screen — this tightens spacing, stacks what
+           needs stacking, and turns a few horizontal button rows into
+           swipeable strips instead of letting them wrap into a messy
+           multi-line jumble.
+        ========================================================= */
+        @media (max-width: 640px) {
+          .restaurant-iq-page {
+            padding: 10px;
+            gap: 12px;
+            overflow-x: hidden;
+          }
+
+          .iq-top-header {
+            flex-direction: column;
+            align-items: stretch;
+            padding: 12px 14px;
+            gap: 10px;
+          }
+
+          .restaurant-title {
+            font-size: 18px;
+          }
+
+          .restaurant-title-wrap {
+            gap: 8px;
+          }
+
+          .header-meta {
+            margin-top: 0;
+          }
+
+          .header-right {
+            width: 100%;
+            gap: 8px;
+          }
+
+          .header-right .action-btn {
+            flex: 1;
+            justify-content: center;
+            padding: 9px 10px;
+          }
+
+          .kpi-top-grid {
+            gap: 10px;
+          }
+
+          .paper-kpi-card {
+            padding: 14px 16px;
+          }
+
+          .kpi-value {
+            font-size: 24px;
+          }
+
+          .kpi-benchmark-row {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 6px;
+          }
+
+          .dimension-selector-section {
+            flex-direction: column;
+            align-items: stretch;
+            gap: 8px;
+          }
+
+          .dimension-pill-nav {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: none;
+          }
+
+          .dimension-pill-nav::-webkit-scrollbar {
+            display: none;
+          }
+
+          .dim-tab-btn {
+            white-space: nowrap;
+            flex-shrink: 0;
+          }
+
+          .card-columns-grid {
+            grid-template-columns: 1fr;
+            gap: 14px;
+          }
+
+          .card-column.revenue-col {
+            border-right: none;
+            padding-right: 0;
+            border-bottom: 1px solid #ede7dc;
+            padding-bottom: 12px;
+          }
+
+          .date-filter-group {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            width: 100%;
+            scrollbar-width: none;
+          }
+
+          .date-filter-group::-webkit-scrollbar {
+            display: none;
+          }
+
+          .filter-btn {
+            white-space: nowrap;
+            flex-shrink: 0;
+          }
+
+          .custom-dates-bar {
+            flex-direction: column;
+            align-items: stretch;
+            gap: 8px;
+          }
+
+          .date-input-wrap {
+            justify-content: space-between;
+          }
+
+          .date-input-wrap input {
+            flex: 1;
+            min-width: 0;
+          }
+
+          .trend-graph-container {
+            padding: 12px;
+          }
+
+          .graph-toolbar {
+            flex-direction: column;
+            align-items: stretch;
+            gap: 10px;
+          }
+
+          .graph-mode-toggle {
+            width: 100%;
+          }
+
+          .mode-btn {
+            flex: 1;
+            text-align: center;
+          }
+
+          .cumulative-cards-grid {
+            gap: 10px;
+          }
+
+          .cum-number {
+            font-size: 22px;
+          }
+
+          .drilldown-paper-card {
+            padding: 14px;
+          }
+
+          .drilldown-header {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 10px;
+          }
+
+          .drilldown-title {
+            font-size: 16px;
+          }
+        }
+
+        @media (max-width: 420px) {
+          .restaurant-title {
+            font-size: 16px;
+          }
+
+          .kpi-value {
+            font-size: 21px;
+          }
+
+          .live-pacing-tag,
+          .location-chip,
+          .date-chip,
+          .shift-chip {
+            font-size: 10px;
+            padding: 2px 7px;
+          }
+
+          .action-btn {
+            font-size: 11px;
+            padding: 8px;
+          }
         }
       `}</style>
     </div>
