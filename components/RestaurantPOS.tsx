@@ -35,7 +35,12 @@ import { printCustomerBillReceipt } from "@/lib/printing/receiptPrinter";
 import {
   enqueueOfflineOrder,
   getOfflineOrdersQueue,
+  getCachedMenuItems,
+  getCachedTables,
   getLocalSettings,
+  getNextDailyKotNumber,
+  removeOfflineOrder,
+  retryOfflineOrder,
   type QueuedOfflineOrder,
   saveLocalSettings,
 } from "@/lib/offline/offlineStorage";
@@ -74,6 +79,17 @@ export type Order = {
   customerName?: string;
   discountAmount?: number;
   subtotal?: number;
+  // Number of KOT rounds printed so far for this table's current sitting
+  // (R1, R2, R3...). Only meaningful for DINE_IN orders with a table.
+  kotRoundCount?: number;
+  // What was actually NEW in each round — round 1's items, then round 2's
+  // additions on top, etc. (not the running cart total at that point).
+  // Lets staff see "what came in R1 vs R2 vs R3" instead of just one merged
+  // list. Reset when the sitting ends (Settle/Quick Settle/Delete).
+  roundBreakdown?: Array<{
+    round: number;
+    items: Array<{ id: string; name: string; qty: number; notes?: string }>;
+  }>;
 };
 
 export type RestaurantTable = {
@@ -98,8 +114,10 @@ type HeldOrder = {
   paymentMode: string;
 };
 
-const DEFAULT_CATEGORIES = [
-  "All Dishes",
+// Only used as a nicety (icons + a few starter suggestions for a brand-new,
+// empty menu) — never to restrict or rewrite what a restaurant's actual
+// menu categories are. See normalizeCategory below.
+const SUGGESTED_CATEGORIES = [
   "Starters",
   "Mains",
   "Breads",
@@ -116,6 +134,13 @@ const CATEGORY_ICONS: Record<string, string> = {
   "Rice & Biryani": "🍚",
   "Desserts": "🍨",
   "Beverages": "🥤",
+  "Soups": "🍜",
+  "Salads": "🥗",
+  "Snacks": "🍟",
+  "Chinese": "🥡",
+  "Pizza": "🍕",
+  "Combos": "🍱",
+  "Uncategorized": "🍴",
 };
 
 const ORDER_CHANNELS: Array<{ id: OrderSource; label: string; icon: string }> = [
@@ -135,21 +160,26 @@ function money(n: number) {
   return `₹${Math.round(Number(n) || 0).toLocaleString("en-IN")}`;
 }
 
+// This used to bucket every category into one of 6 fixed names by keyword
+// match, and silently dumped anything that didn't match (Soups, Salads,
+// Pizza, Chinese, Combos, South Indian, whatever the restaurant actually
+// calls its sections...) into "Starters" — so a menu with real, varied
+// categories from the DB would misfile most of them. Categories are the
+// restaurant's own data: just clean up formatting/whitespace and use them
+// as-is, so the category list always matches the DB exactly.
 function normalizeCategory(category: any): string {
-  if (!category) return "Starters";
-  if (typeof category === "object") {
+  if (typeof category === "object" && category) {
     category = category.name || category.category || category.title || "";
   }
-  const raw = String(category).trim().toLowerCase().replace(/&/g, "and").replace(/[_-]/g, " ");
-
-  if (raw.includes("starter")) return "Starters";
-  if (raw.includes("main")) return "Mains";
-  if (raw.includes("bread") || raw.includes("roti") || raw.includes("naan")) return "Breads";
-  if (raw.includes("rice") || raw.includes("biryani") || raw.includes("pulao")) return "Rice & Biryani";
-  if (raw.includes("dessert") || raw.includes("sweet") || raw.includes("ice cream")) return "Desserts";
-  if (raw.includes("beverage") || raw.includes("drink") || raw.includes("shake") || raw.includes("tea") || raw.includes("coffee")) return "Beverages";
-
-  return "Starters";
+  const raw = String(category || "").trim();
+  if (!raw) return "Uncategorized";
+  // Collapse stray whitespace and normalize casing lightly (Title Case) so
+  // "starters", "Starters", " STARTERS " etc. from inconsistent DB entries
+  // still group into one category instead of three.
+  return raw
+    .split(/\s+/)
+    .map((word) => (word.length > 0 ? word[0].toUpperCase() + word.slice(1).toLowerCase() : word))
+    .join(" ");
 }
 
 function isVeg(name: string, category: string): boolean {
@@ -330,9 +360,22 @@ export function RestaurantPOS({
   const [editPrice, setEditPrice] = useState("");
 
   const [autoPrintKot, setAutoPrintKot] = useState(() => getLocalSettings().autoPrintKot);
+  const [autoPrintBillOnSettle, setAutoPrintBillOnSettle] = useState(
+    () => getLocalSettings().autoPrintBillOnSettle
+  );
   const [isOnline, setIsOnline] = useState(true);
   const [isSyncingQueue, setIsSyncingQueue] = useState(false);
   const [queuedOrders, setQueuedOrders] = useState<QueuedOfflineOrder[]>([]);
+  // --- Live storage debug panel: shows every localStorage key and IndexedDB
+  // store this app owns, refreshed on a timer while open. Read-only, for
+  // watching how each value actually changes during real use.
+  const [showDebugPanel, setShowDebugPanel] = useState(false);
+  const [debugSnapshot, setDebugSnapshot] = useState<{
+    localStorage: Record<string, any>;
+    indexedDB: { queued_orders: QueuedOfflineOrder[]; menu_cache: any; tables_cache: any };
+  } | null>(null);
+  const [debugUpdatedAt, setDebugUpdatedAt] = useState<number | null>(null);
+  const [debugExpanded, setDebugExpanded] = useState<Record<string, boolean>>({});
   const [showSyncDetails, setShowSyncDetails] = useState(false);
   const [saving, setSaving] = useState(false);
   const placingOrderRef = useRef(false);
@@ -340,11 +383,12 @@ export function RestaurantPOS({
   // local/remote representation. Keep a synchronous lock as React state
   // alone cannot prevent two very fast clicks from creating two rounds.
   const savingTableOrderRef = useRef(false);
-  // Tracks, per table, the item list as of the last KOT print (id+notes -> qty).
-  // Cart no longer clears after Save/KOT (see executeSaveTableOrder), so a
-  // KOT print needs to diff against this to send the kitchen only newly
-  // added items / quantity increases — never a dish already fired.
-  const lastKotItemsRef = useRef<Record<string, Array<{ id: string; qty: number; notes?: string }>>>({});
+  // Identity for a Dine-In order with NO table attached (a "default table"
+  // / walk-in / instant order). Since there's no table number to match on,
+  // this ref is what lets a second KOT/Save before Settle replace the same
+  // local record instead of creating a separate one each time. Cleared
+  // after settle or whenever the cart is explicitly reset.
+  const noTableOrderRef = useRef<{ id: string; tempId: string; kotRoundCount: number } | null>(null);
   const [savingTableOrder, setSavingTableOrder] = useState(false);
 
   const [settledTableNumbers, setSettledTableNumbers] = useState<Set<string>>(new Set());
@@ -457,6 +501,42 @@ export function RestaurantPOS({
     [queuedOrders]
   );
 
+  const [retryingTempId, setRetryingTempId] = useState<string | null>(null);
+  const [retryingAll, setRetryingAll] = useState(false);
+  const [showRoundBreakdown, setShowRoundBreakdown] = useState(true);
+
+  // Resets a permanently-failed order back into rotation and immediately
+  // asks the sync manager to try it, rather than waiting for the next
+  // 3.5s tick — retry should feel instant when someone deliberately taps it.
+  async function handleRetryFailedOrder(tempId: string) {
+    setRetryingTempId(tempId);
+    try {
+      await retryOfflineOrder(tempId);
+      await (offlineSyncManager as any).syncAll?.(undefined, restaurantId || undefined);
+      showToast("Retrying order...", "info");
+    } catch (err) {
+      console.error("Failed to retry order:", err);
+      showToast("Couldn't retry that order. Please try again.", "error");
+    } finally {
+      setRetryingTempId(null);
+    }
+  }
+
+  async function handleRetryAllFailed() {
+    if (failedSyncOrders.length === 0) return;
+    setRetryingAll(true);
+    try {
+      await Promise.all(failedSyncOrders.map((o) => retryOfflineOrder(o.tempId)));
+      await (offlineSyncManager as any).syncAll?.(undefined, restaurantId || undefined);
+      showToast(`Retrying ${failedSyncOrders.length} failed order(s)...`, "info");
+    } catch (err) {
+      console.error("Failed to retry all failed orders:", err);
+      showToast("Couldn't retry all orders. Please try again.", "error");
+    } finally {
+      setRetryingAll(false);
+    }
+  }
+
   function getTableSyncStatus(tableNumber: string): {
     label: string;
     tone: "synced" | "pending" | "failed" | "syncing";
@@ -478,23 +558,18 @@ export function RestaurantPOS({
   const activeTables = thirtyTables;
 
   const categoriesWithCounts = useMemo(() => {
-    const counts: Record<string, number> = {
-      "All Dishes": activeProducts.length,
-    };
-    DEFAULT_CATEGORIES.slice(1).forEach((cat) => {
-      counts[cat] = 0;
-    });
+    const counts: Record<string, number> = {};
 
     activeProducts.forEach((p) => {
       const norm = normalizeCategory(p.category);
       counts[norm] = (counts[norm] || 0) + 1;
     });
 
-    const list = [{ name: "All Dishes", count: counts["All Dishes"] || 0 }];
+    const list = [{ name: "All Dishes", count: activeProducts.length }];
     Object.keys(counts)
-      .filter((k) => k !== "All Dishes")
+      .sort((a, b) => a.localeCompare(b))
       .forEach((name) => {
-        list.push({ name, count: counts[name] || 0 });
+        list.push({ name, count: counts[name] });
       });
 
     return list;
@@ -592,6 +667,67 @@ export function RestaurantPOS({
       window.removeEventListener("offline", handleOffline);
     };
   }, [restaurantId]);
+
+  // Debug panel: only polls while actually open, so it costs nothing the
+  // rest of the time. Every key/store this app owns is re-read each tick.
+  useEffect(() => {
+    if (!showDebugPanel) return;
+    let cancelled = false;
+
+    const LS_KEYS = [
+      "restaurant_iq_active_tables",
+      "restaurant_iq_held_orders",
+      "restaurant_iq_cached_tables_config",
+      "restaurant_iq_local_settings_v1",
+      "restaurant_iq_daily_kot_counter_v1",
+      "restaurant_iq_user",
+      "supabase.auth.token",
+    ];
+
+    async function refresh() {
+      const ls: Record<string, any> = {};
+      LS_KEYS.forEach((k) => {
+        const raw = typeof window !== "undefined" ? localStorage.getItem(k) : null;
+        if (raw === null) {
+          ls[k] = null;
+          return;
+        }
+        try {
+          ls[k] = JSON.parse(raw);
+        } catch {
+          ls[k] = raw; // not JSON (e.g. a raw auth token string)
+        }
+      });
+
+      let queue: QueuedOfflineOrder[] = [];
+      let menuCache: any = null;
+      let tablesCache: any = null;
+      try {
+        queue = await getOfflineOrdersQueue(restaurantId || undefined);
+      } catch {}
+      try {
+        menuCache = restaurantId ? await getCachedMenuItems(restaurantId) : null;
+      } catch {}
+      try {
+        tablesCache = restaurantId ? await getCachedTables(restaurantId) : null;
+      } catch {}
+
+      if (!cancelled) {
+        setDebugSnapshot({
+          localStorage: ls,
+          indexedDB: { queued_orders: queue, menu_cache: menuCache, tables_cache: tablesCache },
+        });
+        setDebugUpdatedAt(Date.now());
+      }
+    }
+
+    refresh();
+    const id = setInterval(refresh, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [showDebugPanel, restaurantId]);
 
   useEffect(() => {
     try {
@@ -740,19 +876,41 @@ export function RestaurantPOS({
   }
 
   function handleSelectChannel(chId: OrderSource) {
+    if (chId === source) return; // already on this channel — nothing to do
+
+    // Switching channels used to leave the cart exactly as-is, so items
+    // added under one channel (e.g. Swiggy) could silently ride along into
+    // another (e.g. Zomato or Dine-In) and get billed to the wrong place.
+    // Every channel keeps its own state: a Dine-In table's order lives in
+    // the offline queue/tableOrderMap (untouched by this), everything else
+    // only exists in the on-screen cart until Settled — so leaving a
+    // channel with unsaved items means those specific items are gone.
+    if (cart.length > 0) {
+      const destLabel = ORDER_CHANNELS.find((c) => c.id === chId)?.label || chId;
+      const confirmed = window.confirm(
+        `Switch to ${destLabel}? The current cart (${cart.length} item${
+          cart.length === 1 ? "" : "s"
+        }) will be cleared so orders don't get mixed between channels. Any already-saved table order is not affected.`
+      );
+      if (!confirmed) return;
+    }
+
+    setCart([]);
+    setDiscountPercent(0);
+    setDiscountFlat(0);
+    noTableOrderRef.current = null;
+    setTable(null);
+
     if (chId === "DINE_IN") {
       setSource("DINE_IN");
     } else {
       setSource(chId);
-      setTable(null);
       setActiveView("POS");
     }
   }
 
   function resetOrderForm() {
-    if (table) {
-      delete lastKotItemsRef.current[table.trim().toUpperCase()];
-    }
+    noTableOrderRef.current = null;
     setCart([]);
     setDiscountPercent(0);
     setDiscountFlat(0);
@@ -840,49 +998,34 @@ export function RestaurantPOS({
     }
   }
 
-  function handleQuickSettleTable(order: Order) {
+  async function handleQuickSettleTable(order: Order) {
     if (!order) return;
-    const cleanTable = (order.table || "").trim().toUpperCase();
+    // Table number must never be written for anything but a genuine
+    // Dine-In order — even though this function is currently only ever
+    // called with orders sourced from tableOrderMap (already filtered to
+    // dine-in-with-table), that's an incidental property of today's one
+    // call site, not something this function enforces on its own. Gating
+    // explicitly here, the same way handleSaveOrder already does, closes
+    // that off regardless of how this gets called in the future.
+    const isDineIn = order.source === "DINE_IN";
+    const cleanTable = isDineIn ? (order.table || "").trim().toUpperCase() : "";
+
+    if (cleanTable) setSettlingTableNumber(cleanTable);
 
     try {
-      if (cleanTable) {
-        setSettledTableNumbers((prev) => new Set([...prev, cleanTable]));
-        setSettlingTableNumber(cleanTable);
-        removeActiveTableFromStorage(cleanTable);
-        delete lastKotItemsRef.current[cleanTable];
-      }
-
-      if (table && table.trim().toUpperCase() === cleanTable) {
-        setCart([]);
-        setTable(null);
-      }
-
-      showToast(`Table ${cleanTable} settled & paid! Bill printing...`, "success");
-
-      const billNo = getDailyBillNumber(order.id, order.databaseId);
-
-      const closedOrder: Order = {
-        ...order,
-        status: "COMPLETED",
-        closedAt: new Date().toISOString(),
-      };
-      onPlaced(closedOrder);
-
-      // Route through the same durable offline queue as Settle & Pay,
-      // instead of updating Supabase directly. This table's most recent
-      // Save/KOT round may still be an unsynced local record (orderPhase
-      // "OPEN") — a direct `.is("closed_at", null)` update here could run
-      // before that row even exists remotely and silently affect nothing.
-      // Queuing a SETTLED-phase record lets the normal sync pipeline
-      // find-or-create the row and close it reliably, online or offline.
+      // Write to the durable queue FIRST. The old order marked the table
+      // vacant/settled (and wiped its localStorage cache) *before*
+      // attempting this — so a failed write left the table looking empty
+      // in the UI with no trace anywhere that an order had existed, worse
+      // than just an easy-to-miss error toast during a busy service.
       const tempId = `quick-settle-${cleanTable || "notable"}-${Date.now()}`;
-      enqueueOfflineOrder({
+      await enqueueOfflineOrder({
         tempId,
         restaurantId,
         createdByUserId: safeCreatedByUserId,
         orderNumber: order.id,
         orderType: order.source || "DINE_IN",
-        tableNumber: cleanTable || null,
+        tableNumber: isDineIn && cleanTable ? cleanTable : null,
         channel: order.source || "DINE_IN",
         paymentMode: order.payment || "CASH",
         total: order.total,
@@ -897,42 +1040,113 @@ export function RestaurantPOS({
         })),
         createdAt: order.createdAt || new Date().toISOString(),
         syncAttempts: 0,
-      })
-        .catch((err) => {
-          console.error("Failed to queue quick-settle:", err);
-          showToast("Settle failed to save locally. Please try again.", "error");
-        })
-        .finally(() => setSettlingTableNumber(null));
+        orderPhase: "SETTLED",
+      });
 
-      if (order && order.items && order.items.length > 0) {
-        setTimeout(() => {
-          try {
-            printCustomerBillReceipt({
-              restaurantName: restaurantName || "RestaurantIQ",
-              orderNumber: order.id,
-              billNo,
-              tokenNo: billNo,
-              table: cleanTable || order.table,
-              source: order.source || "DINE_IN",
-              paymentMode: order.payment || "CASH",
-              customerName: order.customerName || undefined,
-              cashierName: order.serverName || serverName.trim() || "biller",
-              items: order.items,
-              subtotal: order.subtotal || order.total,
-              discountAmount: order.discountAmount || 0,
-              taxCgstPercent: applyGst ? 2.5 : 0,
-              taxSgstPercent: applyGst ? 2.5 : 0,
-              total: order.total,
-              paperWidth: "80mm",
-            });
-          } catch (printErr) {
-            console.warn("Receipt print error on quick settle:", printErr);
-          }
-        }, 50);
+      if (cleanTable) {
+        setSettledTableNumbers((prev) => new Set([...prev, cleanTable]));
+        removeActiveTableFromStorage(cleanTable);
       }
-    } catch (e) {
+
+      if (table && table.trim().toUpperCase() === cleanTable) {
+        setCart([]);
+        setTable(null);
+      }
+
+      const closedOrder: Order = {
+        ...order,
+        status: "COMPLETED",
+        closedAt: new Date().toISOString(),
+      };
+      onPlaced(closedOrder);
+
+      // No print here on purpose — Bill and Settle are separate actions on
+      // the table tile now. Use the Bill button (handleQuickPrintTable) for
+      // a receipt, before or after settling.
+      showToast(`Table ${cleanTable} settled!`, "success");
+    } catch (err) {
+      console.error("Failed to queue quick-settle:", err);
+      showToast(`Couldn't settle Table ${cleanTable} — it's still open. Please try again.`, "error");
+    } finally {
       setSettlingTableNumber(null);
-      showToast("Failed to settle table.", "error");
+    }
+  }
+
+  /**
+   * Fully deletes a table's saved order — distinct from Settle & Pay (closes
+   * as paid) and from the "Clear Table" pill in the cart header (that only
+   * unassigns the *current on-screen cart* from a table number, it doesn't
+   * touch any order already saved for that table). This is for voiding an
+   * order opened by mistake, a walk-out, a duplicate table pick, etc.
+   * Always confirms first since it can't be undone from here.
+   */
+  async function handleClearTableOrder(tableNumber: string) {
+    const cleanTable = tableNumber.trim().toUpperCase();
+    const activeOrder = tableOrderMap.get(cleanTable);
+    const itemCount = (activeOrder?.items || []).reduce((s, i) => s + (Number(i.qty) || 0), 0);
+
+    const confirmed = window.confirm(
+      itemCount > 0
+        ? `Delete Table ${cleanTable}'s saved order (${itemCount} item${itemCount === 1 ? "" : "s"}, ${money(
+            activeOrder?.total || 0
+          )})? This cannot be undone and no bill will be generated.`
+        : `Clear Table ${cleanTable}? This removes it from the occupied list.`
+    );
+    if (!confirmed) return;
+
+    try {
+      // Drop the local OPEN record for this table — it's local-only by
+      // design (see offlineStorage.ts / offlineSync.ts) so this alone is
+      // enough if it never reached Supabase.
+      const queue = await getOfflineOrdersQueue(restaurantId || undefined);
+      const localOpenRecord = queue.find(
+        (q) => !q.permanentlyFailed && q.orderType === "DINE_IN" && q.tableNumber === cleanTable
+      );
+      if (localOpenRecord) {
+        await removeOfflineOrder(localOpenRecord.tempId);
+      }
+
+      // The table may already have a synced, open order in Supabase from an
+      // earlier sitting — queue a CANCELLED closing record through the same
+      // durable path Settle & Pay / Quick Settle use, so the background
+      // sync voids it there too if it exists.
+      if (activeOrder) {
+        await enqueueOfflineOrder({
+          tempId: `clear-${cleanTable}-${Date.now()}`,
+          restaurantId,
+          createdByUserId: safeCreatedByUserId,
+          orderNumber: activeOrder.id,
+          orderType: "DINE_IN",
+          tableNumber: cleanTable,
+          channel: "DINE_IN",
+          paymentMode: activeOrder.payment || "CASH",
+          total: activeOrder.total,
+          status: "CANCELLED",
+          items: activeOrder.items || [],
+          createdAt: activeOrder.createdAt || new Date().toISOString(),
+          syncAttempts: 0,
+          orderPhase: "SETTLED",
+        });
+      }
+
+      setSettledTableNumbers((prev) => new Set([...prev, cleanTable]));
+      removeActiveTableFromStorage(cleanTable);
+
+      if (activeOrder) {
+        onPlaced({ ...activeOrder, status: "CANCELLED", closedAt: new Date().toISOString() });
+      }
+
+      if (table && table.trim().toUpperCase() === cleanTable) {
+        setCart([]);
+        setTable(null);
+        setDiscountPercent(0);
+        setDiscountFlat(0);
+      }
+
+      showToast(`Table ${cleanTable} order deleted.`, "info");
+    } catch (err) {
+      console.error("Failed to clear table order:", err);
+      showToast("Failed to clear table. Please try again.", "error");
     }
   }
 
@@ -998,142 +1212,224 @@ export function RestaurantPOS({
     const savedDiscountAmount = discountAmount;
     const savedGrandTotal = grandTotal;
     const settings = getLocalSettings();
-    const orderNumber = `KOT-${Date.now().toString().slice(-4)}`;
-    const kotKey = source === "DINE_IN" && targetTable ? targetTable.trim().toUpperCase() : "__no_table__";
+    const cleanTable = source === "DINE_IN" && targetTable ? targetTable.trim().toUpperCase() : null;
+    const existingOrderForTable = cleanTable ? tableOrderMap.get(cleanTable) : undefined;
 
     try {
-      if (shouldPrintKot) {
-        // Diff against what was last sent to the kitchen for this table, so
-        // a dish that's already cooking/served never gets reprinted just
-        // because the cart (now left populated after Save) still shows it.
-        const prevSnapshot = lastKotItemsRef.current[kotKey] || [];
-        const prevQtyByKey = new Map(prevSnapshot.map((i) => [`${i.id}-${i.notes || ""}`, i.qty]));
-        const diffItems = savedItems
-          .map((item) => {
-            const key = `${item.id}-${item.notes || ""}`;
-            const deltaQty = item.qty - (prevQtyByKey.get(key) || 0);
-            return deltaQty > 0 ? { ...item, qty: deltaQty } : null;
-          })
-          .filter((i): i is (typeof savedItems)[number] => i !== null);
-
-        if (diffItems.length > 0) {
-          try {
-            printKitchenOrderTicket({
-              restaurantName,
-              orderNumber,
-              table: source === "DINE_IN" && targetTable ? targetTable : undefined,
-              source,
-              items: diffItems,
-              serverName: serverName.trim() || undefined,
-              paperWidth: settings.paperWidth,
-            });
-          } catch (e) {
-            console.warn("KOT print skipped or dialog closed:", e);
-          }
-          lastKotItemsRef.current[kotKey] = savedItems.map((i) => ({
-            id: i.id,
-            qty: i.qty,
-            notes: i.notes,
-          }));
-        } else {
-          showToast("No new items to send to the kitchen since the last KOT.", "info");
-        }
-      }
-
-      if (source === "DINE_IN" && targetTable) {
-      const cleanTable = targetTable.trim().toUpperCase();
-      setSettledTableNumbers((prev) => {
-        if (!prev.has(cleanTable)) return prev;
-        const next = new Set(prev);
-        next.delete(cleanTable);
-        return next;
-      });
-
-      const openOrder: Order = {
-        id: `ORD-${Date.now().toString().slice(-5)}`,
-        databaseId: `tbl-${cleanTable}-${Date.now()}`,
-        time: new Date().toLocaleTimeString("en-IN", {
-          hour: "numeric",
-          minute: "2-digit",
-        }),
-        source: "DINE_IN",
-        table: cleanTable,
-        items: savedItems,
-        total: savedGrandTotal,
-        payment: paymentMode,
-        createdAt: new Date().toISOString(),
-        closedAt: null,
-        serverName,
-        customerPhone,
-        customerName,
-        discountAmount: savedDiscountAmount,
-        subtotal: savedSubtotal,
-      };
-
-      // Cart intentionally stays populated (not cleared) after Save/KOT —
-      // it always reflects the table's current running total. This is what
-      // lets a second Save safely REPLACE the queued/remote record instead
-      // of needing to merge deltas together (see enqueueOfflineOrder /
-      // syncOneOrder), and it's also what makes decrementing or removing an
-      // already-saved item actually take effect on the next Save.
-      onPlaced(openOrder);
-      saveActiveTableToStorage(openOrder);
-
-      // Local-first: always write to the durable queue immediately, never
-      // block this action on a network round-trip. orderPhase "OPEN" tells
-      // the sync manager to merge into the table's running order without
-      // closing it (see offlineSync.ts's syncOneOrder) — identical end
-      // result to the old inline Supabase block, just executed in the
-      // background instead of inline here.
-      const kotTempId = `kot-${cleanTable}-${Date.now()}`;
-      try {
-        await enqueueOfflineOrder({
-          tempId: kotTempId,
-          restaurantId,
-          createdByUserId: safeCreatedByUserId,
-          orderNumber: openOrder.id,
-          orderType: "DINE_IN",
-          tableNumber: cleanTable,
-          channel: "DINE_IN",
-          paymentMode,
-          total: savedGrandTotal,
-          status: "PENDING",
-          items: savedItems.map((item) => ({
-            id: item.id,
-            name: item.name,
-            price: item.price,
-            qty: item.qty,
-            notes: item.notes,
-            category: item.category,
-          })),
-          createdAt: openOrder.createdAt,
-          syncAttempts: 0,
-          orderPhase: "OPEN",
+      if (cleanTable) {
+        // --- DINE-IN WITH A TABLE: rounds R1/R2/R3..., same order id, local-only until settled ---
+        setSettledTableNumbers((prev) => {
+          if (!prev.has(cleanTable)) return prev;
+          const next = new Set(prev);
+          next.delete(cleanTable);
+          return next;
         });
-      } catch (error) {
-        showToast("Table saved locally, but its sync queue failed. Reload and retry.", "error");
-        return;
-      }
 
-      // No immediate syncAll() here on purpose: the item is already safely
-      // in IndexedDB the instant enqueueOfflineOrder() above returns, so
-      // nothing is lost if this tab closes right now. Pushing to Supabase
-      // is left entirely to offlineSyncManager's own 3.5s interval (plus
-      // its online/focus/visibilitychange listeners) so a burst of rapid
-      // saves on the same table batches into fewer round-trips instead of
-      // firing a Supabase call after every single tap.
+        const priorRoundCount = existingOrderForTable?.kotRoundCount || 0;
+        const priorRoundBreakdown = existingOrderForTable?.roundBreakdown || [];
+        let newRoundCount = priorRoundCount;
+        let newRoundBreakdown = priorRoundBreakdown;
 
-      if (shouldPrintKot) {
-        showToast(`KOT sent & Table ${cleanTable} order saved!`, "success");
-      } else {
-        showToast(`Table ${cleanTable} order saved! (No KOT printed)`, "success");
-      }
+        if (shouldPrintKot) {
+          // Diff against everything already sent to the kitchen for THIS
+          // TABLE, so a dish already cooking/served never reprints just
+          // because the cart (left populated after Save) still shows it.
+          //
+          // This is reconstructed by summing every prior round's items
+          // from the PERSISTED roundBreakdown — not from an in-memory ref.
+          // A ref-based cache reset on every page reload/remount, which
+          // meant a reload between R1 and R2 made R1's items look "new"
+          // again: duplicated in the round breakdown AND reprinted as a
+          // second physical KOT ticket for dishes already cooking.
+          // roundBreakdown survives reload (it's saved on the Order object
+          // the same way kotRoundCount is), so this can't happen anymore.
+          const alreadySentQtyByKey = new Map<string, number>();
+          priorRoundBreakdown.forEach((r) => {
+            r.items.forEach((i) => {
+              const key = `${i.id}-${i.notes || ""}`;
+              alreadySentQtyByKey.set(key, (alreadySentQtyByKey.get(key) || 0) + i.qty);
+            });
+          });
+          const diffItems = savedItems
+            .map((item) => {
+              const key = `${item.id}-${item.notes || ""}`;
+              const deltaQty = item.qty - (alreadySentQtyByKey.get(key) || 0);
+              return deltaQty > 0 ? { ...item, qty: deltaQty } : null;
+            })
+            .filter((i): i is (typeof savedItems)[number] => i !== null);
+
+          if (diffItems.length > 0) {
+            newRoundCount = priorRoundCount + 1;
+            const globalKotNumber = getNextDailyKotNumber();
+            const kotLabel = `KOT #${globalKotNumber} · Table ${cleanTable} · Round ${newRoundCount}`;
+            try {
+              printKitchenOrderTicket({
+                restaurantName,
+                orderNumber: kotLabel,
+                table: cleanTable,
+                source,
+                items: diffItems,
+                serverName: serverName.trim() || undefined,
+                paperWidth: settings.paperWidth,
+              });
+            } catch (e) {
+              console.warn("KOT print skipped or dialog closed:", e);
+            }
+            // Record exactly what was NEW in this round — not the running
+            // cart total — so the on-screen breakdown can show "R1: X, Y"
+            // then "R2: Z" underneath, instead of one merged list.
+            newRoundBreakdown = [
+              ...newRoundBreakdown,
+              {
+                round: newRoundCount,
+                items: diffItems.map((i) => ({ id: i.id, name: i.name, qty: i.qty, notes: i.notes })),
+              },
+            ];
+          } else {
+            showToast("No new items to send to the kitchen since the last KOT.", "info");
+          }
+        }
+
+        // Reuse the SAME order id across every round of this sitting —
+        // never mint a new one per Save/KOT — so Supabase (once settled)
+        // and every printed KOT ticket for this table agree on one order.
+        const orderId = existingOrderForTable?.id || `ORD-${Date.now().toString().slice(-5)}`;
+
+        const openOrder: Order = {
+          id: orderId,
+          databaseId: existingOrderForTable?.databaseId || `tbl-${cleanTable}-${Date.now()}`,
+          time: new Date().toLocaleTimeString("en-IN", {
+            hour: "numeric",
+            minute: "2-digit",
+          }),
+          source: "DINE_IN",
+          table: cleanTable,
+          items: savedItems,
+          total: savedGrandTotal,
+          payment: paymentMode,
+          createdAt: existingOrderForTable?.createdAt || new Date().toISOString(),
+          closedAt: null,
+          serverName,
+          customerPhone,
+          customerName,
+          discountAmount: savedDiscountAmount,
+          subtotal: savedSubtotal,
+          kotRoundCount: newRoundCount,
+          roundBreakdown: newRoundBreakdown,
+        };
+
+        // Write to the durable queue FIRST, before touching UI/localStorage
+        // state. Doing onPlaced()/saveActiveTableToStorage() first (the old
+        // order) meant that if this enqueue failed, the Tables screen and
+        // localStorage cache would already show the table as saved with the
+        // new items — the UI would be lying about persistence, and since
+        // getTableSyncStatus() only checks the IndexedDB-backed queue, it
+        // would even show a reassuring "Cloud synced" badge for an order
+        // that was never written anywhere durable.
+        const kotTempId = `kot-${cleanTable}`;
+        try {
+          await enqueueOfflineOrder({
+            tempId: kotTempId,
+            restaurantId,
+            createdByUserId: safeCreatedByUserId,
+            orderNumber: orderId,
+            orderType: "DINE_IN",
+            tableNumber: cleanTable,
+            channel: "DINE_IN",
+            paymentMode,
+            total: savedGrandTotal,
+            status: "PENDING",
+            items: savedItems.map((item) => ({
+              id: item.id,
+              name: item.name,
+              price: item.price,
+              qty: item.qty,
+              notes: item.notes,
+              category: item.category,
+            })),
+            createdAt: openOrder.createdAt,
+            syncAttempts: 0,
+            orderPhase: "OPEN",
+          });
+        } catch (error) {
+          showToast(
+            `Couldn't save Table ${cleanTable}'s order on this device. Check storage/permissions and try again before leaving the table.`,
+            "error"
+          );
+          return;
+        }
+
+        // Cart intentionally stays populated (not cleared) after Save/KOT —
+        // it always reflects the table's current running total. This is what
+        // lets a second Save safely REPLACE the queued/remote record instead
+        // of needing to merge deltas together (see enqueueOfflineOrder /
+        // syncOneOrder), and it's also what makes decrementing or removing an
+        // already-saved item actually take effect on the next Save.
+        onPlaced(openOrder);
+        saveActiveTableToStorage(openOrder);
+
+        // No immediate syncAll() here on purpose, and no sync at all yet —
+        // OPEN records are local-only by design (see offlineSync.ts) until
+        // this table is settled.
+
+        if (shouldPrintKot) {
+          showToast(`KOT sent & Table ${cleanTable} order saved!`, "success");
+        } else {
+          showToast(`Table ${cleanTable} order saved! (No KOT printed)`, "success");
+        }
 
         // Table selection and populated cart are both preserved for waiter
         // convenience — the cart now IS the table's running order.
-      } else {
+      } else if (source === "DINE_IN") {
+        // --- DINE-IN, NO TABLE (default/instant order): print-only, exactly
+        // like Takeaway/Swiggy/Zomato below. Deliberately NOT written to the
+        // offline queue here. There's no table to key an OPEN record on, so
+        // if this order were queued now and the sync manager correctly
+        // leaves OPEN records local-only until Settled, a no-table order
+        // that never gets Settled (forgotten, shift change, etc.) would sit
+        // in IndexedDB forever — invisible in any table list, never synced,
+        // never cleaned up. Settle & Pay is the only place a no-table
+        // Dine-In order gets written, exactly like the other walk-up
+        // channels, so an abandoned cart simply never becomes a record.
+        const globalKotNumber = shouldPrintKot ? getNextDailyKotNumber() : null;
+
         if (shouldPrintKot) {
-          showToast(`KOT ${orderNumber} printed.`, "success");
+          try {
+            printKitchenOrderTicket({
+              restaurantName,
+              orderNumber: `KOT #${globalKotNumber}`,
+              table: undefined,
+              source,
+              items: savedItems,
+              serverName: serverName.trim() || undefined,
+              paperWidth: settings.paperWidth,
+            });
+            showToast(`KOT #${globalKotNumber} printed. Remember to Settle to save this order.`, "success");
+          } catch (e) {
+            console.warn("KOT print skipped or dialog closed:", e);
+          }
+        } else {
+          showToast("Dine-In (no table) items noted. Settle to save this order.", "info");
+        }
+      } else {
+        // --- TAKEAWAY / SWIGGY / ZOMATO: just print, no local persistence here.
+        // Placing/settling these goes through the normal Settle & Pay flow. ---
+        if (shouldPrintKot) {
+          const globalKotNumber = getNextDailyKotNumber();
+          try {
+            printKitchenOrderTicket({
+              restaurantName,
+              orderNumber: `KOT #${globalKotNumber}`,
+              table: undefined,
+              source,
+              items: savedItems,
+              serverName: serverName.trim() || undefined,
+              paperWidth: settings.paperWidth,
+            });
+            showToast(`KOT #${globalKotNumber} printed.`, "success");
+          } catch (e) {
+            console.warn("KOT print skipped or dialog closed:", e);
+          }
         }
       }
     } finally {
@@ -1155,12 +1451,9 @@ export function RestaurantPOS({
       showToast("Cart is empty. Please add items to save.", "info");
       return;
     }
-    if (!table) {
-      setPendingSaveOnTableSelect(true);
-      setShowTablePickerModal(true);
-      showToast("Please select a table to save items.", "info");
-      return;
-    }
+    // Table is optional — proceeding with `table` as-is (a real table, or
+    // null for a default/instant Dine-In order) rather than forcing a
+    // table pick first.
     await executeSaveTableOrder(table, false);
   }
 
@@ -1193,6 +1486,20 @@ export function RestaurantPOS({
     }
 
     const cleanT = tNum.trim().toUpperCase();
+
+    // A pending Save/KOT means "this cart (built without a table) needs a
+    // table assigned to it." If that table is already occupied, the cart in
+    // hand doesn't include that table's existing saved items — proceeding
+    // would REPLACE (not merge into) that table's order, silently wiping
+    // out whatever was already saved there. Block it and point the waiter
+    // at the normal way to add to an occupied table instead.
+    if ((pendingKotOnTableSelect || pendingSaveOnTableSelect) && occupiedTableNumbers.has(cleanT)) {
+      showToast(
+        `Table ${cleanT} already has an order. Open it from the Tables screen to add these items, or pick a vacant table.`,
+        "error"
+      );
+      return;
+    }
 
     if (
       cleanT !== table &&
@@ -1282,7 +1589,18 @@ export function RestaurantPOS({
     }
 
     const cleanTable = source === "DINE_IN" ? (table ? table.trim().toUpperCase() : null) : null;
-    const orderNumber = `ORD-${Date.now().toString().slice(-5)}`;
+    const existingOrderForSitting =
+      source === "DINE_IN"
+        ? cleanTable
+          ? tableOrderMap.get(cleanTable)
+          : noTableOrderRef.current
+            ? { id: noTableOrderRef.current.id }
+            : undefined
+        : undefined;
+    // Reuse the sitting's existing order id (from its OPEN local record, if
+    // any) instead of minting a new one — keeps one consistent order
+    // number across every KOT print and the final bill.
+    const orderNumber = existingOrderForSitting?.id || `ORD-${Date.now().toString().slice(-5)}`;
     const settings = getLocalSettings();
     const savedItems = cart.map((item) => ({ ...item }));
     const savedSubtotal = subtotal;
@@ -1293,7 +1611,14 @@ export function RestaurantPOS({
     setSaving(true);
 
     async function queueOffline() {
-      const tempId = `offline-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      // Reuse the same local record identity as the OPEN sitting (if any),
+      // so this call REPLACES it (flipping it to SETTLED) instead of
+      // leaving it behind as an orphan that never gets cleaned up.
+      const tempId = cleanTable
+        ? `kot-${cleanTable}`
+        : source === "DINE_IN" && noTableOrderRef.current
+          ? noTableOrderRef.current.tempId
+          : `offline-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const nowIso = new Date().toISOString();
 
       try {
@@ -1318,6 +1643,7 @@ export function RestaurantPOS({
           })),
           createdAt: nowIso,
           syncAttempts: 0,
+          orderPhase: "SETTLED",
         });
       } catch (e) {
         showToast("Order was not saved locally. Please try again.", "error");
@@ -1357,42 +1683,45 @@ export function RestaurantPOS({
       showToast(
         cleanTable
           ? (isDemo
-              ? `Table ${cleanTable} settled in Demo Mode. Bill printed.`
-              : `Table ${cleanTable} queued in Offline Mode. Bill printed.`)
+              ? `Table ${cleanTable} settled in Demo Mode.${autoPrintBillOnSettle ? " Bill printed." : ""}`
+              : `Table ${cleanTable} queued in Offline Mode.${autoPrintBillOnSettle ? " Bill printed." : ""}`)
           : (isDemo
-              ? `Order ${orderNumber} settled in Demo Mode. Bill printed.`
-              : `Order ${orderNumber} queued in Offline Mode. Bill printed.`),
+              ? `Order ${orderNumber} settled in Demo Mode.${autoPrintBillOnSettle ? " Bill printed." : ""}`
+              : `Order ${orderNumber} queued in Offline Mode.${autoPrintBillOnSettle ? " Bill printed." : ""}`),
         "success"
       );
 
       const billNo = getDailyBillNumber(orderNumber, newOrder.databaseId);
       setTimeout(() => {
-        try {
-          printCustomerBillReceipt({
-            restaurantName,
-            orderNumber,
-            billNo,
-            tokenNo: billNo,
-            table: source === "DINE_IN" ? (cleanTable || undefined) : undefined,
-            source,
-            paymentMode,
-            customerName: customerName.trim() || undefined,
-            cashierName: serverName.trim() || "biller",
-            items: savedItems,
-            subtotal: savedSubtotal,
-            discountAmount: savedDiscountAmount,
-            taxCgstPercent: applyGst ? 2.5 : 0,
-            taxSgstPercent: applyGst ? 2.5 : 0,
-            total: savedGrandTotal,
-            paperWidth: settings.paperWidth,
-          });
-        } catch (e) {}
+        if (autoPrintBillOnSettle) {
+          try {
+            printCustomerBillReceipt({
+              restaurantName,
+              orderNumber,
+              billNo,
+              tokenNo: billNo,
+              table: source === "DINE_IN" ? (cleanTable || undefined) : undefined,
+              source,
+              paymentMode,
+              customerName: customerName.trim() || undefined,
+              cashierName: serverName.trim() || "biller",
+              items: savedItems,
+              subtotal: savedSubtotal,
+              discountAmount: savedDiscountAmount,
+              taxCgstPercent: applyGst ? 2.5 : 0,
+              taxSgstPercent: applyGst ? 2.5 : 0,
+              total: savedGrandTotal,
+              paperWidth: settings.paperWidth,
+            });
+          } catch (e) {}
+        }
 
         if (autoPrintKot) {
           try {
+            const settleKotNumber = getNextDailyKotNumber();
             printKitchenOrderTicket({
               restaurantName,
-              orderNumber,
+              orderNumber: `KOT #${settleKotNumber}`,
               table: source === "DINE_IN" ? (cleanTable || undefined) : undefined,
               source,
               items: savedItems,
@@ -1735,6 +2064,15 @@ export function RestaurantPOS({
         <div className="pos-top-actions">
           <button
             type="button"
+            className={`pos-tool-btn debug-panel-btn ${showDebugPanel ? "active" : ""}`}
+            onClick={() => setShowDebugPanel((v) => !v)}
+            title="Live view of localStorage + IndexedDB values"
+          >
+            <span>🐞</span>
+            <span>Storage</span>
+          </button>
+          <button
+            type="button"
             className="pos-tool-btn logout-btn"
             onClick={() => {
               if (onLogout) {
@@ -1755,6 +2093,87 @@ export function RestaurantPOS({
           </button>
         </div>
       </header>
+
+      {/* DEBUG PANEL: live localStorage + IndexedDB viewer, side drawer */}
+      {showDebugPanel && (
+        <aside className="debug-storage-panel">
+          <div className="debug-panel-head">
+            <div>
+              <strong>Storage inspector</strong>
+              <span className="debug-updated-at">
+                {debugUpdatedAt ? `updated ${new Date(debugUpdatedAt).toLocaleTimeString()}` : "loading…"}
+              </span>
+            </div>
+            <button type="button" onClick={() => setShowDebugPanel(false)} title="Close">
+              ✕
+            </button>
+          </div>
+
+          <div className="debug-panel-body">
+            <div className="debug-section-title">localStorage</div>
+            {debugSnapshot &&
+              Object.entries(debugSnapshot.localStorage).map(([key, value]) => {
+                const isOpen = debugExpanded[`ls:${key}`] !== false; // default open
+                return (
+                  <div className="debug-entry" key={key}>
+                    <button
+                      type="button"
+                      className="debug-entry-head"
+                      onClick={() =>
+                        setDebugExpanded((prev) => ({ ...prev, [`ls:${key}`]: !isOpen }))
+                      }
+                    >
+                      <span className="debug-caret">{isOpen ? "▾" : "▸"}</span>
+                      <span className="debug-key">{key}</span>
+                      <span className="debug-badge">
+                        {value === null ? "empty" : Array.isArray(value) ? `${value.length} item(s)` : "object"}
+                      </span>
+                    </button>
+                    {isOpen && (
+                      <pre className="debug-value">
+                        {value === null ? "null" : JSON.stringify(value, null, 2)}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })}
+
+            <div className="debug-section-title">IndexedDB — restaurant_iq_offline</div>
+            {debugSnapshot &&
+              (
+                [
+                  ["queued_orders", debugSnapshot.indexedDB.queued_orders],
+                  ["menu_cache", debugSnapshot.indexedDB.menu_cache],
+                  ["tables_cache", debugSnapshot.indexedDB.tables_cache],
+                ] as const
+              ).map(([key, value]) => {
+                const isOpen = debugExpanded[`idb:${key}`] !== false;
+                return (
+                  <div className="debug-entry" key={key}>
+                    <button
+                      type="button"
+                      className="debug-entry-head"
+                      onClick={() =>
+                        setDebugExpanded((prev) => ({ ...prev, [`idb:${key}`]: !isOpen }))
+                      }
+                    >
+                      <span className="debug-caret">{isOpen ? "▾" : "▸"}</span>
+                      <span className="debug-key">{key}</span>
+                      <span className="debug-badge">
+                        {value == null ? "empty" : Array.isArray(value) ? `${value.length} item(s)` : "cached"}
+                      </span>
+                    </button>
+                    {isOpen && (
+                      <pre className="debug-value">
+                        {value == null ? "null" : JSON.stringify(value, null, 2)}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })}
+          </div>
+        </aside>
+      )}
 
       {/* 2. MAIN BODY */}
       <div className="pos-main-body">
@@ -1807,6 +2226,17 @@ export function RestaurantPOS({
                     <b>Order sync status</b>
                     <span>Saved on this device, awaiting cloud confirmation.</span>
                   </div>
+                  {failedSyncOrders.length > 0 && (
+                    <button
+                      type="button"
+                      className="retry-all-btn"
+                      onClick={handleRetryAllFailed}
+                      disabled={retryingAll}
+                    >
+                      <RefreshCw size={12} className={retryingAll ? "spin" : ""} />
+                      <span>{retryingAll ? "Retrying..." : `Retry All (${failedSyncOrders.length})`}</span>
+                    </button>
+                  )}
                   <button type="button" onClick={() => setShowSyncDetails(false)} aria-label="Close sync details">
                     <X size={16} />
                   </button>
@@ -1824,6 +2254,17 @@ export function RestaurantPOS({
                           <b>{order.tableNumber ? `Table ${order.tableNumber}` : order.orderType}</b>
                           <span>{itemCount} item{itemCount === 1 ? "" : "s"} · {money(order.total)}</span>
                           <small>{new Date(order.createdAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}{failed && order.lastError ? ` · ${order.lastError}` : ""}</small>
+                          {failed && (
+                            <button
+                              type="button"
+                              className="retry-one-btn"
+                              onClick={() => handleRetryFailedOrder(order.tempId)}
+                              disabled={retryingTempId === order.tempId || retryingAll}
+                            >
+                              <RefreshCw size={11} className={retryingTempId === order.tempId ? "spin" : ""} />
+                              <span>Retry</span>
+                            </button>
+                          )}
                         </div>
                       );
                     })}
@@ -1852,9 +2293,14 @@ export function RestaurantPOS({
                         <b>{t.tableNumber}</b>
                         <small>{t.capacity} Seats</small>
                       </div>
-                      <span className={`tile-badge ${isOccupied ? "occupied" : "vacant"}`}>
-                        {isOccupied ? "Occupied" : "Vacant"}
-                      </span>
+                      <div className="tile-badge-group">
+                        <span className={`tile-badge ${isOccupied ? "occupied" : "vacant"}`}>
+                          {isOccupied ? "Occupied" : "Vacant"}
+                        </span>
+                        {isOccupied && (activeOrder?.kotRoundCount || 0) > 0 && (
+                          <span className="tile-round-badge">R{activeOrder!.kotRoundCount}</span>
+                        )}
+                      </div>
                     </div>
 
                     <div className="tile-body">
@@ -1886,10 +2332,20 @@ export function RestaurantPOS({
                         <div className="tile-action-btns">
                           <button
                             type="button"
+                            className="tile-btn bill-print-btn"
+                            onClick={() => handleQuickPrintTable(activeOrder)}
+                            disabled={settlingTableNumber === t.tableNumber}
+                            title="Print customer bill (does not settle)"
+                          >
+                            <FileText size={11} />
+                            <span>Bill</span>
+                          </button>
+                          <button
+                            type="button"
                             className="tile-btn settle-pay-btn"
                             onClick={() => handleQuickSettleTable(activeOrder)}
                             disabled={settlingTableNumber === t.tableNumber}
-                            title="Settle Bill & Pay (Prints Bill Receipt)"
+                            title="Settle this table (does not print)"
                           >
                             {settlingTableNumber === t.tableNumber ? (
                               <>
@@ -1899,9 +2355,18 @@ export function RestaurantPOS({
                             ) : (
                               <>
                                 <CheckCircle2 size={11} />
-                                <span>Settle & Pay</span>
+                                <span>Settle</span>
                               </>
                             )}
+                          </button>
+                          <button
+                            type="button"
+                            className="tile-btn delete-order-btn"
+                            onClick={() => handleClearTableOrder(t.tableNumber)}
+                            disabled={settlingTableNumber === t.tableNumber}
+                            title="Delete this table's saved order (asks to confirm)"
+                          >
+                            <Trash2 size={11} />
                           </button>
                         </div>
                       ) : (
@@ -1957,21 +2422,6 @@ export function RestaurantPOS({
                 >
                   <Plus size={13} />
                   <span>+ Add Dish</span>
-                </button>
-                <button
-                  type="button"
-                  className="quick-add-dish-btn bulk-btn"
-                  onClick={() => setShowBulkModal(true)}
-                  style={{
-                    background: "#fef9ee",
-                    borderColor: "#fde68a",
-                    color: "#c88719",
-                    fontWeight: 700,
-                  }}
-                  title="Create multiple menu items at once"
-                >
-                  <Plus size={13} />
-                  <span>⚡ Bulk Create Menu</span>
                 </button>
 
                 <div className="terminal-shift-pill">
@@ -2184,6 +2634,16 @@ export function RestaurantPOS({
                   {source === "DINE_IN" && table && (
                     <button
                       type="button"
+                      className="round-badge"
+                      onClick={() => setShowRoundBreakdown((v) => !v)}
+                      title="Click to see what was added in each round"
+                    >
+                      Round {tableOrderMap.get(table.trim().toUpperCase())?.kotRoundCount || 0}
+                    </button>
+                  )}
+                  {source === "DINE_IN" && table && (
+                    <button
+                      type="button"
                       className="ticket-clear-table-pill"
                       onClick={() => {
                         setTable(null);
@@ -2214,6 +2674,28 @@ export function RestaurantPOS({
                   </button>
                 )}
               </div>
+
+              {showRoundBreakdown && source === "DINE_IN" && table && (
+                <div className="round-breakdown-panel">
+                  {(tableOrderMap.get(table.trim().toUpperCase())?.roundBreakdown || []).length === 0 ? (
+                    <div className="round-breakdown-empty">No KOT sent yet for this sitting.</div>
+                  ) : (
+                    (tableOrderMap.get(table.trim().toUpperCase())?.roundBreakdown || []).map((r) => (
+                      <div className="round-breakdown-group" key={r.round}>
+                        <div className="round-breakdown-label">R{r.round}</div>
+                        <div className="round-breakdown-items">
+                          {r.items.map((i, idx) => (
+                            <div className="round-breakdown-item" key={`${i.id}-${idx}`}>
+                              <span>{i.name}</span>
+                              <span className="round-breakdown-qty">x{i.qty}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
 
               <div className="cart-items-container">
                 {cart.length === 0 ? (
@@ -2484,10 +2966,35 @@ export function RestaurantPOS({
                     ) : (
                       <>
                         <CheckCircle2 size={14} />
-                        <span>Settle & Pay</span>
+                        <span>Settle</span>
                       </>
                     )}
                   </button>
+                </div>
+
+                <div className="print-on-settle-group">
+                  <label className="print-on-settle-toggle">
+                    <input
+                      type="checkbox"
+                      checked={autoPrintBillOnSettle}
+                      onChange={(e) => {
+                        setAutoPrintBillOnSettle(e.target.checked);
+                        saveLocalSettings({ autoPrintBillOnSettle: e.target.checked });
+                      }}
+                    />
+                    <span>Print bill on Settle</span>
+                  </label>
+                  <label className="print-on-settle-toggle">
+                    <input
+                      type="checkbox"
+                      checked={autoPrintKot}
+                      onChange={(e) => {
+                        setAutoPrintKot(e.target.checked);
+                        saveLocalSettings({ autoPrintKot: e.target.checked });
+                      }}
+                    />
+                    <span>Print KOT on Settle</span>
+                  </label>
                 </div>
               </div>
             </aside>
@@ -2868,16 +3375,21 @@ export function RestaurantPOS({
                 onChange={(e) => setNewItemPrice(e.target.value)}
               />
               <label>Category:</label>
-              <select
+              <input
+                type="text"
+                list="add-dish-category-options"
+                placeholder="e.g. Starters, Soups, Chinese..."
                 value={newItemCategory}
                 onChange={(e) => setNewItemCategory(e.target.value)}
-              >
-                {DEFAULT_CATEGORIES.slice(1).map((cat) => (
-                  <option key={cat} value={cat}>
-                    {cat}
-                  </option>
+              />
+              <datalist id="add-dish-category-options">
+                {(categoriesWithCounts.length > 1
+                  ? categoriesWithCounts.filter((c) => c.name !== "All Dishes").map((c) => c.name)
+                  : SUGGESTED_CATEGORIES
+                ).map((cat) => (
+                  <option key={cat} value={cat} />
                 ))}
-              </select>
+              </datalist>
             </div>
             <div className="modal-footer">
               <button
@@ -2944,13 +3456,12 @@ export function RestaurantPOS({
             </div>
 
             <datalist id="bulk-category-suggestions">
-              {DEFAULT_CATEGORIES.slice(1).map((cat) => (
+              {(categoriesWithCounts.length > 1
+                ? categoriesWithCounts.filter((c) => c.name !== "All Dishes").map((c) => c.name)
+                : SUGGESTED_CATEGORIES
+              ).map((cat) => (
                 <option key={cat} value={cat} />
               ))}
-              <option value="Rice & Biryani" />
-              <option value="Tandoori" />
-              <option value="Snacks" />
-              <option value="Combo Meals" />
             </datalist>
 
             <div className="bulk-modal-body">
@@ -3142,18 +3653,10 @@ export function RestaurantPOS({
                   <option value="80mm">80mm (3-inch / Standard)</option>
                 </select>
               </label>
-
-              <label className="settings-row">
-                <span>Auto-Print KOT on Settle:</span>
-                <input
-                  type="checkbox"
-                  checked={autoPrintKot}
-                  onChange={(e) => {
-                    setAutoPrintKot(e.target.checked);
-                    saveLocalSettings({ autoPrintKot: e.target.checked });
-                  }}
-                />
-              </label>
+              {/* Print-on-Settle toggles (bill + KOT) live at the bottom of
+                  the cart panel now, next to the Settle button — visible
+                  where they're actually used, instead of buried here where
+                  a KOT could fire on Settle with no visible sign why. */}
             </div>
             <div className="modal-footer">
               <button
@@ -3177,7 +3680,7 @@ export function RestaurantPOS({
           max-height: 100vh;
           width: 100vw;
           max-width: 100vw;
-          background: #090e1a;
+          background: #faf7f2;
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
           color: #1c1917;
           overflow: hidden;
@@ -3217,9 +3720,9 @@ export function RestaurantPOS({
           padding: 0 12px;
           height: 46px;
           min-height: 46px;
-          background: #090e1a;
-          color: #ffffff;
-          border-bottom: 1px solid #1c1917;
+          background: #ffffff;
+          color: #1c1917;
+          border-bottom: 1px solid #ede7dc;
           flex-shrink: 0;
         }
 
@@ -3254,12 +3757,12 @@ export function RestaurantPOS({
           letter-spacing: -0.01em;
           display: block;
           line-height: 1.1;
-          color: #ffffff;
+          color: #1c1917;
         }
 
         .pos-brand-meta span {
           font-size: 10px;
-          color: #a8a29e;
+          color: #78716c;
           display: block;
           line-height: 1.1;
         }
@@ -3267,16 +3770,16 @@ export function RestaurantPOS({
         .top-divider {
           width: 1px;
           height: 22px;
-          background: #1c1917;
+          background: #ede7dc;
         }
 
         .pos-channel-group {
           display: flex;
           gap: 2px;
-          background: rgba(255, 255, 255, 0.05);
+          background: #faf7f2;
           padding: 2px;
           border-radius: 7px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
+          border: 1px solid #ede7dc;
         }
 
         .pos-channel-btn {
@@ -3287,7 +3790,7 @@ export function RestaurantPOS({
           border-radius: 5px;
           border: none;
           background: transparent;
-          color: #a8a29e;
+          color: #78716c;
           font-size: 11.5px;
           font-weight: 600;
           cursor: pointer;
@@ -3296,22 +3799,22 @@ export function RestaurantPOS({
         }
 
         .pos-channel-btn:hover {
-          color: #ffffff;
-          background: rgba(255, 255, 255, 0.06);
+          color: #1c1917;
+          background: #ffffff;
         }
 
         .pos-channel-btn.active {
           background: #d99726;
           color: #ffffff;
           font-weight: 700;
-          box-shadow: 0 1px 4px rgba(217, 151, 38, 0.4);
+          box-shadow: 0 1px 4px rgba(217, 151, 38, 0.3);
         }
 
         /* VIEW SWITCHER IN TOP BAR */
         .pos-view-switcher {
           display: flex;
-          background: rgba(255, 255, 255, 0.08);
-          border: 1px solid rgba(255, 255, 255, 0.15);
+          background: #faf7f2;
+          border: 1px solid #ede7dc;
           border-radius: 7px;
           padding: 2px;
           gap: 2px;
@@ -3325,7 +3828,7 @@ export function RestaurantPOS({
           border-radius: 5px;
           border: none;
           background: transparent;
-          color: #a8a29e;
+          color: #78716c;
           font-size: 12px;
           font-weight: 700;
           cursor: pointer;
@@ -3334,14 +3837,14 @@ export function RestaurantPOS({
         }
 
         .pos-view-btn:hover {
-          color: #ffffff;
-          background: rgba(255, 255, 255, 0.08);
+          color: #1c1917;
+          background: #ffffff;
         }
 
         .pos-view-btn.active {
           background: #d99726;
           color: #ffffff;
-          box-shadow: 0 1px 4px rgba(217, 151, 38, 0.4);
+          box-shadow: 0 1px 4px rgba(217, 151, 38, 0.3);
         }
 
         .pos-dinein-nav-btn {
@@ -3350,9 +3853,9 @@ export function RestaurantPOS({
           gap: 6px;
           padding: 4px 11px;
           border-radius: 6px;
-          border: 1px solid rgba(255, 255, 255, 0.2);
-          background: rgba(255, 255, 255, 0.08);
-          color: #ede7dc;
+          border: 1px solid #ede7dc;
+          background: #faf7f2;
+          color: #44403c;
           font-size: 12px;
           font-weight: 700;
           cursor: pointer;
@@ -3364,7 +3867,7 @@ export function RestaurantPOS({
           background: #d99726;
           border-color: #d99726;
           color: #ffffff;
-          box-shadow: 0 2px 6px rgba(217, 151, 38, 0.4);
+          box-shadow: 0 2px 6px rgba(217, 151, 38, 0.3);
         }
 
         .pos-table-selector-container {
@@ -3378,10 +3881,10 @@ export function RestaurantPOS({
           align-items: center;
           gap: 6px;
           padding: 4px 10px;
-          background: rgba(255, 255, 255, 0.08);
-          border: 1px solid rgba(255, 255, 255, 0.15);
+          background: #faf7f2;
+          border: 1px solid #ede7dc;
           border-radius: 6px;
-          color: #ffffff;
+          color: #1c1917;
           font-size: 12px;
           cursor: pointer;
           transition: all 0.15s ease;
@@ -3389,29 +3892,29 @@ export function RestaurantPOS({
         }
 
         .pos-table-selector-trigger.no-table {
-          border-color: rgba(226, 160, 52, 0.4);
-          background: rgba(226, 160, 52, 0.12);
-          color: #93c5fd;
+          border-color: #fde68a;
+          background: #fef9ee;
+          color: #b45309;
         }
 
         .pos-table-selector-trigger.has-table {
-          border-color: rgba(16, 185, 129, 0.4);
-          background: rgba(16, 185, 129, 0.12);
-          color: #a7f3d0;
+          border-color: #bbf7d0;
+          background: #ecfdf5;
+          color: #15803d;
         }
 
         .no-table-prompt {
           font-weight: 700;
-          color: #ede7dc;
+          color: #44403c;
         }
 
         .table-optional-hint {
           font-size: 10px;
           font-weight: 700;
-          background: rgba(255, 255, 255, 0.12);
+          background: #ede7dc;
           padding: 1px 5px;
           border-radius: 4px;
-          color: #e7e0d3;
+          color: #57534e;
           margin-left: 2px;
         }
 
@@ -3422,9 +3925,9 @@ export function RestaurantPOS({
           width: 22px;
           height: 22px;
           border-radius: 5px;
-          background: rgba(239, 68, 68, 0.15);
-          border: 1px solid rgba(239, 68, 68, 0.3);
-          color: #fca5a5;
+          background: #fef2f2;
+          border: 1px solid #fecaca;
+          color: #dc2626;
           cursor: pointer;
           transition: all 0.15s ease;
         }
@@ -3435,7 +3938,7 @@ export function RestaurantPOS({
         }
 
         .pos-table-selector-trigger:hover {
-          background: rgba(255, 255, 255, 0.16);
+          background: #ffffff;
         }
 
         .table-status-dot {
@@ -3455,7 +3958,7 @@ export function RestaurantPOS({
         .table-status-text {
           font-size: 10px;
           font-weight: 700;
-          color: #a8a29e;
+          color: #78716c;
           text-transform: uppercase;
         }
 
@@ -3467,25 +3970,25 @@ export function RestaurantPOS({
           display: flex;
           align-items: center;
           gap: 5px;
-          background: rgba(255, 255, 255, 0.06);
-          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: #faf7f2;
+          border: 1px solid #ede7dc;
           border-radius: 6px;
           padding: 3px 8px;
-          color: #a8a29e;
+          color: #78716c;
           width: 105px;
         }
 
         .server-input input {
           border: none;
           background: transparent;
-          color: #ffffff;
+          color: #1c1917;
           font-size: 11px;
           width: 100%;
           outline: none;
         }
 
         .server-input input::placeholder {
-          color: #78716c;
+          color: #a8a29e;
         }
 
         .top-spacer {
@@ -3504,9 +4007,9 @@ export function RestaurantPOS({
           gap: 5px;
           padding: 4px 9px;
           border-radius: 6px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.05);
-          color: #e7e0d3;
+          border: 1px solid #ede7dc;
+          background: #faf7f2;
+          color: #44403c;
           font-size: 11.5px;
           font-weight: 600;
           cursor: pointer;
@@ -3515,8 +4018,9 @@ export function RestaurantPOS({
         }
 
         .pos-tool-btn:hover {
-          background: rgba(255, 255, 255, 0.12);
-          color: #ffffff;
+          background: #ffffff;
+          border-color: #d99726;
+          color: #1c1917;
         }
 
         .pos-tool-btn.icon-only {
@@ -3531,9 +4035,129 @@ export function RestaurantPOS({
         }
 
         .logout-btn:hover {
-          background: rgba(239, 68, 68, 0.2);
-          color: #f87171;
-          border-color: rgba(239, 68, 68, 0.4);
+          background: #fef2f2;
+          color: #dc2626;
+          border-color: #fecaca;
+        }
+
+        .debug-panel-btn.active {
+          background: #7c3aed;
+          border-color: #7c3aed;
+          color: #ffffff;
+        }
+
+        .debug-storage-panel {
+          position: fixed;
+          top: 46px;
+          right: 0;
+          bottom: 0;
+          width: 380px;
+          max-width: 92vw;
+          background: #1c1917;
+          color: #e7e0d3;
+          z-index: 500;
+          display: flex;
+          flex-direction: column;
+          box-shadow: -6px 0 18px rgba(0, 0, 0, 0.25);
+          font-family: "SF Mono", "Fira Code", ui-monospace, monospace;
+        }
+
+        .debug-panel-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 10px 12px;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+          flex-shrink: 0;
+        }
+
+        .debug-panel-head strong {
+          font-size: 13px;
+          display: block;
+        }
+
+        .debug-updated-at {
+          font-size: 10px;
+          color: #a8a29e;
+        }
+
+        .debug-panel-head button {
+          background: transparent;
+          border: none;
+          color: #e7e0d3;
+          cursor: pointer;
+          font-size: 14px;
+          padding: 2px 6px;
+        }
+
+        .debug-panel-body {
+          flex: 1;
+          overflow-y: auto;
+          padding: 8px 10px 20px;
+        }
+
+        .debug-section-title {
+          font-size: 10.5px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+          color: #a78bfa;
+          margin: 14px 0 6px;
+        }
+
+        .debug-entry {
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 6px;
+          margin-bottom: 6px;
+          overflow: hidden;
+        }
+
+        .debug-entry-head {
+          width: 100%;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          padding: 6px 8px;
+          background: rgba(255, 255, 255, 0.04);
+          border: none;
+          color: #e7e0d3;
+          cursor: pointer;
+          font-family: inherit;
+          font-size: 11px;
+          text-align: left;
+        }
+
+        .debug-caret {
+          color: #a8a29e;
+          width: 10px;
+        }
+
+        .debug-key {
+          flex: 1;
+          font-weight: 700;
+          word-break: break-all;
+        }
+
+        .debug-badge {
+          font-size: 9.5px;
+          color: #a8a29e;
+          background: rgba(255, 255, 255, 0.06);
+          padding: 1px 6px;
+          border-radius: 10px;
+          flex-shrink: 0;
+        }
+
+        .debug-value {
+          margin: 0;
+          padding: 8px;
+          font-size: 10.5px;
+          line-height: 1.5;
+          white-space: pre-wrap;
+          word-break: break-word;
+          max-height: 260px;
+          overflow-y: auto;
+          background: #0c0a09;
+          color: #86efac;
         }
 
         .pos-status-badge {
@@ -3692,6 +4316,54 @@ export function RestaurantPOS({
         .sync-detail-head button { border: 0; background: transparent; color: #78716c; cursor: pointer; padding: 0; }
         .sync-empty-state { padding-top: 9px; font-size: 12px; color: #15803d; font-weight: 600; }
 
+        .retry-all-btn {
+          display: flex !important;
+          align-items: center;
+          gap: 4px;
+          padding: 5px 10px !important;
+          border-radius: 6px !important;
+          background: #dc2626 !important;
+          color: #ffffff !important;
+          font-size: 11px;
+          font-weight: 700;
+          white-space: nowrap;
+          flex-shrink: 0;
+        }
+
+        .retry-all-btn:hover {
+          background: #b91c1c !important;
+        }
+
+        .retry-all-btn:disabled {
+          opacity: 0.6;
+          cursor: not-allowed;
+        }
+
+        .retry-one-btn {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          margin-top: 4px;
+          padding: 4px 8px;
+          border-radius: 5px;
+          border: 1px solid #fca5a5;
+          background: #ffffff;
+          color: #b91c1c;
+          font-size: 10.5px;
+          font-weight: 700;
+          cursor: pointer;
+          width: fit-content;
+        }
+
+        .retry-one-btn:hover {
+          background: #fee2e2;
+        }
+
+        .retry-one-btn:disabled {
+          opacity: 0.6;
+          cursor: not-allowed;
+        }
+
         .sync-order-list {
           display: grid;
           grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
@@ -3838,6 +4510,83 @@ export function RestaurantPOS({
           color: #b91c1c;
         }
 
+        .tile-badge-group {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+        }
+
+        .tile-round-badge {
+          font-size: 9px;
+          font-weight: 800;
+          padding: 1px 5px;
+          border-radius: 3px;
+          background: #ede9fe;
+          color: #6d28d9;
+        }
+
+        .round-badge {
+          font-size: 10px;
+          font-weight: 700;
+          padding: 2px 7px;
+          border-radius: 10px;
+          background: #ede9fe;
+          color: #6d28d9;
+          white-space: nowrap;
+          border: none;
+          cursor: pointer;
+          transition: background 0.12s ease;
+        }
+
+        .round-badge:hover {
+          background: #ddd6fe;
+        }
+
+        .round-breakdown-panel {
+          margin: 0 10px 8px;
+          padding: 8px 10px;
+          border-radius: 8px;
+          background: #faf5ff;
+          border: 1px solid #ede9fe;
+          max-height: 160px;
+          overflow-y: auto;
+        }
+
+        .round-breakdown-empty {
+          font-size: 11px;
+          color: #78716c;
+          font-weight: 600;
+        }
+
+        .round-breakdown-group + .round-breakdown-group {
+          margin-top: 8px;
+          padding-top: 8px;
+          border-top: 1px dashed #ddd6fe;
+        }
+
+        .round-breakdown-label {
+          font-size: 10.5px;
+          font-weight: 800;
+          color: #6d28d9;
+          margin-bottom: 3px;
+          letter-spacing: 0.02em;
+        }
+
+        .round-breakdown-item {
+          display: flex;
+          justify-content: space-between;
+          gap: 8px;
+          font-size: 11.5px;
+          color: #44403c;
+          padding: 1px 0;
+        }
+
+        .round-breakdown-qty {
+          font-weight: 700;
+          color: #57534e;
+          flex-shrink: 0;
+        }
+
         .tile-body {
           display: flex;
           flex-direction: column;
@@ -3903,36 +4652,69 @@ export function RestaurantPOS({
           align-items: center;
           gap: 3px;
           width: 100%;
-          justify-content: flex-end;
         }
 
         .tile-btn {
           display: flex;
           align-items: center;
+          justify-content: center;
           gap: 2px;
           padding: 2px 5px;
           height: 20px;
           border-radius: 4px;
           border: none;
-          font-size: 9.5px;
+          font-size: 9px;
           font-weight: 700;
           cursor: pointer;
           transition: all 0.12s ease;
         }
 
+        .tile-btn.bill-print-btn {
+          background: #eff6ff;
+          color: #1d4ed8;
+          border: 1px solid #bfdbfe;
+          flex: 1;
+        }
+
+        .tile-btn.bill-print-btn:hover {
+          background: #dbeafe;
+        }
+
         .tile-btn.settle-pay-btn {
           background: #16a34a;
           color: #ffffff;
-          padding: 2px 7px;
+          padding: 2px 6px;
           height: 20px;
-          font-size: 9.5px;
+          font-size: 9px;
           font-weight: 800;
           border-radius: 4px;
           box-shadow: 0 1px 2px rgba(22, 163, 74, 0.2);
+          flex: 1;
         }
 
         .tile-btn.settle-pay-btn:hover {
           background: #15803d;
+        }
+
+        .tile-btn.delete-order-btn {
+          background: #fef2f2;
+          color: #dc2626;
+          width: 20px;
+          height: 20px;
+          padding: 0;
+          justify-content: center;
+          border: 1px solid #fecaca;
+          flex-shrink: 0;
+        }
+
+        .tile-btn.delete-order-btn:hover {
+          background: #fee2e2;
+          color: #b91c1c;
+        }
+
+        .tile-btn:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
         }
 
         .tile-new-order-btn {
@@ -4259,14 +5041,14 @@ export function RestaurantPOS({
           overflow-y: auto;
           padding: 8px 10px 16px 10px;
           display: grid;
-          grid-template-columns: repeat(5, minmax(0, 1fr));
+          grid-template-columns: repeat(4, minmax(0, 1fr));
           gap: 8px;
           align-content: start;
         }
 
         @media (max-width: 1080px) {
           .dishes-grid {
-            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-template-columns: repeat(3, minmax(0, 1fr));
           }
         }
 
@@ -4280,7 +5062,7 @@ export function RestaurantPOS({
           justify-content: space-between;
           cursor: pointer;
           transition: all 0.12s ease;
-          min-height: 84px;
+          min-height: 92px;
           box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
           position: relative;
           overflow: hidden;
@@ -4394,13 +5176,13 @@ export function RestaurantPOS({
           display: flex;
           align-items: center;
           gap: 2px;
-          padding: 0 7px;
-          height: 22px;
+          padding: 0 9px;
+          height: 28px;
           background: #faf7f2;
           border: 1px solid #e7e0d3;
-          border-radius: 5px;
+          border-radius: 6px;
           color: #44403c;
-          font-size: 10.5px;
+          font-size: 11px;
           font-weight: 700;
           cursor: pointer;
           transition: all 0.12s ease;
@@ -4417,10 +5199,10 @@ export function RestaurantPOS({
           align-items: center;
           gap: 1px;
           background: #d99726;
-          border-radius: 5px;
+          border-radius: 6px;
           padding: 1px 2px;
           color: #ffffff;
-          height: 22px;
+          height: 28px;
         }
 
         .card-step-btn {
@@ -4430,10 +5212,10 @@ export function RestaurantPOS({
           display: flex;
           align-items: center;
           justify-content: center;
-          width: 19px;
-          height: 19px;
+          width: 26px;
+          height: 26px;
           cursor: pointer;
-          border-radius: 3px;
+          border-radius: 4px;
         }
 
         .card-step-btn:hover {
@@ -4441,9 +5223,9 @@ export function RestaurantPOS({
         }
 
         .card-qty {
-          font-size: 11.5px;
+          font-size: 12.5px;
           font-weight: 800;
-          min-width: 16px;
+          min-width: 20px;
           text-align: center;
         }
 
@@ -4491,9 +5273,9 @@ export function RestaurantPOS({
 
         /* COLUMN 3: BILLING & CHECKOUT TERMINAL */
         .pos-checkout-panel {
-          width: 350px;
-          min-width: 335px;
-          max-width: 365px;
+          width: 420px;
+          min-width: 400px;
+          max-width: 440px;
           background: #ffffff;
           display: flex;
           flex-direction: column;
@@ -4604,9 +5386,9 @@ export function RestaurantPOS({
           display: flex;
           align-items: center;
           justify-content: space-between;
-          height: 25px;
-          min-height: 25px;
-          max-height: 25px;
+          height: 32px;
+          min-height: 32px;
+          max-height: 32px;
           padding: 0 6px;
           border-bottom: 1px solid #faf7f2;
           background: #ffffff;
@@ -4621,7 +5403,7 @@ export function RestaurantPOS({
         .cart-item-left {
           display: flex;
           align-items: center;
-          gap: 4px;
+          gap: 5px;
           flex: 1;
           min-width: 0;
           overflow: hidden;
@@ -4629,8 +5411,8 @@ export function RestaurantPOS({
         }
 
         .cart-veg-dot {
-          width: 5px;
-          height: 5px;
+          width: 6px;
+          height: 6px;
           border-radius: 50%;
           flex-shrink: 0;
         }
@@ -4644,7 +5426,7 @@ export function RestaurantPOS({
         }
 
         .cart-item-name {
-          font-size: 11px;
+          font-size: 13.5px;
           font-weight: 600;
           color: #1c1917;
           white-space: nowrap;
@@ -4657,7 +5439,7 @@ export function RestaurantPOS({
           border: none;
           background: transparent;
           color: #e2a034;
-          font-size: 9px;
+          font-size: 10px;
           font-weight: 600;
           padding: 0 2px;
           margin: 0;
@@ -4678,7 +5460,7 @@ export function RestaurantPOS({
           padding: 0 3px;
           background: #fef3c7;
           color: #92400e;
-          font-size: 8.5px;
+          font-size: 9.5px;
           font-weight: 600;
           border-radius: 3px;
           max-width: 70px;
@@ -4692,7 +5474,7 @@ export function RestaurantPOS({
         .cart-item-right {
           display: flex;
           align-items: center;
-          gap: 5px;
+          gap: 6px;
           flex-shrink: 0;
         }
 
@@ -4700,17 +5482,17 @@ export function RestaurantPOS({
           display: flex;
           align-items: center;
           border: 1px solid #e7e0d3;
-          border-radius: 3px;
+          border-radius: 4px;
           padding: 0;
           background: #ffffff;
-          height: 18px;
+          height: 24px;
         }
 
         .cart-stepper button {
           border: none;
           background: transparent;
           color: #57534e;
-          padding: 0 3px;
+          padding: 0 5px;
           cursor: pointer;
           display: flex;
           align-items: center;
@@ -4723,19 +5505,19 @@ export function RestaurantPOS({
         }
 
         .cart-stepper span {
-          font-size: 11px;
+          font-size: 13px;
           font-weight: 700;
           color: #1c1917;
-          min-width: 14px;
+          min-width: 18px;
           text-align: center;
         }
 
         .cart-item-price {
-          font-size: 12px;
+          font-size: 14px;
           font-weight: 700;
           color: #1c1917;
           font-variant-numeric: tabular-nums;
-          min-width: 44px;
+          min-width: 52px;
           text-align: right;
           white-space: nowrap;
         }
@@ -4974,6 +5756,33 @@ export function RestaurantPOS({
           grid-template-columns: 1fr 1fr 1.5fr;
           gap: 5px;
           margin-top: 4px;
+        }
+
+        .print-on-settle-group {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 4px 18px;
+        }
+
+        .print-on-settle-toggle {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          margin-top: 8px;
+          padding: 6px 4px 2px;
+          font-size: 11px;
+          font-weight: 600;
+          color: #57534e;
+          cursor: pointer;
+          user-select: none;
+        }
+
+        .print-on-settle-toggle input[type="checkbox"] {
+          width: 15px;
+          height: 15px;
+          accent-color: #16a34a;
+          cursor: pointer;
         }
 
         .action-btn {

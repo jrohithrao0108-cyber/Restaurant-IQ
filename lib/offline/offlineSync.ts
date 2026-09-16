@@ -21,6 +21,18 @@ type SyncListener = (state: {
 // with zero user action needed.
 const AUTO_SYNC_INTERVAL_MS = 3500;
 
+// Wait before retry N (1-indexed: after the 1st failure, before the 2nd
+// attempt, etc.). Grows from a few seconds to 10 minutes, so a short blip
+// clears on the next tick or two while a longer outage doesn't burn through
+// every attempt in the first minute. Index 0 covers the first attempt,
+// which always fires immediately (no wait).
+const BACKOFF_SCHEDULE_MS = [0, 5_000, 15_000, 60_000, 180_000, 300_000, 600_000, 600_000];
+
+function backoffMsForAttempt(attemptsSoFar: number): number {
+  const idx = Math.min(attemptsSoFar, BACKOFF_SCHEDULE_MS.length - 1);
+  return BACKOFF_SCHEDULE_MS[idx];
+}
+
 class OfflineSyncManager {
   private listeners: Set<SyncListener> = new Set();
   private isSyncing = false;
@@ -91,7 +103,10 @@ class OfflineSyncManager {
   private async refreshCounts(): Promise<void> {
     try {
       const all = await getOfflineOrdersQueue(this.activeRestaurantId ?? undefined);
-      this.queuedCountCache = all.filter((o) => !o.permanentlyFailed).length;
+      // OPEN records are local-only running tabs, not a sync backlog — a
+      // restaurant with several occupied tables would otherwise
+      // permanently show "N pending sync," which isn't accurate.
+      this.queuedCountCache = all.filter((o) => !o.permanentlyFailed && o.orderPhase !== "OPEN").length;
       this.failedCountCache = all.filter((o) => o.permanentlyFailed).length;
     } catch (err) {
       console.error("Failed to refresh offline queue counts:", err);
@@ -129,16 +144,21 @@ class OfflineSyncManager {
   }
 
   /**
-   * Attempts to sync an offline dine-in order. Mirrors the online
-   * "3-hop waterfall" in RestaurantPOS.tsx: if the table already has an
-   * open order, merge into it instead of creating a duplicate order row.
+   * Pushes one finished table sitting to Supabase. Since syncAll() now
+   * filters out orderPhase "OPEN" items before they ever reach here (see
+   * above), everything arriving in this function is the final SETTLED
+   * state of a sitting — there's no more "leave it running as PENDING"
+   * case to branch on.
+   *
+   * The existing-open-order lookup below is a safety net, not the normal
+   * path: it only matters if a row is somehow still open for this table
+   * (e.g. left over from before this architecture). Either way we REPLACE
+   * that row's total/items rather than adding to them, since item.total/
+   * item.items is always the complete, authoritative state on its own.
    */
   private async syncOneOrder(item: QueuedOfflineOrder): Promise<any> {
     const safeCreatedBy = toValidUuidOrNull(item.createdByUserId);
-
-    // Backward compatible: anything queued before orderPhase existed behaves
-    // exactly as it did before (settle-and-close).
-    const isSettle = item.orderPhase !== "OPEN";
+    const nowIso = new Date().toISOString();
 
     let orderRecord: any = null;
     // Set when we're updating an already-open remote order rather than
@@ -161,24 +181,15 @@ class OfflineSyncManager {
       if (lookupError) throw lookupError;
 
       if (existingOpenOrder) {
-        // Full replace, not additive: `item.total`/`item.items` already
-        // represent the complete current state of the table's cart (see the
-        // matching invariant in offlineStorage.ts's enqueueOfflineOrder), so
-        // adding on top of the existing remote total would double-count
-        // everything that was already synced in a previous round.
+        // Full replace, not additive: item.total/item.items already
+        // represent the complete, final state of the sitting.
         const { data: updatedOrder, error: updateError } = await supabase
           .from("orders")
           .update({
             total: item.total,
             payment_mode: item.paymentMode,
-            // OPEN rounds (KOT/Save) keep the tab running as "PENDING";
-            // only a SETTLED round marks it COMPLETED.
-            status: isSettle ? item.status || "COMPLETED" : "PENDING",
-            // Only close the tab when this round is an actual settle.
-            // An OPEN round must leave closed_at untouched (null) so the
-            // *next* round for this table keeps finding and merging into
-            // the same order instead of spawning a new one.
-            closed_at: isSettle ? new Date().toISOString() : null,
+            status: item.status || "COMPLETED",
+            closed_at: nowIso,
           })
           .eq("id", existingOpenOrder.id)
           .select()
@@ -190,7 +201,7 @@ class OfflineSyncManager {
       }
     }
 
-    // No existing open order to merge into (or not a table order) -> insert new
+    // No existing open order to fall back into (the normal case) -> insert new
     if (!orderRecord) {
       const { data: newOrder, error: orderError } = await supabase
         .from("orders")
@@ -203,14 +214,11 @@ class OfflineSyncManager {
           channel: item.channel,
           payment_mode: item.paymentMode,
           total: item.total,
-          status: isSettle ? item.status || "COMPLETED" : "PENDING",
+          status: item.status || "COMPLETED",
           created_at: item.createdAt,
-          // Mirrors the online pair (executeSaveTableOrder / handleSaveOrder):
-          // a SETTLED round closes immediately on creation just like the
-          // online 3-hop waterfall does; an OPEN round (KOT/Save) is created
-          // as a running tab (closed_at: null) so later rounds for the same
-          // table merge into it instead of each spawning its own order.
-          closed_at: isSettle ? new Date().toISOString() : null,
+          // Always closes immediately: by the time anything reaches
+          // syncOneOrder it's already the final settled state.
+          closed_at: nowIso,
         })
         .select()
         .maybeSingle();
@@ -279,7 +287,25 @@ class OfflineSyncManager {
     this.isSyncing = true;
     this.notifyListeners();
 
-    const queue = await getPendingOfflineOrders(restaurantId ?? this.activeRestaurantId ?? undefined);
+    const rawQueue = await getPendingOfflineOrders(restaurantId ?? this.activeRestaurantId ?? undefined);
+    // OPEN items are running tabs that are intentionally local-only (see
+    // offlineStorage.ts) — they must never reach Supabase until Settle &
+    // Pay flips them to SETTLED. Anything still OPEN here just stays in
+    // IndexedDB; only SETTLED (or legacy items queued before this field
+    // existed, orderPhase === undefined) are eligible.
+    //
+    // Items that failed recently also get skipped until their backoff
+    // window has passed (see BACKOFF_SCHEDULE_MS below) — otherwise a
+    // stretch of flaky connectivity retries every 3.5s and burns through
+    // all attempts in well under a minute, giving up on orders that a
+    // slightly longer wait would have synced fine.
+    const now = Date.now();
+    const queue = rawQueue.filter((o) => {
+      if (o.orderPhase === "OPEN") return false;
+      if (!o.lastAttemptAt || !o.syncAttempts) return true;
+      const waitMs = backoffMsForAttempt(o.syncAttempts);
+      return now - new Date(o.lastAttemptAt).getTime() >= waitMs;
+    });
     if (queue.length === 0) {
       this.isSyncing = false;
       this.notifyListeners();
@@ -297,8 +323,24 @@ class OfflineSyncManager {
       try {
         const orderRecord = await this.syncOneOrder(item);
 
-        await removeOfflineOrder(item.tempId);
+        // If this delete fails, the record stays in the local queue — and
+        // since syncOneOrder just closed it remotely (closed_at set), a
+        // plain retry on the next tick would no longer find it as "the
+        // existing open order" and would INSERT A DUPLICATE row instead.
+        // Better to stop retrying it automatically and flag it for a human
+        // to clean up than to risk silently double-billing a table.
+        const removed = await removeOfflineOrder(item.tempId);
         synced++;
+
+        if (!removed) {
+          console.error(
+            `Order ${item.tempId} synced to Supabase (id ${orderRecord?.id}) but could not be removed from the local queue — flagging for manual review instead of risking a duplicate on retry.`
+          );
+          await updateOfflineOrder(item.tempId, {
+            lastError: `Already synced to cloud (order ${orderRecord?.id ?? "unknown"}) but couldn't clear the local copy. Safe to dismiss — do not retry.`,
+            permanentlyFailed: true,
+          });
+        }
 
         if (onOrderSynced) {
           onOrderSynced(item.tempId, orderRecord);
@@ -313,6 +355,7 @@ class OfflineSyncManager {
 
         await updateOfflineOrder(item.tempId, {
           syncAttempts: attempts,
+          lastAttemptAt: new Date().toISOString(),
           lastError: err?.message || "Sync failed",
           permanentlyFailed: givingUp,
         });
