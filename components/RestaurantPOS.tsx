@@ -9,6 +9,7 @@ import {
   Clock,
   Edit2,
   FileText,
+  Heart,
   History,
   LogOut,
   Minus,
@@ -88,6 +89,7 @@ export type Order = {
   // list. Reset when the sitting ends (Settle/Quick Settle/Delete).
   roundBreakdown?: Array<{
     round: number;
+    kotNumber?: number;
     items: Array<{ id: string; name: string; qty: number; notes?: string }>;
   }>;
 };
@@ -140,6 +142,29 @@ const CATEGORY_ICONS: Record<string, string> = {
   "Chinese": "🥡",
   "Pizza": "🍕",
   "Combos": "🍱",
+  "Burgers": "🍔",
+  "Coffee": "☕",
+  "Tea": "🍵",
+  "Chai": "🍵",
+  "Juices": "🧃",
+  "Lassi": "🥛",
+  "Ice Cream": "🍦",
+  "Mocktails": "🍹",
+  "Sandwiches": "🥪",
+  "Chaat": "🥙",
+  "Rolls": "🌯",
+  "Tiffins": "🥘",
+  "Idly": "🥟",
+  "Idli": "🥟",
+  "Dosa": "🫓",
+  "Bonda": "🧆",
+  "Vada": "🍩",
+  "Wada": "🍩",
+  "Uttapam": "🥞",
+  "Upma": "🥣",
+  "Pongal": "🥣",
+  "Sambar": "🍲",
+  "Rasam": "🍲",
   "Uncategorized": "🍴",
 };
 
@@ -304,6 +329,31 @@ export function RestaurantPOS({
   const [activeView, setActiveView] = useState<"POS" | "TABLES">("POS");
 
   const [selectedCat, setSelectedCat] = useState("All Dishes");
+  const FAVORITES_KEY = "restaurant_iq_favorite_dishes";
+  const [favoriteIds, setFavoriteIds] = useState<Set<string>>(() => {
+    if (typeof window === "undefined") return new Set();
+    try {
+      const raw = localStorage.getItem(FAVORITES_KEY);
+      return raw ? new Set(JSON.parse(raw)) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
+
+  function toggleFavorite(productId: string) {
+    setFavoriteIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(productId)) {
+        next.delete(productId);
+      } else {
+        next.add(productId);
+      }
+      try {
+        localStorage.setItem(FAVORITES_KEY, JSON.stringify(Array.from(next)));
+      } catch {}
+      return next;
+    });
+  }
   const [vegFilter, setVegFilter] = useState<"ALL" | "VEG" | "NON_VEG">("ALL");
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -801,7 +851,9 @@ export function RestaurantPOS({
 
   const filteredProducts = useMemo(() => {
     return activeProducts.filter((p) => {
-      if (selectedCat !== "All Dishes") {
+      if (selectedCat === "Favorites") {
+        if (!favoriteIds.has(p.id)) return false;
+      } else if (selectedCat !== "All Dishes") {
         if (normalizeCategory(p.category) !== selectedCat) return false;
       }
       const veg = isVeg(p.name, p.category);
@@ -814,7 +866,7 @@ export function RestaurantPOS({
       }
       return true;
     });
-  }, [activeProducts, selectedCat, vegFilter, searchQuery]);
+  }, [activeProducts, selectedCat, vegFilter, searchQuery, favoriteIds]);
 
   const cartQtyMap = useMemo(() => {
     const map = new Map<string, number>();
@@ -1274,13 +1326,10 @@ export function RestaurantPOS({
           // then "R2: Z" underneath, instead of one merged list. This
           // happens on Save too, not just KOT: Save = KOT-print, so a
           // round is a round whether or not a physical ticket fired.
-          newRoundBreakdown = [
-            ...newRoundBreakdown,
-            {
-              round: newRoundCount,
-              items: diffItems.map((i) => ({ id: i.id, name: i.name, qty: i.qty, notes: i.notes })),
-            },
-          ];
+          const newRoundEntry: (typeof newRoundBreakdown)[number] = {
+            round: newRoundCount,
+            items: diffItems.map((i) => ({ id: i.id, name: i.name, qty: i.qty, notes: i.notes })),
+          };
 
           // The daily KOT counter and the physical print stay strictly
           // tied to an actual print happening — Save creating a round
@@ -1288,6 +1337,7 @@ export function RestaurantPOS({
           // anything at the kitchen printer.
           if (shouldPrintKot) {
             const globalKotNumber = getNextDailyKotNumber();
+            newRoundEntry.kotNumber = globalKotNumber;
             const kotLabel = `KOT #${globalKotNumber} · Table ${cleanTable} · Round ${newRoundCount}`;
             try {
               printKitchenOrderTicket({
@@ -1303,8 +1353,46 @@ export function RestaurantPOS({
               console.warn("KOT print skipped or dialog closed:", e);
             }
           }
+
+          newRoundBreakdown = [...newRoundBreakdown, newRoundEntry];
         } else if (shouldPrintKot) {
-          showToast("No new items to send to the kitchen since the last KOT.", "info");
+          // Nothing NEW since the last round — but that's a reason to
+          // REPRINT the current round's ticket, not refuse to print at
+          // all. A jammed printer, a lost ticket, or the kitchen just
+          // asking "can you send that again" are all normal, and staff
+          // need a way to get another copy without it looking like a
+          // brand new round or consuming a new daily KOT number. The
+          // reprint reuses the exact same round + KOT number every time,
+          // no matter how many times it's printed.
+          if (priorRoundBreakdown.length === 0) {
+            showToast("Nothing to print yet for this table.", "info");
+          } else {
+            const lastRoundIdx = priorRoundBreakdown.length - 1;
+            const lastRound = priorRoundBreakdown[lastRoundIdx];
+            // A round created via Save (never actually KOT'd) has no
+            // kotNumber yet — this is really its FIRST print, so it earns
+            // a fresh number now, which then sticks for every future
+            // reprint of this same round.
+            const kotNumberForReprint = lastRound.kotNumber ?? getNextDailyKotNumber();
+            const kotLabel = `KOT #${kotNumberForReprint} · Table ${cleanTable} · Round ${lastRound.round} (Reprint)`;
+            try {
+              printKitchenOrderTicket({
+                restaurantName,
+                orderNumber: kotLabel,
+                table: cleanTable,
+                source,
+                items: lastRound.items,
+                serverName: serverName.trim() || undefined,
+                paperWidth: settings.paperWidth,
+              });
+              showToast(`Reprinted KOT #${kotNumberForReprint} (Round ${lastRound.round}).`, "success");
+            } catch (e) {
+              console.warn("KOT reprint skipped or dialog closed:", e);
+            }
+            newRoundBreakdown = priorRoundBreakdown.map((r, idx) =>
+              idx === lastRoundIdx ? { ...r, kotNumber: kotNumberForReprint } : r
+            );
+          }
         }
 
         // Reuse the SAME order id across every round of this sitting —
@@ -2033,7 +2121,7 @@ export function RestaurantPOS({
           {ORDER_CHANNELS.map((ch) => (
             <button
               key={ch.id}
-              className={`pos-channel-btn ${source === ch.id ? "active" : ""}`}
+              className={`pos-channel-btn channel-${ch.id.toLowerCase()} ${source === ch.id ? "active" : ""}`}
               onClick={() => handleSelectChannel(ch.id)}
             >
               <span className="channel-icon">{ch.icon}</span>
@@ -2432,6 +2520,17 @@ export function RestaurantPOS({
               </div>
 
               <div className="vertical-cat-list">
+                <button
+                  type="button"
+                  className={`vertical-cat-btn favorites-cat-btn ${selectedCat === "Favorites" ? "active" : ""}`}
+                  onClick={() => setSelectedCat("Favorites")}
+                >
+                  <span className="cat-icon">❤️</span>
+                  <span className="cat-name">Favorites</span>
+                  <span className="cat-badge">{favoriteIds.size}</span>
+                  {selectedCat === "Favorites" && <div className="cat-active-indicator" />}
+                </button>
+
                 {categoriesWithCounts.map((cat) => {
                   const icon = CATEGORY_ICONS[cat.name] || "🍴";
                   const isSelected = selectedCat === cat.name;
@@ -2546,6 +2645,7 @@ export function RestaurantPOS({
                 {filteredProducts.map((p) => {
                   const veg = isVeg(p.name, p.category);
                   const qtyInCart = cartQtyMap.get(p.id) || 0;
+                  const isFav = favoriteIds.has(p.id);
 
                   return (
                     <div
@@ -2553,6 +2653,18 @@ export function RestaurantPOS({
                       className={`dish-card ${qtyInCart > 0 ? "in-cart" : ""}`}
                       onClick={() => addToCart(p)}
                     >
+                      <button
+                        type="button"
+                        className={`dish-fav-btn ${isFav ? "active" : ""}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleFavorite(p.id);
+                        }}
+                        title={isFav ? "Remove from favorites" : "Add to favorites"}
+                      >
+                        <Heart size={13} fill={isFav ? "#ef4444" : "none"} />
+                      </button>
+
                       <div className="dish-card-top">
                         <div className={`fssai-symbol ${veg ? "veg" : "non-veg"}`}>
                           <div className="symbol-inner" />
@@ -3823,13 +3935,13 @@ export function RestaurantPOS({
         .pos-channel-btn {
           display: flex;
           align-items: center;
-          gap: 5px;
-          padding: 4px 9px;
-          border-radius: 5px;
+          gap: 6px;
+          padding: 7px 14px;
+          border-radius: 6px;
           border: none;
           background: transparent;
           color: #78716c;
-          font-size: 11.5px;
+          font-size: 13px;
           font-weight: 600;
           cursor: pointer;
           transition: all 0.15s ease;
@@ -3846,6 +3958,29 @@ export function RestaurantPOS({
           color: #ffffff;
           font-weight: 700;
           box-shadow: 0 1px 4px rgba(217, 151, 38, 0.3);
+        }
+
+        /* Subtle brand tint even when NOT selected, so the group reads
+           as distinct channels at a glance, not just "one highlighted
+           button among identical gray ones." */
+        .pos-channel-btn.channel-dine_in:not(.active) {
+          background: rgba(217, 151, 38, 0.08);
+          color: #b47814;
+        }
+
+        .pos-channel-btn.channel-takeaway:not(.active) {
+          background: rgba(59, 130, 246, 0.08);
+          color: #1d4ed8;
+        }
+
+        .pos-channel-btn.channel-swiggy:not(.active) {
+          background: rgba(249, 115, 22, 0.1);
+          color: #c2410c;
+        }
+
+        .pos-channel-btn.channel-zomato:not(.active) {
+          background: rgba(239, 68, 68, 0.1);
+          color: #b91c1c;
         }
 
         /* VIEW SWITCHER IN TOP BAR */
@@ -4841,9 +4976,9 @@ export function RestaurantPOS({
           position: relative;
           display: flex;
           align-items: center;
-          gap: 8px;
-          height: 38px;
-          padding: 0 8px;
+          gap: 10px;
+          height: 48px;
+          padding: 0 10px;
           border-radius: 6px;
           border: 1px solid transparent;
           background: transparent;
@@ -4866,15 +5001,32 @@ export function RestaurantPOS({
           font-weight: 700;
         }
 
+        .favorites-cat-btn {
+          margin-bottom: 6px;
+          padding-bottom: 6px;
+          border-bottom: 1px dashed #ede7dc;
+        }
+
+        .favorites-cat-btn.active {
+          background: #fef2f2;
+          color: #dc2626;
+          border-color: #fecaca;
+        }
+
+        .favorites-cat-btn.active .cat-badge {
+          background: #fecaca;
+          color: #b91c1c;
+        }
+
         .cat-icon {
-          font-size: 16px;
+          font-size: 20px;
           line-height: 1;
           flex-shrink: 0;
         }
 
         .cat-name {
           flex: 1;
-          font-size: 12.5px;
+          font-size: 14.5px;
           font-weight: 600;
           white-space: nowrap;
           overflow: hidden;
@@ -4882,11 +5034,11 @@ export function RestaurantPOS({
         }
 
         .cat-badge {
-          font-size: 10.5px;
+          font-size: 12px;
           font-weight: 700;
           background: #faf7f2;
           color: #78716c;
-          padding: 1px 5px;
+          padding: 2px 6px;
           border-radius: 4px;
         }
 
@@ -5122,6 +5274,33 @@ export function RestaurantPOS({
           overflow: hidden;
         }
 
+        .dish-fav-btn {
+          position: absolute;
+          top: 3px;
+          right: 3px;
+          z-index: 2;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 18px;
+          height: 18px;
+          padding: 0;
+          border: none;
+          background: transparent;
+          color: #d6d3d1;
+          cursor: pointer;
+          transition: all 0.12s ease;
+        }
+
+        .dish-fav-btn:hover {
+          color: #ef4444;
+          transform: scale(1.15);
+        }
+
+        .dish-fav-btn.active {
+          color: #ef4444;
+        }
+
         .dish-card:hover {
           border-color: #93c5fd;
           transform: translateY(-1px);
@@ -5139,6 +5318,7 @@ export function RestaurantPOS({
           justify-content: space-between;
           align-items: center;
           margin-bottom: 2px;
+          padding-right: 16px;
         }
 
         .dish-indicator-group {
