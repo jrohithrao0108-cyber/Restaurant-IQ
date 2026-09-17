@@ -804,6 +804,17 @@ export function RestaurantPOS({
   // of each one needing its own filter.
   const activeTables = thirtyTables.filter((t) => t.isActive !== false);
 
+  // The real, dynamic total — not a hardcoded 30. A restaurant can now
+  // have any number of tables (sections support adding more freely, and
+  // disabling removes them from the working count). Falls back to 30
+  // ONLY when restaurantTables is genuinely empty (the fallback/demo
+  // scenario thirtyTables itself falls back to), matching prior behavior
+  // for a brand-new restaurant that hasn't loaded real data yet.
+  const totalActiveTableCount =
+    restaurantTables && restaurantTables.length > 0
+      ? restaurantTables.filter((t) => t.isActive !== false).length
+      : 30;
+
   const categoriesWithCounts = useMemo(() => {
     const counts: Record<string, number> = {};
 
@@ -2318,7 +2329,7 @@ export function RestaurantPOS({
               onClick={() => setActiveView("TABLES")}
             >
               <TableIcon size={13} />
-              <span>Tables ({occupiedTableNumbers.size}/30)</span>
+              <span>Tables ({occupiedTableNumbers.size}/{totalActiveTableCount})</span>
             </button>
           </div>
         ) : (
@@ -2525,10 +2536,10 @@ export function RestaurantPOS({
           <div className="pos-tables-screen">
             <div className="tables-screen-toolbar">
               <div className="tables-toolbar-left">
-                <h2>Tables Floor (30 Tables)</h2>
+                <h2>Tables Floor ({totalActiveTableCount} Tables)</h2>
                 <div className="tables-stat-badge vacant">
                   <span className="status-dot green" />
-                  <span>Vacant: <b>{30 - occupiedTableNumbers.size}</b></span>
+                  <span>Vacant: <b>{Math.max(0, totalActiveTableCount - occupiedTableNumbers.size)}</b></span>
                 </div>
                 <div className="tables-stat-badge occupied">
                   <span className="status-dot red" />
@@ -3512,7 +3523,7 @@ export function RestaurantPOS({
             onClick={(e) => e.stopPropagation()}
           >
             <div className="modal-head">
-              <h3>Select Dine-In Table (T1 - T30)</h3>
+              <h3>Select Dine-In Table</h3>
               <button
                 type="button"
                 onClick={() => {
@@ -7300,6 +7311,9 @@ export function RestaurantPOS({
           display: flex;
           flex-direction: column;
           gap: 10px;
+          overflow-y: auto;
+          flex: 1;
+          min-height: 0;
         }
 
         .settings-row {

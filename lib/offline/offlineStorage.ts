@@ -333,10 +333,23 @@ type DailyCounterState = {
   count: number;
 };
 
+// Same constant and approach as getFastISTParts/getISTDateStr in
+// RestaurantIQDashboard.tsx — kept in sync deliberately, not just
+// coincidentally similar. Computing IST this way (fixed +5:30 offset,
+// then reading back with UTC getters) gives the correct Indian calendar
+// date regardless of what timezone the device's OS/browser actually
+// happens to be set to — the previous version used the device's LOCAL
+// date getters directly, which only worked if the terminal's OS clock
+// was correctly configured to IST. A misconfigured device (set to UTC,
+// or any other zone) would reset the counter at the wrong moment,
+// exactly the risk being closed here.
+const IST_OFFSET_MS = 19800000; // 5 hours 30 minutes
+
 function todayDateKey(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-    d.getDate()
+  const istMs = Date.now() + IST_OFFSET_MS;
+  const d = new Date(istMs);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(
+    d.getUTCDate()
   ).padStart(2, "0")}`;
 }
 

@@ -297,22 +297,29 @@ export function RestaurantIQDashboard({
   // How far back internalHistoricalOrders currently covers (IST date
   // string). Used to detect when a custom range picks a start date further
   // back than what's loaded, so that can be fetched on demand instead of
-  // baking every possible custom selection into the default load.
   const [loadedHistoryStartStr, setLoadedHistoryStartStr] = useState<string | null>(null);
   const wideningHistoryRef = useRef(false);
   const [loading, setLoading] = useState(true);
   const [hasFetched, setHasFetched] = useState(false);
   const [localRefreshing, setLocalRefreshing] = useState(false);
 
-  // Navigation & Drilldown State
-  const [dimension, setDimension] = useState<"channels" | "hours" | "menu">("channels");
+  // Navigation & Drilldown State (Order Type, Menu Category, Payment Mode, Hours)
+  const [dimension, setDimension] = useState<
+    "order_type" | "menu_category" | "payment_mode" | "hours"
+  >("order_type");
+  const [timeframeMode, setTimeframeMode] = useState<"today" | "mtd">("today");
+  const [chartMetric, setChartMetric] = useState<"orders" | "revenue">("revenue");
   const [selectedItemId, setSelectedItemId] = useState<string>("ZOMATO");
-  const [dateRange, setDateRange] = useState<"today" | "7days" | "30days" | "custom">("7days");
+  // Whether the full-page category drilldown is open. Clicking a bar in
+  // the horizontal bar chart opens this exactly like clicking "Today"/
+  // "MTD" under Gross Revenue opens revenueTrendView below — a full
+  // takeover of this section with its own back button, not a side panel.
+  const [dimensionDrilldownOpen, setDimensionDrilldownOpen] = useState(false);
+  const [dateRange, setDateRange] = useState<"today" | "7days" | "15days" | "mtd" | "30days" | "year_by_month" | "custom">("today");
   const [graphMetric, setGraphMetric] = useState<"both" | "rev" | "orders">("both");
 
   // Current Hyderabad time references (reactive every 30s)
   const [currentTime, setCurrentTime] = useState<Date>(() => new Date());
-
   useEffect(() => {
     const timer = setInterval(() => {
       setCurrentTime(new Date());
@@ -654,6 +661,30 @@ export function RestaurantIQDashboard({
       };
     }
 
+    // No 3-week same-weekday history yet (a new restaurant, or simply no
+    // matching orders on those exact past weekdays) — fall back to
+    // yesterday's same-time-of-day performance rather than a flat zero
+    // baseline, which would make every "vs baseline" comparison read as
+    // a meaningless "+100% up" no matter how the day is actually going.
+    const yesterdayMs = now.getTime() - 86400000;
+    const yesterdayISTDate = getFastISTParts(yesterdayMs).dateStr;
+    const yesterdayOrders = historicalOrdersByDate.get(yesterdayISTDate);
+
+    if (yesterdayOrders && yesterdayOrders.length > 0) {
+      let dayRev = 0;
+      let count = 0;
+      for (let i = 0; i < yesterdayOrders.length; i++) {
+        const o = yesterdayOrders[i];
+        if (o.istMsIntoDay <= nowIST.msIntoDay && (!filterFn || filterFn(o))) {
+          dayRev += Number(o.total) || 0;
+          count++;
+        }
+      }
+      if (dayRev > 0 || count > 0) {
+        return { baselineRev: Math.round(dayRev), baselineOrders: count, weeksSampled: 0 };
+      }
+    }
+
     return { baselineRev: 0, baselineOrders: 0, weeksSampled: 0 };
   }
 
@@ -680,6 +711,47 @@ export function RestaurantIQDashboard({
         ? "+100.0"
         : "0.0";
 
+    // MTD (Month-To-Date) Calculations in Hyderabad IST
+    const currentMonthPrefix = todayISTStr.slice(0, 7); // e.g. "2026-09"
+    const mtdDays = parseInt(todayISTStr.slice(8, 10), 10) || 1;
+    const monthShortName = now.toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", month: "short" });
+
+    const seenMtdOrderIds = new Set<string>();
+    let mtdRev = 0;
+    let mtdOrders = 0;
+
+    for (let i = 0; i < todayOrders.length; i++) {
+      const o = todayOrders[i];
+      const oid = String(o.databaseId || o.id);
+      if (oid && !seenMtdOrderIds.has(oid)) {
+        seenMtdOrderIds.add(oid);
+        mtdRev += Number(o.total) || 0;
+        mtdOrders++;
+      }
+    }
+
+    for (let i = 0; i < historicalOrders.length; i++) {
+      const o = historicalOrders[i];
+      const dateStr = o.istDateStr || (o.createdAt ? getFastISTParts(o.createdAt).dateStr : "");
+      if (dateStr && dateStr.startsWith(currentMonthPrefix)) {
+        const oid = String(o.databaseId || o.id);
+        if (oid && !seenMtdOrderIds.has(oid)) {
+          seenMtdOrderIds.add(oid);
+          mtdRev += Number(o.total) || 0;
+          mtdOrders++;
+        }
+      }
+    }
+
+    // Fallback: If limited history was loaded into memory, estimate MTD pacing from baseline and days
+    if (mtdRev === 0 && todayRev > 0) {
+      mtdRev = todayRev * mtdDays;
+      mtdOrders = todayCount * mtdDays;
+    }
+
+    const mtdAvgDailyRev = Math.round(mtdRev / Math.max(1, mtdDays));
+    const mtdAvgDailyOrders = Math.round(mtdOrders / Math.max(1, mtdDays));
+
     return {
       todayRev,
       baselineRev,
@@ -692,8 +764,167 @@ export function RestaurantIQDashboard({
       ordersGrowthPct: (ordersDelta >= 0 ? "+" : "") + ordersGrowthPct + "%",
       ordersUp: ordersDelta >= 0,
       weeksSampled,
+      mtdRev,
+      mtdOrders,
+      mtdDays,
+      mtdAvgDailyRev,
+      mtdAvgDailyOrders,
+      monthShortName,
     };
-  }, [todayOrders, historicalOrders, nowIST.msIntoDay]);
+  }, [todayOrders, historicalOrders, nowIST.msIntoDay, todayISTStr, now]);
+
+  // Full list of deduplicated MTD orders (from 1st of month to today)
+  const mtdOrdersList = useMemo(() => {
+    const currentMonthPrefix = todayISTStr.slice(0, 7);
+    const seen = new Set<string>();
+    const list: Order[] = [];
+    for (let i = 0; i < todayOrders.length; i++) {
+      const o = todayOrders[i];
+      const oid = String(o.databaseId || o.id);
+      if (oid && !seen.has(oid)) {
+        seen.add(oid);
+        list.push(o);
+      }
+    }
+    for (let i = 0; i < historicalOrders.length; i++) {
+      const o = historicalOrders[i];
+      const dateStr = o.istDateStr || (o.createdAt ? getFastISTParts(o.createdAt).dateStr : "");
+      if (dateStr && dateStr.startsWith(currentMonthPrefix)) {
+        const oid = String(o.databaseId || o.id);
+        if (oid && !seen.has(oid)) {
+          seen.add(oid);
+          list.push(o);
+        }
+      }
+    }
+    return list;
+  }, [todayOrders, historicalOrders, todayISTStr]);
+
+  // Active orders for dimension breakdown (switches dynamically between Today and MTD)
+  const activePeriodOrders = useMemo(() => {
+    return timeframeMode === "mtd" ? mtdOrdersList : todayOrders;
+  }, [timeframeMode, mtdOrdersList, todayOrders]);
+
+  const activePeriodTotalRev = useMemo(() => {
+    return timeframeMode === "mtd" ? (topMetrics.mtdRev || 1) : (topMetrics.todayRev || 1);
+  }, [timeframeMode, topMetrics.mtdRev, topMetrics.todayRev]);
+
+  // Day-by-Day Revenue & Volume Boxes for previous days & MTD
+  const dayBoxes = useMemo(() => {
+    const dailyMap = new Map<string, { rev: number; orders: number }>();
+    const channelCounter = new Map<string, Map<string, number>>();
+
+    const seen = new Set<string>();
+    const allOrdersList: Order[] = [];
+    for (const o of todayOrders) {
+      const oid = String(o.databaseId || o.id);
+      if (oid && !seen.has(oid)) {
+        seen.add(oid);
+        allOrdersList.push(o);
+      }
+    }
+    for (const o of historicalOrders) {
+      const oid = String(o.databaseId || o.id);
+      if (oid && !seen.has(oid)) {
+        seen.add(oid);
+        allOrdersList.push(o);
+      }
+    }
+
+    allOrdersList.forEach((o) => {
+      const dStr = o.istDateStr || (o.createdAt ? getFastISTParts(o.createdAt).dateStr : "");
+      if (!dStr) return;
+      const cur = dailyMap.get(dStr) || { rev: 0, orders: 0 };
+      cur.rev += Number(o.total) || 0;
+      cur.orders += 1;
+      dailyMap.set(dStr, cur);
+
+      const chMap = channelCounter.get(dStr) || new Map<string, number>();
+      const ch = o.source || "DINE_IN";
+      chMap.set(ch, (chMap.get(ch) || 0) + 1);
+      channelCounter.set(dStr, chMap);
+    });
+
+    const datesToDisplay: string[] = [];
+    const currentMonthPrefix = todayISTStr.slice(0, 7);
+    const mtdDaysCount = parseInt(todayISTStr.slice(8, 10), 10) || 1;
+
+    if (dateRange === "mtd" || (timeframeMode === "mtd" && dateRange !== "custom" && dateRange !== "7days" && dateRange !== "30days")) {
+      for (let dayNum = mtdDaysCount; dayNum >= 1; dayNum--) {
+        datesToDisplay.push(`${currentMonthPrefix}-${String(dayNum).padStart(2, "0")}`);
+      }
+    } else if (dateRange === "custom" && customStart && customEnd) {
+      const startMs = new Date(`${customStart}T00:00:00+05:30`).getTime();
+      const endMs = new Date(`${customEnd}T23:59:59+05:30`).getTime();
+      const diff = Math.min(60, Math.max(1, Math.round((endMs - startMs) / 86400000)));
+      for (let i = 0; i < diff; i++) {
+        const dMs = endMs - i * 86400000;
+        datesToDisplay.push(getFastISTParts(dMs).dateStr);
+      }
+    } else if (dateRange === "30days") {
+      for (let i = 0; i < 30; i++) {
+        const dMs = now.getTime() - i * 86400000;
+        datesToDisplay.push(getFastISTParts(dMs).dateStr);
+      }
+    } else if (dateRange === "15days") {
+      for (let i = 0; i < 15; i++) {
+        const dMs = now.getTime() - i * 86400000;
+        datesToDisplay.push(getFastISTParts(dMs).dateStr);
+      }
+    } else {
+      for (let i = 0; i < 7; i++) {
+        const dMs = now.getTime() - i * 86400000;
+        datesToDisplay.push(getFastISTParts(dMs).dateStr);
+      }
+    }
+
+    let runningCum = 0;
+    const sortedForward = [...datesToDisplay].sort();
+    const cumMap = new Map<string, number>();
+    sortedForward.forEach((dStr) => {
+      const s = dailyMap.get(dStr);
+      runningCum += s ? s.rev : 0;
+      cumMap.set(dStr, runningCum);
+    });
+
+    return datesToDisplay.map((dStr) => {
+      const s = dailyMap.get(dStr) || { rev: 0, orders: 0 };
+      const aov = s.orders > 0 ? Math.round(s.rev / s.orders) : 0;
+      const isToday = dStr === todayISTStr;
+
+      const dayDate = new Date(`${dStr}T12:00:00+05:30`);
+      const dayName = dayDate.toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", weekday: "short" });
+      const dayNum = dayDate.toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", day: "numeric", month: "short" });
+
+      const chMap = channelCounter.get(dStr);
+      let topCh = "Dine-In";
+      let maxChCount = 0;
+      if (chMap) {
+        chMap.forEach((cnt, ch) => {
+          if (cnt > maxChCount) {
+            maxChCount = cnt;
+            topCh = ch === "ZOMATO" ? "Zomato" : ch === "SWIGGY" ? "Swiggy" : ch === "DINE_IN" ? "Dine-In" : "Takeaway";
+          }
+        });
+      }
+
+      const baselineForDay = topMetrics.baselineRev || 1;
+      const pacingPct = baselineForDay > 0 ? Math.round(((s.rev - baselineForDay) / baselineForDay) * 100) : 0;
+
+      return {
+        dateStr: dStr,
+        label: `${dayName}, ${dayNum}`,
+        isToday,
+        rev: s.rev,
+        orders: s.orders,
+        aov,
+        topChannel: topCh,
+        cumRev: cumMap.get(dStr) || s.rev,
+        pacingPct,
+        pacingUp: pacingPct >= 0,
+      };
+    });
+  }, [todayOrders, historicalOrders, todayISTStr, dateRange, timeframeMode, customStart, customEnd, now, topMetrics.baselineRev]);
 
   /* =========================================================
      DIMENSION BREAKDOWN LISTS
@@ -743,27 +974,32 @@ export function RestaurantIQDashboard({
       },
     ];
 
-    const totalRevAll = topMetrics.todayRev || 1;
+    const totalRevAll = activePeriodTotalRev;
+    const isMtd = timeframeMode === "mtd";
+    const mtdMultiplier = isMtd ? Math.max(1, topMetrics.mtdDays) : 1;
 
     return channelConfigs.map((cfg) => {
-      const chOrders = todayOrders.filter((o) => o.source === cfg.id);
+      const chOrders = activePeriodOrders.filter((o) => o.source === cfg.id);
       const rev = chOrders.reduce((s, o) => s + (Number(o.total) || 0), 0);
       const count = chOrders.length;
       const sharePct = Math.round((rev / totalRevAll) * 100);
 
       const base = calculateSameTimeBaseline((o) => o.source === cfg.id);
-      const revDelta = rev - base.baselineRev;
-      const orderDelta = count - base.baselineOrders;
+      const baseRevScaled = isMtd ? Math.round(base.baselineRev * mtdMultiplier) : base.baselineRev;
+      const baseOrdersScaled = isMtd ? Math.round(base.baselineOrders * mtdMultiplier) : base.baselineOrders;
+
+      const revDelta = rev - baseRevScaled;
+      const orderDelta = count - baseOrdersScaled;
 
       const revGrowth =
-        base.baselineRev > 0
-          ? ((revDelta / base.baselineRev) * 100).toFixed(1)
+        baseRevScaled > 0
+          ? ((revDelta / baseRevScaled) * 100).toFixed(1)
           : rev > 0
           ? "+100.0"
           : "0.0";
       const orderGrowth =
-        base.baselineOrders > 0
-          ? ((orderDelta / base.baselineOrders) * 100).toFixed(1)
+        baseOrdersScaled > 0
+          ? ((orderDelta / baseOrdersScaled) * 100).toFixed(1)
           : count > 0
           ? "+100.0"
           : "0.0";
@@ -790,7 +1026,7 @@ export function RestaurantIQDashboard({
         filterFn: (o: Order) => o.source === cfg.id,
       };
     });
-  }, [todayOrders, historicalOrders, topMetrics.todayRev, nowIST.msIntoDay]);
+  }, [activePeriodOrders, activePeriodTotalRev, historicalOrders, timeframeMode, topMetrics.mtdDays, nowIST.msIntoDay]);
 
   // 2. Hour Shifts Breakdown in Hyderabad IST
   const hourCards = useMemo(() => {
@@ -827,24 +1063,30 @@ export function RestaurantIQDashboard({
       },
     ];
 
+    const isMtd = timeframeMode === "mtd";
+    const mtdMultiplier = isMtd ? Math.max(1, topMetrics.mtdDays) : 1;
+
     return shiftConfigs.map((cfg) => {
-      const shiftOrders = todayOrders.filter((o) => cfg.hourFilter(o.istHour));
+      const shiftOrders = activePeriodOrders.filter((o) => cfg.hourFilter(o.istHour));
       const rev = shiftOrders.reduce((s, o) => s + (Number(o.total) || 0), 0);
       const count = shiftOrders.length;
 
       const base = calculateSameTimeBaseline((o) => cfg.hourFilter(o.istHour));
-      const revDelta = rev - base.baselineRev;
-      const orderDelta = count - base.baselineOrders;
+      const baseRevScaled = isMtd ? Math.round(base.baselineRev * mtdMultiplier) : base.baselineRev;
+      const baseOrdersScaled = isMtd ? Math.round(base.baselineOrders * mtdMultiplier) : base.baselineOrders;
+
+      const revDelta = rev - baseRevScaled;
+      const orderDelta = count - baseOrdersScaled;
 
       const revGrowth =
-        base.baselineRev > 0
-          ? ((revDelta / base.baselineRev) * 100).toFixed(1)
+        baseRevScaled > 0
+          ? ((revDelta / baseRevScaled) * 100).toFixed(1)
           : rev > 0
           ? "+100.0"
           : "0.0";
       const orderGrowth =
-        base.baselineOrders > 0
-          ? ((orderDelta / base.baselineOrders) * 100).toFixed(1)
+        baseOrdersScaled > 0
+          ? ((orderDelta / baseOrdersScaled) * 100).toFixed(1)
           : count > 0
           ? "+100.0"
           : "0.0";
@@ -871,17 +1113,19 @@ export function RestaurantIQDashboard({
         filterFn: (o: Order) => cfg.hourFilter(o.istHour),
       };
     });
-  }, [todayOrders, historicalOrders, nowIST.msIntoDay]);
+  }, [activePeriodOrders, historicalOrders, timeframeMode, topMetrics.mtdDays, nowIST.msIntoDay]);
 
   // 3. Menu Categories Breakdown
   const menuCards = useMemo(() => {
     const catMap = new Map<string, { rev: number; count: number }>();
-    const totalRevAll = topMetrics.todayRev || 1;
+    const totalRevAll = activePeriodTotalRev;
+    const isMtd = timeframeMode === "mtd";
+    const mtdMultiplier = isMtd ? Math.max(1, topMetrics.mtdDays) : 1;
 
     const initialCats = ["Rice & Biryani", "Starters", "Main Course", "Breads", "Desserts", "Beverages"];
     initialCats.forEach((c) => catMap.set(c, { rev: 0, count: 0 }));
 
-    todayOrders.forEach((o) => {
+    activePeriodOrders.forEach((o) => {
       o.items.forEach((it) => {
         const rawCat = it.category || "Main Course";
         const cat = rawCat === "Mains" ? "Main Course" : rawCat;
@@ -912,16 +1156,17 @@ export function RestaurantIQDashboard({
         })
       );
 
-      // Historical orders omit child item rows for performance, so if item-level baseline is 0,
-      // benchmark against overall baseline scaled by category share of revenue/orders
+      const baseRevScaled = isMtd ? Math.round(base.baselineRev * mtdMultiplier) : base.baselineRev;
+      const baseOrdersScaled = isMtd ? Math.round(base.baselineOrders * mtdMultiplier) : base.baselineOrders;
+
       const estimatedBaseRev =
-        base.baselineRev > 0
-          ? base.baselineRev
-          : Math.round(topMetrics.baselineRev * (stats.rev / totalRevAll));
+        baseRevScaled > 0
+          ? baseRevScaled
+          : Math.round(topMetrics.baselineRev * (isMtd ? mtdMultiplier : 1) * (stats.rev / totalRevAll));
       const estimatedBaseOrders =
-        base.baselineOrders > 0
-          ? base.baselineOrders
-          : Math.round(topMetrics.baselineOrders * (stats.count / (topMetrics.todayCount || 1)));
+        baseOrdersScaled > 0
+          ? baseOrdersScaled
+          : Math.round(topMetrics.baselineOrders * (isMtd ? mtdMultiplier : 1) * (stats.count / (isMtd ? (topMetrics.mtdOrders || 1) : (topMetrics.todayCount || 1))));
 
       const revDelta = stats.rev - estimatedBaseRev;
       const orderDelta = stats.count - estimatedBaseOrders;
@@ -965,14 +1210,165 @@ export function RestaurantIQDashboard({
           }),
       };
     });
-  }, [todayOrders, historicalOrders, topMetrics.todayRev, nowIST.msIntoDay]);
+  }, [activePeriodOrders, activePeriodTotalRev, historicalOrders, timeframeMode, topMetrics.mtdDays, topMetrics.mtdOrders, topMetrics.todayCount, topMetrics.baselineRev, topMetrics.baselineOrders, nowIST.msIntoDay]);
 
-  // Active items list based on dimension
+  // 4. Payment Modes Breakdown
+  const paymentCards = useMemo(() => {
+    const paymentConfigs = [
+      {
+        id: "UPI",
+        name: "UPI & QR Payments",
+        icon: "📱",
+        iconBg: "#059669",
+        tag: "Instant Digital",
+        tagColor: "rgba(16, 185, 129, 0.15)",
+        tagTextColor: "#10b981",
+        matcher: (o: Order) => {
+          const s = (o.source || "").toUpperCase();
+          const p = (o.payment || "").toUpperCase();
+          if (s === "ZOMATO" || s === "SWIGGY") return false;
+          return (
+            p.includes("UPI") ||
+            p.includes("GPAY") ||
+            p.includes("PHONEPE") ||
+            p.includes("PAYTM") ||
+            (!p.includes("CASH") && !p.includes("CARD"))
+          );
+        },
+      },
+      {
+        id: "AGGREGATOR",
+        name: "Aggregator Escrow",
+        icon: "🛵",
+        iconBg: "#ea580c",
+        tag: "Swiggy & Zomato",
+        tagColor: "rgba(249, 115, 22, 0.15)",
+        tagTextColor: "#f97316",
+        matcher: (o: Order) => {
+          const s = (o.source || "").toUpperCase();
+          const p = (o.payment || "").toUpperCase();
+          return (
+            s === "ZOMATO" ||
+            s === "SWIGGY" ||
+            p.includes("ZOMATO") ||
+            p.includes("SWIGGY") ||
+            p.includes("AGGREGATOR") ||
+            p.includes("ESCROW")
+          );
+        },
+      },
+      {
+        id: "CASH",
+        name: "Counter Cash",
+        icon: "💵",
+        iconBg: "#16a34a",
+        tag: "Direct Cash",
+        tagColor: "rgba(34, 197, 94, 0.15)",
+        tagTextColor: "#22c55e",
+        matcher: (o: Order) => {
+          const p = (o.payment || "").toUpperCase();
+          return p.includes("CASH");
+        },
+      },
+      {
+        id: "CARD",
+        name: "Card (POS Terminal)",
+        icon: "💳",
+        iconBg: "#2563eb",
+        tag: "Credit / Debit",
+        tagColor: "rgba(37, 99, 235, 0.15)",
+        tagTextColor: "#3b82f6",
+        matcher: (o: Order) => {
+          const p = (o.payment || "").toUpperCase();
+          return p.includes("CARD") || p.includes("POS");
+        },
+      },
+    ];
+
+    const totalRevAll = activePeriodTotalRev;
+    const isMtd = timeframeMode === "mtd";
+    const mtdMultiplier = isMtd ? Math.max(1, topMetrics.mtdDays) : 1;
+
+    return paymentConfigs.map((cfg) => {
+      const pmOrders = activePeriodOrders.filter(cfg.matcher);
+      const rev = pmOrders.reduce((s, o) => s + (Number(o.total) || 0), 0);
+      const count = pmOrders.length;
+      const sharePct = Math.round((rev / totalRevAll) * 100);
+
+      const base = calculateSameTimeBaseline(cfg.matcher);
+      const baseRevScaled = isMtd ? Math.round(base.baselineRev * mtdMultiplier) : base.baselineRev;
+      const baseOrdersScaled = isMtd ? Math.round(base.baselineOrders * mtdMultiplier) : base.baselineOrders;
+
+      const revDelta = rev - baseRevScaled;
+      const orderDelta = count - baseOrdersScaled;
+
+      const revGrowth =
+        baseRevScaled > 0
+          ? ((revDelta / baseRevScaled) * 100).toFixed(1)
+          : rev > 0
+          ? "+100.0"
+          : "0.0";
+      const orderGrowth =
+        baseOrdersScaled > 0
+          ? ((orderDelta / baseOrdersScaled) * 100).toFixed(1)
+          : count > 0
+          ? "+100.0"
+          : "0.0";
+
+      return {
+        id: cfg.id,
+        name: cfg.name,
+        icon: cfg.icon,
+        iconBg: cfg.iconBg,
+        tag: `${sharePct}% of Total`,
+        tagColor: cfg.tagColor,
+        tagTextColor: cfg.tagTextColor,
+        rev,
+        revGrowth: (revDelta >= 0 ? "▲ " : "▼ ") + Math.abs(Number(revGrowth)) + "%",
+        revUp: revDelta >= 0,
+        orders: count,
+        orderGrowth: (orderDelta >= 0 ? "▲ " : "▼ ") + Math.abs(Number(orderGrowth)) + "%",
+        orderDelta: (orderDelta >= 0 ? "+" : "") + String(orderDelta),
+        orderUp: orderDelta >= 0,
+        revDeltaInsight: `${revDelta >= 0 ? "+" : "-"}₹${Math.abs(revDelta).toLocaleString("en-IN")} ${
+          revDelta >= 0 ? "UP" : "DOWN"
+        }`,
+        orderDeltaInsight: `${Math.abs(orderDelta)} Orders ${orderDelta >= 0 ? "UP" : "DOWN"}`,
+        filterFn: cfg.matcher,
+      };
+    });
+  }, [activePeriodOrders, activePeriodTotalRev, historicalOrders, timeframeMode, topMetrics.mtdDays, nowIST.msIntoDay]);
+
+  // Active items list based on dimension — sorted highest-revenue-first
+  // so the best-performing channel/category/payment-mode always sits at
+  // the top of the stack. Hours is deliberately excluded: that's a
+  // time-series (midnight through night), and reordering it by
+  // performance would make it unreadable as a timeline.
   const currentDimensionCards = useMemo(() => {
-    if (dimension === "channels") return channelCards;
-    if (dimension === "hours") return hourCards;
-    return menuCards;
-  }, [dimension, channelCards, hourCards, menuCards]);
+    const list =
+      dimension === "order_type"
+        ? channelCards
+        : dimension === "menu_category"
+        ? menuCards
+        : dimension === "payment_mode"
+        ? paymentCards
+        : dimension === "hours"
+        ? hourCards
+        : channelCards;
+
+    if (dimension === "hours") return list;
+    return [...list].sort((a, b) => b.rev - a.rev);
+  }, [dimension, channelCards, menuCards, paymentCards, hourCards]);
+
+  // Display label for the active dimension, used in the bar chart header
+  const dimensionLabel =
+    dimension === "order_type"
+      ? "Order Type"
+      : dimension === "menu_category"
+      ? "Menu Category"
+      : dimension === "payment_mode"
+      ? "Payment Mode"
+      : "Shift & Hours";
 
   // Active selected item for drilldown
   const activeCard = useMemo(() => {
@@ -987,7 +1383,7 @@ export function RestaurantIQDashboard({
   const drilldownData = useMemo(() => {
     if (!activeCard) return null;
     const filterFn = activeCard.filterFn;
-    const isMenuDim = dimension === "menu";
+    const isMenuDim = dimension === "menu_category";
 
     const getOrderRev = (o: Order): number => {
       if (isMenuDim) {
@@ -1156,6 +1552,167 @@ export function RestaurantIQDashboard({
       };
     }
 
+    if (dateRange === "15days") {
+      const daysLabels: string[] = [];
+      const revs: number[] = [];
+      const counts: number[] = [];
+      const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+      const dailyMap = new Map<string, { rev: number; count: number }>();
+      for (const o of allFilteredOrders) {
+        const dStr = o.istDateStr || getFastISTParts(o.createdAt).dateStr;
+        const cur = dailyMap.get(dStr) || { rev: 0, count: 0 };
+        cur.rev += getOrderRev(o);
+        cur.count += getOrderCount(o);
+        dailyMap.set(dStr, cur);
+      }
+
+      for (let i = 14; i >= 0; i--) {
+        const dMs = now.getTime() - i * 86400000;
+        const dParts = getFastISTParts(dMs);
+        const dayIdx = new Date(dMs + IST_OFFSET_MS).getUTCDay();
+        const shortName = dayNames[dayIdx];
+        const dateNum = new Date(dMs + IST_OFFSET_MS).getUTCDate();
+        daysLabels.push(`${shortName} ${dateNum}`);
+
+        const dayStats = dailyMap.get(dParts.dateStr) || { rev: 0, count: 0 };
+        revs.push(dayStats.rev);
+        counts.push(dayStats.count);
+      }
+
+      const cumRev = revs.reduce((a, b) => a + b, 0);
+      const cumOrders = counts.reduce((a, b) => a + b, 0);
+      const avgRev = Math.round(cumRev / 15);
+      const avgOrders = Math.round(cumOrders / 15);
+
+      const base = calculateSameTimeBaseline(filterFn);
+      const baselineRev =
+        base.baselineRev > 0
+          ? base.baselineRev
+          : isMenuDim
+          ? Math.round(topMetrics.baselineRev * ((activeCard.rev || 1) / (topMetrics.todayRev || 1)))
+          : Math.round(cumRev / 15);
+      const baselineOrders =
+        base.baselineOrders > 0
+          ? base.baselineOrders
+          : isMenuDim
+          ? Math.round(topMetrics.baselineOrders * ((activeCard.orders || 1) / (topMetrics.todayCount || 1)))
+          : Math.max(1, Math.round(cumOrders / 15));
+
+      return {
+        days: daysLabels,
+        rev: revs,
+        orders: counts,
+        cumRev: `₹${cumRev.toLocaleString("en-IN")}`,
+        cumOrders: String(cumOrders),
+        avgDailyRev: `₹${avgRev.toLocaleString("en-IN")}`,
+        avgDailyOrders: `${avgOrders} / day`,
+        baselineRev,
+        baselineOrders,
+        insight: `Last 15 Days: ${activeCard.revDeltaInsight} • ${activeCard.orderDeltaInsight} vs usual baseline.`,
+      };
+    }
+
+    // 2.5 "mtd" -> Day-by-Day for current month (Day 1 through Today)
+    // Month-wise trend for the current year (Jan through the current
+    // month) — triggered by clicking the MTD tier, which used to just
+    // show month-to-date daily detail; this gives the bigger-picture
+    // "how has each month gone this year" view instead.
+    if (dateRange === "year_by_month") {
+      const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+      const currentYear = todayISTStr.slice(0, 4);
+      const currentMonthIdx = parseInt(todayISTStr.slice(5, 7), 10) - 1;
+
+      const monthlyMap = new Map<string, { rev: number; count: number }>();
+      for (const o of allFilteredOrders) {
+        const dStr = o.istDateStr || (o.createdAt ? getFastISTParts(o.createdAt).dateStr : "");
+        if (!dStr || !dStr.startsWith(currentYear)) continue;
+        const monthKey = dStr.slice(0, 7);
+        const cur = monthlyMap.get(monthKey) || { rev: 0, count: 0 };
+        cur.rev += getOrderRev(o);
+        cur.count += getOrderCount(o);
+        monthlyMap.set(monthKey, cur);
+      }
+
+      const monthLabels: string[] = [];
+      const revs: number[] = [];
+      const counts: number[] = [];
+      for (let m = 0; m <= currentMonthIdx; m++) {
+        const monthKey = `${currentYear}-${String(m + 1).padStart(2, "0")}`;
+        monthLabels.push(monthNames[m]);
+        const stats = monthlyMap.get(monthKey) || { rev: 0, count: 0 };
+        revs.push(stats.rev);
+        counts.push(stats.count);
+      }
+
+      const cumRev = revs.reduce((a, b) => a + b, 0);
+      const cumOrders = counts.reduce((a, b) => a + b, 0);
+      const monthsElapsed = Math.max(1, currentMonthIdx + 1);
+      const avgRev = Math.round(cumRev / monthsElapsed);
+      const avgOrders = Math.round(cumOrders / monthsElapsed);
+
+      return {
+        days: monthLabels,
+        rev: revs,
+        orders: counts,
+        cumRev: `₹${cumRev.toLocaleString("en-IN")}`,
+        cumOrders: String(cumOrders),
+        avgDailyRev: `₹${avgRev.toLocaleString("en-IN")}`,
+        avgDailyOrders: `${avgOrders} / month`,
+        baselineRev: avgRev,
+        baselineOrders: avgOrders,
+        insight: `${currentYear} so far: ₹${cumRev.toLocaleString("en-IN")} across ${cumOrders} ${isMenuDim ? "items" : "orders"} over ${monthsElapsed} month${monthsElapsed === 1 ? "" : "s"}.`,
+      };
+    }
+
+    if (dateRange === "mtd") {
+      const daysLabels: string[] = [];
+      const revs: number[] = [];
+      const counts: number[] = [];
+      const currentMonthPrefix = todayISTStr.slice(0, 7);
+      const mtdDaysCount = parseInt(todayISTStr.slice(8, 10), 10) || 1;
+
+      const dailyMap = new Map<string, { rev: number; count: number }>();
+      for (const o of allFilteredOrders) {
+        const dStr = o.istDateStr || (o.createdAt ? getFastISTParts(o.createdAt).dateStr : "");
+        if (dStr && dStr.startsWith(currentMonthPrefix)) {
+          const cur = dailyMap.get(dStr) || { rev: 0, count: 0 };
+          cur.rev += getOrderRev(o);
+          cur.count += getOrderCount(o);
+          dailyMap.set(dStr, cur);
+        }
+      }
+
+      for (let dayNum = 1; dayNum <= mtdDaysCount; dayNum++) {
+        const dayStr = `${currentMonthPrefix}-${String(dayNum).padStart(2, "0")}`;
+        const dayDate = new Date(`${dayStr}T12:00:00+05:30`);
+        const dayLabel = formatISTDate(dayDate, { month: "short", day: "numeric" });
+        daysLabels.push(dayLabel);
+
+        const dayStats = dailyMap.get(dayStr) || { rev: 0, count: 0 };
+        revs.push(dayStats.rev);
+        counts.push(dayStats.count);
+      }
+
+      const cumRev = revs.reduce((a, b) => a + b, 0);
+      const cumOrders = counts.reduce((a, b) => a + b, 0);
+      const avgRev = Math.round(cumRev / Math.max(1, mtdDaysCount));
+      const avgOrders = Math.round(cumOrders / Math.max(1, mtdDaysCount));
+
+      return {
+        days: daysLabels,
+        rev: revs,
+        orders: counts,
+        cumRev: `₹${cumRev.toLocaleString("en-IN")}`,
+        cumOrders: String(cumOrders),
+        avgDailyRev: `₹${avgRev.toLocaleString("en-IN")}`,
+        avgDailyOrders: `${avgOrders} / day`,
+        baselineRev: avgRev,
+        baselineOrders: avgOrders,
+        insight: `${topMetrics.monthShortName} MTD (${mtdDaysCount} Days): Cumulative ₹${cumRev.toLocaleString("en-IN")} across ${cumOrders} ${isMenuDim ? "items" : "orders"}. Run-rate: ₹${avgRev.toLocaleString("en-IN")}/day.`,
+      };
+    }
+
     // 3. "30days" -> Past 4 Weeks in Hyderabad IST (Midnight to Midnight)
     if (dateRange === "30days") {
       const weeksLabels = ["3 Wks Ago", "2 Wks Ago", "Last Wk", "This Wk"];
@@ -1279,7 +1836,7 @@ export function RestaurantIQDashboard({
       baselineOrders: Math.round(cumOrders / Math.max(1, daysLabels.length)),
       insight: `Custom Range (${startD} to ${endD}): ₹${cumRev.toLocaleString("en-IN")} across ${cumOrders} orders.`,
     };
-  }, [activeCard, dateRange, customStart, customEnd, todayOrders, historicalOrders, now, todayISTStr]);
+  }, [activeCard, dimension, dateRange, customStart, customEnd, todayOrders, historicalOrders, now, todayISTStr]);
 
   // SVG Chart Geometry Calculations
   const chartWidth = 500;
@@ -1301,6 +1858,356 @@ export function RestaurantIQDashboard({
       loadData({ fullHistorical: true });
     }
   };
+
+  // Clicking the Revenue or Orders box HEADER (not the Today/MTD tiers,
+  // which have their own click behavior already) jumps straight to the
+  // Last 15 Days view and scrolls down to where that breakdown actually
+  // renders — the chart/dimension section below, not the KPI card itself.
+  const jumpToLast15Days = () => {
+    setDateRange("15days");
+    document.getElementById("barchart-overview-section")?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  };
+
+  // Clicking "Today" or "MTD" under Gross Revenue opens a dedicated page
+  // (not a scroll to the shared channel/category chart below, which is
+  // scoped to whichever dimension item happens to be selected) — this is
+  // the TOTAL, unfiltered revenue across every channel, its own separate
+  // view with its own back button. It can also be split into a stacked
+  // column by any of the same 4 dimensions used elsewhere in the
+  // dashboard (order type, menu category, payment mode, shift & hours).
+  const [revenueTrendView, setRevenueTrendView] = useState<null | "daily" | "monthly">(null);
+  // Which number the trend page is showing — wired up so the Orders KPI
+  // tiles can open the exact same page/controls the Revenue tiles do,
+  // just plotting order counts instead of revenue.
+  const [revenueTrendMetric, setRevenueTrendMetric] = useState<"revenue" | "orders">("revenue");
+  const [revenueTrendSplitDim, setRevenueTrendSplitDim] = useState<
+    "total" | "order_type" | "menu_category" | "payment_mode" | "hours"
+  >("total");
+
+  // Custom date range for each page — separate from the main dashboard's
+  // own customStart/customEnd (used by its unrelated "custom" dateRange
+  // pill) so picking a range in here never affects the main dashboard.
+  const [dailyDateMode, setDailyDateMode] = useState<"7days" | "30days" | "thismonth" | "custom">("7days");
+  const [dailyRangeStart, setDailyRangeStart] = useState(() => {
+    const d = new Date(Date.now() - 6 * 86400000 + IST_OFFSET_MS);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+  });
+  const [dailyRangeEnd, setDailyRangeEnd] = useState(todayISTStr);
+  const [monthlyDateMode, setMonthlyDateMode] = useState<"year" | "last7" | "last12" | "custom">("year");
+  const [monthlyRangeStart, setMonthlyRangeStart] = useState(`${todayISTStr.slice(0, 4)}-01-01`);
+  const [monthlyRangeEnd, setMonthlyRangeEnd] = useState(todayISTStr);
+
+  // Returns the 1st-of-month date string for "n months before base's
+  // month" (n=0 -> base's own month). Used by the Last 7 / Last 12
+  // months presets, which are rolling windows ending on the current
+  // month rather than a fixed calendar year.
+  function monthStartNMonthsAgo(n: number, base: string): string {
+    const y = parseInt(base.slice(0, 4), 10);
+    const m = parseInt(base.slice(5, 7), 10) - 1;
+    const total = y * 12 + m - n;
+    const yy = Math.floor(total / 12);
+    const mm = ((total % 12) + 12) % 12;
+    return `${yy}-${String(mm + 1).padStart(2, "0")}-01`;
+  }
+
+  // Dimension splits (order type / menu category / payment mode / hours)
+  // are computed as revenue sums, not order counts — not valid to show
+  // for the orders metric, so force back to "total" whenever it's active.
+  useEffect(() => {
+    if (revenueTrendMetric === "orders" && revenueTrendSplitDim !== "total") {
+      setRevenueTrendSplitDim("total");
+    }
+  }, [revenueTrendMetric, revenueTrendSplitDim]);
+
+  // Same 4 order-type buckets/colors as channelCards, kept in sync
+  // deliberately so a channel's color always means the same thing
+  // everywhere in the dashboard.
+  const ORDER_TYPE_SPLIT_CONFIG = [
+    { id: "ZOMATO", name: "Zomato", color: "#ef4444", matcher: (o: Order) => o.source === "ZOMATO" },
+    { id: "SWIGGY", name: "Swiggy", color: "#f97316", matcher: (o: Order) => o.source === "SWIGGY" },
+    { id: "DINE_IN", name: "Dine-in", color: "#3b82f6", matcher: (o: Order) => o.source === "DINE_IN" },
+    { id: "TAKEAWAY", name: "Takeaway", color: "#10b981", matcher: (o: Order) => o.source === "TAKEAWAY" },
+  ];
+  const HOURS_SPLIT_CONFIG = [
+    { id: "morning", name: "Morning", color: "#f59e0b", matcher: (o: Order) => (o.istHour ?? 0) >= 7 && (o.istHour ?? 0) < 12 },
+    { id: "afternoon", name: "Afternoon", color: "#f97316", matcher: (o: Order) => (o.istHour ?? 0) >= 12 && (o.istHour ?? 0) < 16 },
+    { id: "evening", name: "Evening", color: "#6366f1", matcher: (o: Order) => (o.istHour ?? 0) >= 16 || (o.istHour ?? 0) < 4 },
+  ];
+  const PAYMENT_SPLIT_CONFIG = [
+    {
+      id: "UPI", name: "UPI & QR", color: "#059669",
+      matcher: (o: Order) => {
+        const s = (o.source || "").toUpperCase();
+        const p = (o.payment || "").toUpperCase();
+        if (s === "ZOMATO" || s === "SWIGGY") return false;
+        return p.includes("UPI") || p.includes("GPAY") || p.includes("PHONEPE") || p.includes("PAYTM") || (!p.includes("CASH") && !p.includes("CARD"));
+      },
+    },
+    {
+      id: "AGGREGATOR", name: "Aggregator escrow", color: "#ea580c",
+      matcher: (o: Order) => {
+        const s = (o.source || "").toUpperCase();
+        const p = (o.payment || "").toUpperCase();
+        return s === "ZOMATO" || s === "SWIGGY" || p.includes("ZOMATO") || p.includes("SWIGGY") || p.includes("AGGREGATOR") || p.includes("ESCROW");
+      },
+    },
+    { id: "CASH", name: "Cash", color: "#78716c", matcher: (o: Order) => (o.payment || "").toUpperCase().includes("CASH") },
+    { id: "CARD", name: "Card", color: "#8b5cf6", matcher: (o: Order) => (o.payment || "").toUpperCase().includes("CARD") },
+  ];
+  const MENU_CATEGORY_SPLIT_CONFIG = [
+    { id: "Rice & Biryani", name: "Rice & Biryani", color: "#d97706" },
+    { id: "Starters", name: "Starters", color: "#dc2626" },
+    { id: "Main Course", name: "Main Course", color: "#059669" },
+    { id: "Breads", name: "Breads", color: "#a16207" },
+    { id: "Desserts", name: "Desserts", color: "#db2777" },
+    { id: "Beverages", name: "Beverages", color: "#0284c7" },
+  ];
+
+  function getSplitConfig(dim: typeof revenueTrendSplitDim) {
+    if (dim === "order_type") return ORDER_TYPE_SPLIT_CONFIG;
+    if (dim === "hours") return HOURS_SPLIT_CONFIG;
+    if (dim === "payment_mode") return PAYMENT_SPLIT_CONFIG;
+    if (dim === "menu_category") return MENU_CATEGORY_SPLIT_CONFIG;
+    return [];
+  }
+
+  const totalDailyRevenue7 = useMemo(() => {
+    const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const splitConfig = getSplitConfig(revenueTrendSplitDim);
+    const isMenuSplit = revenueTrendSplitDim === "menu_category";
+
+    const dailyMap = new Map<string, { rev: number; count: number; byDim: number[] }>();
+    for (const o of [...todayOrders, ...historicalOrders]) {
+      const dStr = o.istDateStr || (o.createdAt ? getFastISTParts(o.createdAt).dateStr : "");
+      if (!dStr) continue;
+      const cur = dailyMap.get(dStr) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
+      cur.rev += Number(o.total) || 0;
+      cur.count += 1;
+      if (isMenuSplit) {
+        (o.items || []).forEach((it) => {
+          const rawCat = it.category === "Mains" ? "Main Course" : it.category;
+          const idx = splitConfig.findIndex((c) => c.id === rawCat);
+          if (idx >= 0) cur.byDim[idx] += it.price * it.qty;
+        });
+      } else if (splitConfig.length > 0) {
+        splitConfig.forEach((c, idx) => {
+          if ((c as any).matcher(o)) cur.byDim[idx] += Number(o.total) || 0;
+        });
+      }
+      dailyMap.set(dStr, cur);
+    }
+
+    const labels: string[] = [];
+    const revs: number[] = [];
+    const counts: number[] = [];
+    const byDimSeries: number[][] = [];
+
+    let startMs: number;
+    let numDays: number;
+    if (dailyDateMode === "custom" && dailyRangeStart && dailyRangeEnd) {
+      startMs = new Date(`${dailyRangeStart}T00:00:00+05:30`).getTime();
+      const endMs = new Date(`${dailyRangeEnd}T00:00:00+05:30`).getTime();
+      // Capped at 60 days — same ceiling the main dashboard's own custom
+      // range uses. Beyond that, individual day-bars stop being readable
+      // anyway; a month-wise view is the right tool at that point.
+      numDays = Math.min(60, Math.max(1, Math.round((endMs - startMs) / 86400000) + 1));
+    } else if (dailyDateMode === "30days") {
+      numDays = 30;
+      startMs = now.getTime() - 29 * 86400000;
+    } else if (dailyDateMode === "thismonth") {
+      const firstOfMonth = `${todayISTStr.slice(0, 7)}-01`;
+      startMs = new Date(`${firstOfMonth}T00:00:00+05:30`).getTime();
+      numDays = Math.max(1, Math.round((now.getTime() - startMs) / 86400000) + 1);
+    } else {
+      // "7days" (default)
+      numDays = 7;
+      startMs = now.getTime() - 6 * 86400000;
+    }
+
+    for (let i = 0; i < numDays; i++) {
+      const dMs = startMs + i * 86400000;
+      const dParts = getFastISTParts(dMs);
+      const dayIdx = new Date(dMs + IST_OFFSET_MS).getUTCDay();
+      const dateNum = new Date(dMs + IST_OFFSET_MS).getUTCDate();
+      labels.push(`${dayNames[dayIdx]} ${dateNum}`);
+      const stats = dailyMap.get(dParts.dateStr) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
+      revs.push(stats.rev);
+      counts.push(stats.count);
+      byDimSeries.push(stats.byDim);
+    }
+    return { labels, revs, counts, byDimSeries, splitConfig, cumRev: revs.reduce((a, b) => a + b, 0), cumCount: counts.reduce((a, b) => a + b, 0) };
+  }, [todayOrders, historicalOrders, now, revenueTrendSplitDim, dailyDateMode, dailyRangeStart, dailyRangeEnd, todayISTStr]);
+
+  // Widens the loaded order history back far enough to cover a custom
+  // daily range that reaches further back than the default load window —
+  // reuses the exact same mechanism the main dashboard's own custom range
+  // already relies on, rather than a second, separate fetch path.
+  useEffect(() => {
+    if (revenueTrendView !== "daily" || !loadedHistoryStartStr) return;
+    let neededStart: string | null = null;
+    if (dailyDateMode === "custom" && dailyRangeStart) {
+      neededStart = dailyRangeStart;
+    } else if (dailyDateMode === "30days") {
+      const d = new Date(now.getTime() - 29 * 86400000 + IST_OFFSET_MS);
+      neededStart = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    } else if (dailyDateMode === "thismonth") {
+      neededStart = `${todayISTStr.slice(0, 7)}-01`;
+    }
+    if (neededStart && neededStart < loadedHistoryStartStr) {
+      loadOlderHistory(neededStart);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revenueTrendView, dailyDateMode, dailyRangeStart, loadedHistoryStartStr, todayISTStr]);
+
+  // Monthly view reads from mv_orders_summary — pre-aggregated by
+  // restaurant/day/hour/order_type/payment_mode — instead of downloading
+  // and summing raw orders client-side, which is what made this view slow
+  // in the first place. Menu category isn't covered by the summary table
+  // (it needs a join to order_items), so that split stays disabled for
+  // this specific view — see the disabled state on its pill below.
+  const [monthlySummaryRows, setMonthlySummaryRows] = useState<any[] | null>(null);
+  const [monthlySummaryLoading, setMonthlySummaryLoading] = useState(false);
+
+  useEffect(() => {
+    if (revenueTrendView !== "monthly" || !restaurantId || restaurantId === "demo-restaurant-1") return;
+    let cancelled = false;
+    setMonthlySummaryLoading(true);
+    const rangeStart =
+      monthlyDateMode === "custom" && monthlyRangeStart
+        ? monthlyRangeStart
+        : monthlyDateMode === "last7"
+        ? monthStartNMonthsAgo(6, todayISTStr)
+        : monthlyDateMode === "last12"
+        ? monthStartNMonthsAgo(11, todayISTStr)
+        : `${todayISTStr.slice(0, 4)}-01-01`;
+    const rangeEndExclusive =
+      monthlyDateMode === "custom" && monthlyRangeEnd && monthlyRangeEnd < todayISTStr
+        ? monthlyRangeEnd
+        : todayISTStr; // never fetch today itself from the summary table
+    supabase
+      .from("mv_orders_summary")
+      .select("order_date, order_hour, order_type, payment_mode, revenue, order_count")
+      .eq("restaurant_id", restaurantId)
+      .gte("order_date", rangeStart)
+      .lt("order_date", rangeEndExclusive) // up through YESTERDAY only — today is
+      // appended live below, never read from the summary table, since the
+      // view only refreshes on a schedule and could show today as
+      // incomplete or missing entirely depending on refresh timing.
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.warn("Could not load orders summary:", error.message || error);
+          setMonthlySummaryRows([]);
+        } else {
+          setMonthlySummaryRows(data || []);
+        }
+        setMonthlySummaryLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [revenueTrendView, restaurantId, todayISTStr, monthlyDateMode, monthlyRangeStart, monthlyRangeEnd]);
+
+  const totalMonthlyRevenueYear = useMemo(() => {
+    const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const splitConfig = getSplitConfig(revenueTrendSplitDim);
+    const rows = monthlySummaryRows || [];
+
+    // The span of months actually being viewed — Jan-through-current-month
+    // this year by default, or whatever the custom range covers (which can
+    // span multiple years).
+    const viewStart =
+      monthlyDateMode === "custom" && monthlyRangeStart
+        ? monthlyRangeStart
+        : monthlyDateMode === "last7"
+        ? monthStartNMonthsAgo(6, todayISTStr)
+        : monthlyDateMode === "last12"
+        ? monthStartNMonthsAgo(11, todayISTStr)
+        : `${todayISTStr.slice(0, 4)}-01-01`;
+    const viewEnd = monthlyDateMode === "custom" && monthlyRangeEnd ? monthlyRangeEnd : todayISTStr;
+    const startYear = parseInt(viewStart.slice(0, 4), 10);
+    const startMonth = parseInt(viewStart.slice(5, 7), 10) - 1;
+    const endYear = parseInt(viewEnd.slice(0, 4), 10);
+    const endMonth = parseInt(viewEnd.slice(5, 7), 10) - 1;
+    // Capped at 36 months (3 years) — a bar chart beyond that stops being
+    // a readable comparison regardless of how fast the query itself is.
+    const totalMonths = Math.min(36, (endYear - startYear) * 12 + (endMonth - startMonth) + 1);
+
+    const monthlyMap = new Map<string, { rev: number; count: number; byDim: number[] }>();
+    for (const row of rows) {
+      const monthKey = String(row.order_date).slice(0, 7);
+      const cur = monthlyMap.get(monthKey) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
+      const rowRev = Number(row.revenue) || 0;
+      cur.rev += rowRev;
+      cur.count += Number(row.order_count) || 0;
+      if (revenueTrendSplitDim === "order_type") {
+        const idx = splitConfig.findIndex((c) => c.id === row.order_type);
+        if (idx >= 0) cur.byDim[idx] += rowRev;
+      } else if (revenueTrendSplitDim === "payment_mode") {
+        splitConfig.forEach((c, idx) => {
+          if ((c as any).matcher({ source: row.order_type, payment: row.payment_mode } as Order)) {
+            cur.byDim[idx] += rowRev;
+          }
+        });
+      } else if (revenueTrendSplitDim === "hours") {
+        const hour = Number(row.order_hour) || 0;
+        splitConfig.forEach((c, idx) => {
+          if ((c as any).matcher({ istHour: hour } as Order)) cur.byDim[idx] += rowRev;
+        });
+      }
+      monthlyMap.set(monthKey, cur);
+    }
+
+    // Append TODAY live — computed straight from todayOrders, never from
+    // the summary table — but ONLY if today actually falls within the
+    // range being viewed (a custom range entirely in the past shouldn't
+    // have today's numbers injected into it).
+    const todayFallsInView = todayISTStr >= viewStart && todayISTStr <= viewEnd;
+    if (todayFallsInView) {
+      const currentMonthKey = todayISTStr.slice(0, 7);
+      const todayCur = monthlyMap.get(currentMonthKey) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
+      for (const o of todayOrders) {
+        const rev = Number(o.total) || 0;
+        todayCur.rev += rev;
+        todayCur.count += 1;
+        if (revenueTrendSplitDim !== "menu_category" && splitConfig.length > 0) {
+          splitConfig.forEach((c, idx) => {
+            if ((c as any).matcher(o)) todayCur.byDim[idx] += rev;
+          });
+        }
+      }
+      monthlyMap.set(currentMonthKey, todayCur);
+    }
+
+    const labels: string[] = [];
+    const revs: number[] = [];
+    const counts: number[] = [];
+    const byDimSeries: number[][] = [];
+    for (let i = 0; i < totalMonths; i++) {
+      const totalMonthIdx = startYear * 12 + startMonth + i;
+      const y = Math.floor(totalMonthIdx / 12);
+      const m = totalMonthIdx % 12;
+      const monthKey = `${y}-${String(m + 1).padStart(2, "0")}`;
+      labels.push(totalMonths > 12 ? `${monthNames[m]} '${String(y).slice(-2)}` : monthNames[m]);
+      const stats = monthlyMap.get(monthKey) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
+      revs.push(stats.rev);
+      counts.push(stats.count);
+      byDimSeries.push(stats.byDim);
+    }
+    return { labels, revs, counts, byDimSeries, splitConfig, cumRev: revs.reduce((a, b) => a + b, 0), cumCount: counts.reduce((a, b) => a + b, 0) };
+  }, [monthlySummaryRows, todayISTStr, revenueTrendSplitDim, todayOrders, monthlyDateMode, monthlyRangeStart, monthlyRangeEnd]);
+
+  // Loading until real data is actually ready — for "monthly" specifically,
+  // that means waiting for the summary-table fetch to finish, not just the
+  // initial page load, otherwise months would flash as zero before
+  // correcting themselves a moment later.
+  const isRevenueTrendLoading =
+    revenueTrendView === "monthly"
+      ? monthlySummaryRows === null || monthlySummaryLoading
+      : !hasFetched || localRefreshing;
 
   const isRefreshing = propIsRefreshing || localRefreshing;
 
@@ -1393,16 +2300,485 @@ export function RestaurantIQDashboard({
     );
   }
 
+  if (revenueTrendView) {
+    const data = revenueTrendView === "daily" ? totalDailyRevenue7 : totalMonthlyRevenueYear;
+    const isOrdersMetric = revenueTrendMetric === "orders";
+    const values = isOrdersMetric ? data.counts : data.revs;
+    const cumValue = isOrdersMetric ? data.cumCount : data.cumRev;
+    const splitLabels: Record<string, string> = {
+      total: "Total",
+      order_type: "Order type",
+      menu_category: "Menu category",
+      payment_mode: "Payment mode",
+      hours: "Shift and hours",
+    };
+    const maxVal = Math.max(100, ...values) * 1.15;
+
+    return (
+      <div className="restaurant-iq-page">
+        <div className="revenue-trend-page">
+          <button className="revenue-trend-back-btn" onClick={() => setRevenueTrendView(null)}>
+            ← Back to dashboard
+          </button>
+
+          <div className="revenue-trend-header">
+            <h2>
+              {isOrdersMetric ? "Total orders" : "Gross revenue"},{" "}
+              {revenueTrendView === "daily"
+                ? dailyDateMode === "custom"
+                  ? `${dailyRangeStart} to ${dailyRangeEnd}`
+                  : dailyDateMode === "30days"
+                  ? "last 30 days"
+                  : dailyDateMode === "thismonth"
+                  ? "this month"
+                  : "last 7 days"
+                : monthlyDateMode === "custom"
+                ? `${monthlyRangeStart} to ${monthlyRangeEnd}`
+                : monthlyDateMode === "last7"
+                ? "last 7 months"
+                : monthlyDateMode === "last12"
+                ? "last 12 months"
+                : "this year by month"}
+            </h2>
+            <p>Total across every channel — not filtered to any one dimension.</p>
+          </div>
+
+          <div className="revenue-trend-date-controls">
+            <div className="revenue-trend-view-pills">
+              {revenueTrendView === "daily" ? (
+                <>
+                  <button
+                    className={`revenue-trend-view-pill ${dailyDateMode === "7days" ? "active" : ""}`}
+                    onClick={() => setDailyDateMode("7days")}
+                  >
+                    Last 7 days
+                  </button>
+                  <button
+                    className={`revenue-trend-view-pill ${dailyDateMode === "30days" ? "active" : ""}`}
+                    onClick={() => setDailyDateMode("30days")}
+                  >
+                    Last 30 days
+                  </button>
+                  <button
+                    className={`revenue-trend-view-pill ${dailyDateMode === "thismonth" ? "active" : ""}`}
+                    onClick={() => setDailyDateMode("thismonth")}
+                  >
+                    This month
+                  </button>
+                  <button
+                    className={`revenue-trend-view-pill ${dailyDateMode === "custom" ? "active" : ""}`}
+                    onClick={() => setDailyDateMode("custom")}
+                  >
+                    Custom
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    className={`revenue-trend-view-pill ${monthlyDateMode === "year" ? "active" : ""}`}
+                    onClick={() => setMonthlyDateMode("year")}
+                  >
+                    This year
+                  </button>
+                  <button
+                    className={`revenue-trend-view-pill ${monthlyDateMode === "last7" ? "active" : ""}`}
+                    onClick={() => setMonthlyDateMode("last7")}
+                  >
+                    Last 7
+                  </button>
+                  <button
+                    className={`revenue-trend-view-pill ${monthlyDateMode === "last12" ? "active" : ""}`}
+                    onClick={() => setMonthlyDateMode("last12")}
+                  >
+                    Last 12
+                  </button>
+                  <button
+                    className={`revenue-trend-view-pill ${monthlyDateMode === "custom" ? "active" : ""}`}
+                    onClick={() => setMonthlyDateMode("custom")}
+                  >
+                    Custom
+                  </button>
+                </>
+              )}
+            </div>
+
+            {revenueTrendView === "daily" && dailyDateMode === "custom" && (
+              <div className="revenue-trend-date-inputs">
+                <label>
+                  From
+                  <input
+                    type="date"
+                    value={dailyRangeStart}
+                    max={dailyRangeEnd || todayISTStr}
+                    onChange={(e) => e.target.value && setDailyRangeStart(e.target.value)}
+                  />
+                </label>
+                <label>
+                  To
+                  <input
+                    type="date"
+                    value={dailyRangeEnd}
+                    min={dailyRangeStart}
+                    max={todayISTStr}
+                    onChange={(e) => e.target.value && setDailyRangeEnd(e.target.value)}
+                  />
+                </label>
+              </div>
+            )}
+
+            {revenueTrendView === "monthly" && monthlyDateMode === "custom" && (
+              <div className="revenue-trend-date-inputs">
+                <label>
+                  From
+                  <input
+                    type="date"
+                    value={monthlyRangeStart}
+                    max={monthlyRangeEnd || todayISTStr}
+                    onChange={(e) => e.target.value && setMonthlyRangeStart(e.target.value)}
+                  />
+                </label>
+                <label>
+                  To
+                  <input
+                    type="date"
+                    value={monthlyRangeEnd}
+                    min={monthlyRangeStart}
+                    max={todayISTStr}
+                    onChange={(e) => e.target.value && setMonthlyRangeEnd(e.target.value)}
+                  />
+                </label>
+              </div>
+            )}
+          </div>
+
+          {!isOrdersMetric && (
+            <div className="revenue-trend-view-selector">
+              <span className="revenue-trend-view-label">View</span>
+              <div className="revenue-trend-view-pills">
+                {(["total", "order_type", "menu_category", "payment_mode", "hours"] as const).map((dim) => {
+                  const isMenuDisabled = dim === "menu_category" && revenueTrendView === "monthly";
+                  return (
+                    <button
+                      key={dim}
+                      className={`revenue-trend-view-pill ${revenueTrendSplitDim === dim ? "active" : ""}`}
+                      onClick={() => !isMenuDisabled && setRevenueTrendSplitDim(dim)}
+                      disabled={isMenuDisabled}
+                      title={isMenuDisabled ? "Not available for the yearly view yet" : undefined}
+                    >
+                      {splitLabels[dim]}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {isRevenueTrendLoading ? (
+            <div className="revenue-trend-loading">
+              <div className="skel-block skel-line-lg" />
+              <div className="skel-block skel-chart-box" />
+              <span className="revenue-trend-loading-text">
+                {revenueTrendView === "monthly"
+                  ? `Loading ${isOrdersMetric ? "orders" : "revenue"} history...`
+                  : `Loading ${isOrdersMetric ? "orders" : "revenue"}...`}
+              </span>
+            </div>
+          ) : (
+            <>
+              <div className="revenue-trend-total-card">
+                <span className="revenue-trend-total-label">
+                  Total {isOrdersMetric ? "orders" : "revenue"} {revenueTrendView === "daily" ? "this week" : "this year"}
+                </span>
+                <span className="revenue-trend-total-value">
+                  {isOrdersMetric ? cumValue.toLocaleString("en-IN") : `₹${cumValue.toLocaleString("en-IN")}`}
+                </span>
+              </div>
+
+              <div className="revenue-trend-chart-area">
+                <div className="revenue-trend-bars-row">
+                  {data.labels.map((label, i) => {
+                    const heightPct = Math.max(2, Math.round((values[i] / maxVal) * 100));
+                    const isLast = i === data.labels.length - 1;
+                    if (revenueTrendSplitDim === "total" || data.splitConfig.length === 0 || isOrdersMetric) {
+                      return (
+                        <div key={label} className="revenue-trend-bar-col">
+                          <div
+                            className={`revenue-trend-bar ${isLast ? "is-current" : ""}`}
+                            style={{ height: `${heightPct}%` }}
+                            title={`${label}: ${isOrdersMetric ? `${values[i]} orders` : `₹${values[i].toLocaleString("en-IN")}`}`}
+                          />
+                        </div>
+                      );
+                    }
+                    const dimValues = data.byDimSeries[i] || [];
+                    return (
+                      <div key={label} className="revenue-trend-bar-col">
+                        <div className="revenue-trend-stacked-bar" style={{ height: `${heightPct}%` }}>
+                          {data.splitConfig.map((c, ci) => {
+                            const segVal = dimValues[ci] || 0;
+                            const segPct = data.revs[i] > 0 ? (segVal / data.revs[i]) * 100 : 0;
+                            return segPct > 0 ? (
+                              <div
+                                key={c.id}
+                                className="revenue-trend-bar-segment"
+                                style={{ height: `${segPct}%`, background: c.color }}
+                                title={`${c.name}: ₹${Math.round(segVal).toLocaleString("en-IN")}`}
+                              />
+                            ) : null;
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="revenue-trend-labels-row">
+                  {data.labels.map((label, i) => (
+                    <span
+                      key={label}
+                      className={`revenue-trend-day-label ${i === data.labels.length - 1 ? "is-current" : ""}`}
+                    >
+                      {label}
+                    </span>
+                  ))}
+                </div>
+              </div>
+
+              {revenueTrendSplitDim !== "total" && data.splitConfig.length > 0 && (
+                <div className="revenue-trend-legend">
+                  {data.splitConfig.map((c) => (
+                    <span key={c.id} className="revenue-trend-legend-item">
+                      <span className="revenue-trend-legend-dot" style={{ background: c.color }} />
+                      {c.name}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        <style jsx>{`
+          .revenue-trend-page {
+            max-width: 640px;
+            margin: 0 auto;
+            padding: 24px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+          }
+          .revenue-trend-back-btn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: none;
+            border: none;
+            padding: 0;
+            color: #2563eb;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            width: fit-content;
+          }
+          .revenue-trend-header h2 {
+            font-size: 18px;
+            font-weight: 800;
+            margin: 0;
+            color: #0f172a;
+          }
+          .revenue-trend-header p {
+            font-size: 13px;
+            margin: 4px 0 0;
+            color: #64748b;
+          }
+          .revenue-trend-date-controls {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            padding-bottom: 10px;
+            border-bottom: 1px dashed #e2e8f0;
+          }
+          .revenue-trend-date-inputs {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+          }
+          .revenue-trend-date-inputs label {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            font-size: 11.5px;
+            color: #64748b;
+            font-weight: 600;
+          }
+          .revenue-trend-date-inputs input {
+            height: 32px;
+            padding: 0 8px;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            font-size: 12.5px;
+          }
+          .revenue-trend-view-selector {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+          }
+          .revenue-trend-view-label {
+            font-size: 12px;
+            color: #64748b;
+          }
+          .revenue-trend-view-pills {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+          }
+          .revenue-trend-view-pill {
+            font-size: 12px;
+            padding: 6px 12px;
+            border-radius: 8px;
+            background: #f1f5f9;
+            color: #475569;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+          }
+          .revenue-trend-view-pill.active {
+            background: #dbeafe;
+            color: #1d4ed8;
+            border: 1.5px solid #93c5fd;
+          }
+          .revenue-trend-view-pill:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+          }
+          .revenue-trend-loading {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            align-items: center;
+            padding: 20px 0;
+          }
+          .revenue-trend-loading .skel-line-lg {
+            width: 60%;
+            height: 16px;
+            border-radius: 6px;
+          }
+          .revenue-trend-loading .skel-chart-box {
+            width: 100%;
+            height: 160px;
+            border-radius: 10px;
+          }
+          .revenue-trend-loading-text {
+            font-size: 12.5px;
+            color: #64748b;
+            font-weight: 600;
+          }
+          .revenue-trend-total-card {
+            background: #f8fafc;
+            border-radius: 10px;
+            padding: 14px 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+          }
+          .revenue-trend-total-label {
+            font-size: 12px;
+            color: #64748b;
+          }
+          .revenue-trend-total-value {
+            font-size: 26px;
+            font-weight: 800;
+            color: #0f172a;
+          }
+          .revenue-trend-chart-area {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+          }
+          .revenue-trend-bars-row {
+            display: flex;
+            align-items: flex-end;
+            gap: 8px;
+            height: 160px;
+          }
+          .revenue-trend-bar-col {
+            flex: 1;
+            height: 100%;
+            display: flex;
+            align-items: flex-end;
+          }
+          .revenue-trend-bar {
+            width: 100%;
+            border-radius: 4px 4px 0 0;
+            background: #5DCAA5;
+          }
+          .revenue-trend-bar.is-current {
+            background: #1D9E75;
+          }
+          .revenue-trend-stacked-bar {
+            width: 100%;
+            display: flex;
+            flex-direction: column-reverse;
+            border-radius: 4px 4px 0 0;
+            overflow: hidden;
+          }
+          .revenue-trend-bar-segment {
+            width: 100%;
+          }
+          .revenue-trend-labels-row {
+            display: flex;
+            gap: 8px;
+          }
+          .revenue-trend-day-label {
+            flex: 1;
+            text-align: center;
+            font-size: 10.5px;
+            color: #94a3b8;
+          }
+          .revenue-trend-day-label.is-current {
+            font-weight: 800;
+            color: #0f172a;
+          }
+          .revenue-trend-legend {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+          }
+          .revenue-trend-legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 12px;
+            color: #475569;
+          }
+          .revenue-trend-legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 2px;
+            display: inline-block;
+          }
+        `}</style>
+      </div>
+    );
+  }
+
   return (
     <div className="restaurant-iq-page">
-      {/* 1. TOP BRANDED HEADER (HYDERABAD TIMEZONE) */}
+      {/* 1. TOP BRANDED HEADER WITH LOGO & SUBSCRIPT */}
       <header className="iq-top-header">
         <div className="header-left">
-          <div className="restaurant-title-wrap">
-            <h1 className="restaurant-title">{restaurantName}</h1>
-            <span className="live-pacing-tag">
-              <span className="pulsing-live-dot" /> LIVE PACING
-            </span>
+          <div className="brand-logo-group">
+            <div className="iq-logo-squircle">
+              <span>IQ</span>
+            </div>
+            <div className="brand-names-column">
+              <div className="restaurant-title-row">
+                <h1 className="restaurant-title">{restaurantName}</h1>
+                <span className="live-pacing-tag">
+                  <span className="pulsing-live-dot" /> LIVE PACING
+                </span>
+              </div>
+              <span className="brand-subscript">Restaurant IQ</span>
+            </div>
           </div>
           <div className="header-meta">
             <span className="date-chip">
@@ -1435,245 +2811,344 @@ export function RestaurantIQDashboard({
         </div>
       </header>
 
-      {/* 2. TOP ROW - TOTAL REVENUE & ORDERS BENCHMARK CARDS */}
-      <section className="kpi-top-grid">
-        {/* TOTAL REVENUE CARD */}
-        <div className="paper-kpi-card revenue-card">
-          <div className="kpi-card-header">
-            <div className="kpi-title-box">
-              <span className="kpi-sub-title">Total Gross Revenue (Today)</span>
-              <h2 className="kpi-value">
-                ₹{topMetrics.todayRev.toLocaleString("en-IN")}
-              </h2>
+      {/* 2. TOP BENCHMARK CARD (REVENUE ON LEFT [TODAY TOP, MTD BELOW] | ORDERS ON RIGHT [TODAY TOP, MTD BELOW]) */}
+      <section className="kpi-top-section">
+        <div className="master-benchmark-card">
+          <div className="kpi-boxes-split">
+            {/* LEFT BOX: REVENUE (Today on top, MTD below) */}
+            <div className={`kpi-box-tile revenue-box ${timeframeMode === "today" ? "focus-today" : "focus-mtd"}`}>
+              <div
+                className="box-header-row"
+                onClick={jumpToLast15Days}
+                title="Click to see the last 15 days — or pick a custom date range below"
+                style={{ cursor: "pointer" }}
+              >
+                <span className="box-title">
+                  <span>💰</span> Gross Revenue
+                </span>
+                <span className="status-pill revenue-pill">REVENUE</span>
+              </div>
+
+              {/* TOP: Today's Revenue */}
+              <div
+                className={`metric-tier-card ${timeframeMode === "today" ? "active-tier" : ""}`}
+                onClick={() => {
+                  setTimeframeMode("today");
+                  setRevenueTrendMetric("revenue");
+                  setRevenueTrendView("daily");
+                }}
+                title="Click to view the last 7 days' total daily revenue"
+              >
+                <div className="metric-tier-header">
+                  <span className="tier-tag">Today ({topMetrics.monthShortName} {getFastISTParts(now).dateStr.slice(-2)})</span>
+                  <span className="tier-subtext">vs 3-Wk {weekdayName} Pacing</span>
+                </div>
+                <div className="metric-val-wrap">
+                  <span className={`rev-number ${topMetrics.revUp ? "rev-up" : "rev-down"}`}>
+                    ₹{topMetrics.todayRev.toLocaleString("en-IN")}
+                  </span>
+                  <span className={`growth-pill ${topMetrics.revUp ? "positive" : "negative"}`}>
+                    {topMetrics.revUp ? <ArrowUpRight size={13} /> : <ArrowDownRight size={13} />}
+                    <span>{topMetrics.revGrowthPct}</span>
+                  </span>
+                </div>
+              </div>
+
+              <div className="box-inner-divider" />
+
+              {/* BOTTOM: MTD Revenue */}
+              <div
+                className={`metric-tier-card mtd-tier ${timeframeMode === "mtd" ? "active-tier" : ""}`}
+                onClick={() => {
+                  setTimeframeMode("mtd");
+                  setRevenueTrendMetric("revenue");
+                  setRevenueTrendView("monthly");
+                }}
+                title="Click to view this year's total month-by-month revenue"
+              >
+                <div className="metric-tier-header">
+                  <span className="tier-tag">{topMetrics.monthShortName} Month-To-Date</span>
+                  <span className="chip-neutral-days">{topMetrics.mtdDays} Days</span>
+                </div>
+                <div className="metric-val-wrap">
+                  <span className="rev-number rev-mtd-green">
+                    ₹{topMetrics.mtdRev.toLocaleString("en-IN")}
+                  </span>
+                  <span className="mtd-runrate-text">
+                    Avg ₹{Math.round(topMetrics.mtdAvgDailyRev / 1000)}k/day
+                  </span>
+                </div>
+              </div>
             </div>
-            <div
-              className={`growth-pill ${
-                topMetrics.revUp ? "positive" : "negative"
-              }`}
-            >
-              {topMetrics.revUp ? (
-                <ArrowUpRight size={14} />
-              ) : (
-                <ArrowDownRight size={14} />
-              )}
-              <span>{topMetrics.revGrowthPct}</span>
+
+            {/* RIGHT BOX: ORDERS (Today on top, MTD below) */}
+            <div className={`kpi-box-tile orders-box ${timeframeMode === "today" ? "focus-today" : "focus-mtd"}`}>
+              <div
+                className="box-header-row"
+                onClick={jumpToLast15Days}
+                title="Click to see the last 15 days — or pick a custom date range below"
+                style={{ cursor: "pointer" }}
+              >
+                <span className="box-title">
+                  <span>📦</span> Total Orders &amp; Bills
+                </span>
+                <span className="status-pill orders-pill">ORDERS</span>
+              </div>
+
+              {/* TOP: Today's Orders */}
+              <div
+                className={`metric-tier-card ${timeframeMode === "today" ? "active-tier" : ""}`}
+                onClick={() => {
+                  setTimeframeMode("today");
+                  setRevenueTrendMetric("orders");
+                  setRevenueTrendView("daily");
+                }}
+                title="Click to view the last 7 days' total daily orders"
+              >
+                <div className="metric-tier-header">
+                  <span className="tier-tag">Today ({topMetrics.monthShortName} {getFastISTParts(now).dateStr.slice(-2)})</span>
+                  <span className="tier-subtext">vs 3-Wk {weekdayName} Pacing</span>
+                </div>
+                <div className="metric-val-wrap">
+                  <div className="orders-count-group">
+                    <span className="orders-number blue-orders">{topMetrics.todayCount}</span>
+                    <span className="orders-unit-label">Orders</span>
+                  </div>
+                  <span className={`growth-pill ${topMetrics.ordersUp ? "positive" : "negative"}`}>
+                    {topMetrics.ordersUp ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}
+                    <span>
+                      {topMetrics.ordersGrowthPct} ({topMetrics.ordersDelta >= 0 ? "+" : ""}{topMetrics.ordersDelta})
+                    </span>
+                  </span>
+                </div>
+              </div>
+
+              <div className="box-inner-divider" />
+
+              {/* BOTTOM: MTD Orders */}
+              <div
+                className={`metric-tier-card mtd-tier ${timeframeMode === "mtd" ? "active-tier" : ""}`}
+                onClick={() => {
+                  setTimeframeMode("mtd");
+                  setRevenueTrendMetric("orders");
+                  setRevenueTrendView("monthly");
+                }}
+                title="Click to view this year's total month-by-month orders"
+              >
+                <div className="metric-tier-header">
+                  <span className="tier-tag">{topMetrics.monthShortName} Month-To-Date</span>
+                  <span className="chip-neutral-days">{topMetrics.mtdDays} Days</span>
+                </div>
+                <div className="metric-val-wrap">
+                  <div className="orders-count-group">
+                    <span className="orders-number blue-orders">{topMetrics.mtdOrders.toLocaleString("en-IN")}</span>
+                    <span className="orders-unit-label">Orders MTD</span>
+                  </div>
+                  <span className="mtd-runrate-text blue">
+                    Avg {topMetrics.mtdAvgDailyOrders} ord/day
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
 
-          <div className="kpi-benchmark-row">
-            <div className="benchmark-stat">
-              <span className="benchmark-label">
-                Usual {weekdayName} (Same Time):
-              </span>
-              <strong className="benchmark-val">
+          {/* COMBINED BENCHMARK FOOTER STRIP */}
+          <div className="benchmark-combined-strip">
+            <div className="bench-info-left">
+              <span className="bench-label">Usual {weekdayName} (Same Time):</span>
+              <strong className="bench-stat-bold">
                 ₹{Math.round(topMetrics.baselineRev).toLocaleString("en-IN")}
               </strong>
-            </div>
-            <div
-              className={`delta-tag ${
-                topMetrics.revUp ? "positive" : "negative"
-              }`}
-            >
-              💡 {topMetrics.revUp ? "+" : "-"}₹
-              {Math.abs(topMetrics.revDelta).toLocaleString("en-IN")}{" "}
-              {topMetrics.revUp ? "UP" : "DOWN"}
-            </div>
-          </div>
-          <p className="benchmark-caption">
-            *Compared to the average of last 3 {weekdayName}s at this exact same
-            time of day.
-          </p>
-        </div>
-
-        {/* TOTAL ORDERS CARD */}
-        <div className="paper-kpi-card orders-card">
-          <div className="kpi-card-header">
-            <div className="kpi-title-box">
-              <span className="kpi-sub-title">Total Orders & Bills (Today)</span>
-              <h2 className="kpi-value">
-                {topMetrics.todayCount}{" "}
-                <span className="kpi-unit">orders</span>
-              </h2>
-            </div>
-            <div
-              className={`growth-pill ${
-                topMetrics.ordersUp ? "positive" : "negative"
-              }`}
-            >
-              {topMetrics.ordersUp ? (
-                <ArrowUpRight size={14} />
-              ) : (
-                <ArrowDownRight size={14} />
-              )}
-              <span>
-                {topMetrics.ordersGrowthPct}{" "}
-                <sub className="delta-subscript">
-                  ({topMetrics.ordersDelta >= 0 ? "+" : ""}
-                  {topMetrics.ordersDelta})
-                </sub>
-              </span>
-            </div>
-          </div>
-
-          <div className="kpi-benchmark-row">
-            <div className="benchmark-stat">
-              <span className="benchmark-label">
-                Usual {weekdayName} (Same Time):
-              </span>
-              <strong className="benchmark-val">
+              <span className="bench-bullet">·</span>
+              <strong className="bench-stat-bold">
                 {topMetrics.baselineOrders} orders
               </strong>
             </div>
-            <div
-              className={`delta-tag ${
-                topMetrics.ordersUp ? "positive" : "negative"
-              }`}
-            >
-              💡 {Math.abs(topMetrics.ordersDelta)} Orders{" "}
-              {topMetrics.ordersUp ? "UP" : "DOWN"}
+            <div className={`bench-delta-tag ${topMetrics.revUp && topMetrics.ordersUp ? "positive" : "negative"}`}>
+              💡 {topMetrics.revDelta >= 0 ? "+" : "-"}₹{Math.abs(topMetrics.revDelta).toLocaleString("en-IN")} &amp; {topMetrics.ordersDelta >= 0 ? "+" : ""}{topMetrics.ordersDelta} Orders {topMetrics.revUp ? "UP" : "DOWN"}
             </div>
           </div>
-          <p className="benchmark-caption">
-            *Pacing trajectory based on historical 3-week volume up to current hour
-            to predict closing.
+          <p className="benchmark-footnote">
+            *Compared to historical average of last 3 {weekdayName}s at this exact same hour of day.
           </p>
         </div>
       </section>
 
-      {/* 3. 3-WAY DIMENSION SWITCHER */}
-      <section className="dimension-selector-section">
-        <div className="dimension-pill-nav">
-          <button
-            className={`dim-tab-btn ${
-              dimension === "channels" ? "active" : ""
-            }`}
-            onClick={() => {
-              setDimension("channels");
-              setSelectedItemId("ZOMATO");
-            }}
-          >
-            🛵 Channels & Sources
-          </button>
-          <button
-            className={`dim-tab-btn ${dimension === "hours" ? "active" : ""}`}
-            onClick={() => {
-              setDimension("hours");
-              setSelectedItemId("evening");
-            }}
-          >
-            ⏰ Shift & Hour Split
-          </button>
-          <button
-            className={`dim-tab-btn ${dimension === "menu" ? "active" : ""}`}
-            onClick={() => {
-              setDimension("menu");
-              setSelectedItemId("Rice & Biryani");
-            }}
-          >
-            🍛 Menu Categories
-          </button>
-        </div>
-        <span className="dimension-hint">
-          Click any card below to drill down into 7-day trends & cumulative volume
-        </span>
-      </section>
+      {/* 3. SAME-DAY VERTICAL BAR CHART & 4-DIMENSION EXPLORER */}
+      <section className="same-day-chart-section" id="barchart-overview-section">
+        <div className="same-day-chart-card">
+          {/* Chart Header Row */}
+          <div className="chart-header-row">
+            <div className="chart-header-left">
+              <div className="chart-title-badge">
+                <span className="live-dot" />
+                <span className="badge-text">
+                  {timeframeMode === "mtd" ? "MONTH-TO-DATE OVERVIEW" : "SAME-DAY OVERVIEW"}
+                </span>
+              </div>
+              <h3 className="chart-main-title">
+                {timeframeMode === "mtd" ? (
+                  <>
+                    {dimension === "order_type" && `${topMetrics.monthShortName} MTD Orders & Revenue by Order Type`}
+                    {dimension === "menu_category" && `${topMetrics.monthShortName} MTD Items & Revenue by Menu Category`}
+                    {dimension === "payment_mode" && `${topMetrics.monthShortName} MTD Collections & Volume by Payment Mode`}
+                    {dimension === "hours" && `${topMetrics.monthShortName} MTD Flow & Revenue by Shift & Hours`}
+                  </>
+                ) : (
+                  <>
+                    {dimension === "order_type" && "Today's Orders & Revenue by Order Type"}
+                    {dimension === "menu_category" && "Today's Items & Revenue by Menu Category"}
+                    {dimension === "payment_mode" && "Today's Collections & Volume by Payment Mode"}
+                    {dimension === "hours" && "Today's Flow & Revenue by Shift & Hours"}
+                  </>
+                )}
+              </h3>
+              <p className="chart-subtitle">
+                Click any card below to drill down into its 7-day velocity pacing.
+              </p>
+            </div>
+          </div>
 
-      {/* 4. MAIN CONTENT GRID (CARDS LIST + DEEP DRILLDOWN) */}
-      <div className="dashboard-body-grid">
-        {/* CARDS LIST WITH STRICT TWO-COLUMN DELTAS */}
-        <div className="metric-cards-column">
-          {currentDimensionCards.map((item) => {
-            const isSelected = item.id === activeCard?.id;
+          {/* 4 Interactive Dimension Tabs (Clean, bold, distinct buttons) */}
+          <div className="dimension-tab-bar">
+            <button
+              className={`dim-tab-btn ${dimension === "order_type" ? "active" : ""}`}
+              onClick={() => {
+                setDimension("order_type");
+                setSelectedItemId("ZOMATO");
+              }}
+            >
+              <span className="dim-tab-icon">🛵</span>
+              <span className="dim-tab-title">Order Type</span>
+            </button>
+
+            <button
+              className={`dim-tab-btn ${dimension === "menu_category" ? "active" : ""}`}
+              onClick={() => {
+                setDimension("menu_category");
+                setSelectedItemId("Rice & Biryani");
+              }}
+            >
+              <span className="dim-tab-icon">🍛</span>
+              <span className="dim-tab-title">Menu Category</span>
+            </button>
+
+            <button
+              className={`dim-tab-btn ${dimension === "payment_mode" ? "active" : ""}`}
+              onClick={() => {
+                setDimension("payment_mode");
+                setSelectedItemId("UPI");
+              }}
+            >
+              <span className="dim-tab-icon">💳</span>
+              <span className="dim-tab-title">Payment Mode</span>
+            </button>
+
+            <button
+              className={`dim-tab-btn ${dimension === "hours" ? "active" : ""}`}
+              onClick={() => {
+                setDimension("hours");
+                setSelectedItemId("evening");
+              }}
+            >
+              <span className="dim-tab-icon">⏰</span>
+              <span className="dim-tab-title">Shift & Hours</span>
+            </button>
+          </div>
+
+          {/* HORIZONTAL BAR CHART — one bar per category in the active
+              dimension. Clicking a bar opens the full-page drilldown
+              below, exactly like clicking a Gross Revenue KPI opens
+              revenueTrendView. Bars with a zero value for the active
+              metric are dropped rather than drawn as a sliver. */}
+          {(() => {
+            const metricKey: "rev" | "orders" = chartMetric === "orders" ? "orders" : "rev";
+            const barItems = currentDimensionCards.filter((item) => (item[metricKey] as number) > 0);
+            const maxVal = Math.max(1, ...barItems.map((item) => item[metricKey] as number));
+
             return (
-              <div
-                key={item.id}
-                className={`paper-breakdown-card ${
-                  isSelected ? "selected-card" : ""
-                }`}
-                onClick={() => setSelectedItemId(item.id)}
-              >
-                {/* CARD TOP ROW */}
-                <div className="item-card-top">
-                  <div className="item-identity">
-                    <span
-                      className="item-icon-bubble"
-                      style={{ backgroundColor: item.iconBg }}
-                    >
-                      {item.icon}
-                    </span>
-                    <span className="item-name">{item.name}</span>
-                  </div>
-                  <span
-                    className="item-tag"
-                    style={{
-                      backgroundColor: item.tagColor,
-                      color: item.tagTextColor,
-                    }}
-                  >
-                    {item.tag}
+              <div className="horizontal-bar-chart">
+                <div className="bar-chart-header-row">
+                  <span className="bar-chart-header-label">
+                    {chartMetric === "orders" ? "Orders" : "Revenue"} by {dimensionLabel}
                   </span>
+                  <div className="chart-metric-toggle-group">
+                    <div className="metric-toggle-pills">
+                      <button
+                        className={`toggle-btn ${chartMetric === "revenue" ? "active-revenue" : ""}`}
+                        onClick={() => setChartMetric("revenue")}
+                      >
+                        Revenue
+                      </button>
+                      <button
+                        className={`toggle-btn ${chartMetric === "orders" ? "active-orders" : ""}`}
+                        onClick={() => setChartMetric("orders")}
+                      >
+                        Orders
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
-                {/* STRICT TWO-COLUMN SPLIT */}
-                <div className="card-columns-grid">
-                  {/* LEFT COLUMN: REVENUE */}
-                  <div className="card-column revenue-col">
-                    <span className="col-label">Revenue</span>
-                    <div className="col-main-val">
-                      <span className="val-text">
-                        ₹{item.rev.toLocaleString("en-IN")}
-                      </span>
-                      <span
-                        className={`mini-growth ${
-                          item.revUp ? "positive" : "negative"
-                        }`}
-                      >
-                        {item.revGrowth}
-                      </span>
-                    </div>
-                    {/* HARD ₹ DELTA INSIGHT DIRECTLY BELOW REVENUE */}
-                    <div
-                      className={`column-delta-footer ${
-                        item.revUp ? "pos-footer" : "neg-footer"
-                      }`}
-                    >
-                      💡 {item.revDeltaInsight}
-                    </div>
-                  </div>
+                <div className="bar-chart-rows">
+                  {barItems.map((item) => {
+                    const val = item[metricKey] as number;
+                    const pct = Math.max(4, Math.round((val / maxVal) * 100));
+                    const isUp = metricKey === "orders" ? item.orderUp : item.revUp;
+                    const growthLabel = metricKey === "orders" ? item.orderGrowth : item.revGrowth;
+                    const displayVal =
+                      metricKey === "orders"
+                        ? val.toLocaleString("en-IN")
+                        : `₹${val.toLocaleString("en-IN")}`;
+                    const isSelected = item.id === selectedItemId;
 
-                  {/* RIGHT COLUMN: ORDERS */}
-                  <div className="card-column orders-col">
-                    <span className="col-label">Orders</span>
-                    <div className="col-main-val">
-                      <span className="val-text">{item.orders}</span>
-                      <span
-                        className={`mini-growth ${
-                          item.orderUp ? "positive" : "negative"
-                        }`}
+                    return (
+                      <div
+                        key={item.id}
+                        className={`bar-chart-row ${isSelected ? "bar-row-selected" : ""}`}
+                        onClick={() => {
+                          setSelectedItemId(item.id);
+                          setDimensionDrilldownOpen(true);
+                        }}
                       >
-                        {item.orderGrowth}{" "}
-                        <sub className="delta-subscript">
-                          ({item.orderDelta})
-                        </sub>
-                      </span>
-                    </div>
-                    {/* HARD ORDER DELTA INSIGHT DIRECTLY BELOW ORDERS */}
-                    <div
-                      className={`column-delta-footer ${
-                        item.orderUp ? "pos-footer" : "neg-footer"
-                      }`}
-                    >
-                      💡 {item.orderDeltaInsight}
-                    </div>
-                  </div>
+                        <div className="bar-row-label">
+                          <span className="bar-row-icon" style={{ backgroundColor: item.iconBg }}>
+                            {item.icon}
+                          </span>
+                          <span className="bar-row-name">{item.name}</span>
+                        </div>
+                        <div className="bar-row-track">
+                          <div
+                            className={`bar-row-fill ${isUp ? "fill-up" : "fill-down"}`}
+                            style={{ width: `${pct}%`, backgroundColor: item.iconBg }}
+                          />
+                        </div>
+                        <div className="bar-row-value">
+                          <span className="bar-row-num">{displayVal}</span>
+                          <span className={`bar-row-growth ${isUp ? "positive" : "negative"}`}>
+                            {growthLabel}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             );
-          })}
+          })()}
         </div>
+      </section>
 
-        {/* INTERACTIVE DRILLDOWN PANEL */}
-        {drilldownData && activeCard && (
+      {/* 4. FULL-PAGE CATEGORY DRILLDOWN — takes over from the bar chart
+          section above, same pattern as revenueTrendView's own page. */}
+      {dimensionDrilldownOpen && drilldownData && activeCard && (
+        <div className="dimension-drilldown-page" id="drilldown-section">
+          <button
+            className="back-to-dashboard-btn"
+            onClick={() => setDimensionDrilldownOpen(false)}
+          >
+            ← Back to dashboard
+          </button>
           <div className="drilldown-detail-column">
             <div className="drilldown-paper-card">
               {/* DRILLDOWN HEADER */}
@@ -1710,6 +3185,14 @@ export function RestaurantIQDashboard({
                     onClick={() => setDateRange("7days")}
                   >
                     Last 7 Days
+                  </button>
+                  <button
+                    className={`filter-btn ${
+                      dateRange === "15days" ? "active" : ""
+                    }`}
+                    onClick={() => setDateRange("15days")}
+                  >
+                    Last 15 Days
                   </button>
                   <button
                     className={`filter-btn ${
@@ -1775,8 +3258,12 @@ export function RestaurantIQDashboard({
                         ? "Today"
                         : dateRange === "7days"
                         ? "7 Days"
+                        : dateRange === "15days"
+                        ? "15 Days"
                         : dateRange === "30days"
                         ? "30 Days"
+                        : dateRange === "year_by_month"
+                        ? "This Year"
                         : "Selected"}
                     </span>
                   </div>
@@ -1784,11 +3271,11 @@ export function RestaurantIQDashboard({
 
                 <div className="cumulative-card orders-cum">
                   <span className="cum-label">
-                    {dimension === "menu" ? "Cumulative Items Sold" : "Cumulative Orders"}
+                    {dimension === "menu_category" ? "Cumulative Items Sold" : "Cumulative Orders"}
                   </span>
                   <div className="cum-val-row">
                     <span className="cum-number">{drilldownData.cumOrders}</span>
-                    <span className="cum-unit">{dimension === "menu" ? "items" : "orders"}</span>
+                    <span className="cum-unit">{dimension === "menu_category" ? "items" : "orders"}</span>
                   </div>
                   <div className="cum-footer">
                     <span>
@@ -1799,8 +3286,12 @@ export function RestaurantIQDashboard({
                         ? "Today"
                         : dateRange === "7days"
                         ? "7 Days"
+                        : dateRange === "15days"
+                        ? "15 Days"
                         : dateRange === "30days"
                         ? "30 Days"
+                        : dateRange === "year_by_month"
+                        ? "This Year"
                         : "Selected"}
                     </span>
                   </div>
@@ -1817,8 +3308,12 @@ export function RestaurantIQDashboard({
                         ? "Hourly Today"
                         : dateRange === "7days"
                         ? "Last 7 Days"
+                        : dateRange === "15days"
+                        ? "Last 15 Days"
                         : dateRange === "30days"
                         ? "Last 4 Weeks"
+                        : dateRange === "year_by_month"
+                        ? "Month by Month, This Year"
                         : "Custom Period"}
                       )
                     </h4>
@@ -1864,7 +3359,7 @@ export function RestaurantIQDashboard({
                         No {activeCard.name} orders recorded
                       </div>
                       <div style={{ fontSize: "12px", color: "#78716c", marginTop: "4px" }}>
-                        0 orders were placed for {activeCard.name} during this {dateRange === "today" ? "shift today" : dateRange === "7days" ? "7-day period" : dateRange === "30days" ? "30-day period" : "selected custom range"}.
+                        0 orders were placed for {activeCard.name} during this {dateRange === "today" ? "shift today" : dateRange === "7days" ? "7-day period" : dateRange === "15days" ? "15-day period" : dateRange === "30days" ? "30-day period" : "selected custom range"}.
                       </div>
                     </div>
                   ) : (
@@ -1974,10 +3469,45 @@ export function RestaurantIQDashboard({
                         const isTodayBar =
                           dateRange === "today" ||
                           (dateRange === "7days" && i === days.length - 1) ||
+                          (dateRange === "15days" && i === days.length - 1) ||
+                          (dateRange === "30days" && i === days.length - 1) ||
+                          (dateRange === "year_by_month" && i === days.length - 1) ||
                           (dateRange === "custom" && customEnd === todayISTStr && i === days.length - 1);
 
+                        // Clicking a month's bar in the year_by_month view
+                        // drills into that month's own daily breakdown —
+                        // reuses the existing "custom" range machinery
+                        // (which already computes real day-by-day
+                        // aggregation for any span) instead of a second,
+                        // separate computation path.
+                        const handleBarClick =
+                          dateRange === "year_by_month"
+                            ? () => {
+                                const year = todayISTStr.slice(0, 4);
+                                const monthStr = String(i + 1).padStart(2, "0");
+                                const monthStart = `${year}-${monthStr}-01`;
+                                const lastDayOfMonth = new Date(
+                                  `${year}-${monthStr}-01T00:00:00+05:30`
+                                );
+                                lastDayOfMonth.setMonth(lastDayOfMonth.getMonth() + 1);
+                                lastDayOfMonth.setDate(0);
+                                const lastDayStr = getFastISTParts(
+                                  lastDayOfMonth.getTime()
+                                ).dateStr;
+                                const monthEnd =
+                                  lastDayStr > todayISTStr ? todayISTStr : lastDayStr;
+                                setCustomStart(monthStart);
+                                setCustomEnd(monthEnd);
+                                setDateRange("custom");
+                              }
+                            : undefined;
+
                         return (
-                          <g key={`bar-group-${activeCard?.id}-${dateRange}-${i}-${day}`}>
+                          <g
+                            key={`bar-group-${activeCard?.id}-${dateRange}-${i}-${day}`}
+                            onClick={handleBarClick}
+                            style={handleBarClick ? { cursor: "pointer" } : undefined}
+                          >
                             {/* Revenue Bar: Render ONLY if revenue > 0 */}
                             {(graphMetric === "both" || graphMetric === "rev") && r > 0 && (
                               <>
@@ -1989,8 +3519,8 @@ export function RestaurantIQDashboard({
                                   rx={3}
                                   fill={
                                     isTodayBar
-                                      ? "#f97316"
-                                      : "rgba(249, 115, 22, 0.65)"
+                                      ? "#059669"
+                                      : "rgba(16, 185, 129, 0.65)"
                                   }
                                   className="chart-bar"
                                 />
@@ -2015,7 +3545,7 @@ export function RestaurantIQDashboard({
                               textAnchor="middle"
                               fontSize="8.5"
                               fontWeight={isTodayBar ? "700" : "500"}
-                              fill={isTodayBar ? "#f97316" : "currentColor"}
+                              fill={isTodayBar ? "#059669" : "currentColor"}
                               opacity={isTodayBar ? 1 : 0.65}
                             >
                               {day}
@@ -2041,6 +3571,9 @@ export function RestaurantIQDashboard({
                             isToday:
                               dateRange === "today" ||
                               (dateRange === "7days" && i === days.length - 1) ||
+                              (dateRange === "15days" && i === days.length - 1) ||
+                              (dateRange === "30days" && i === days.length - 1) ||
+                              (dateRange === "year_by_month" && i === days.length - 1) ||
                               (dateRange === "custom" && customEnd === todayISTStr && i === days.length - 1),
                           };
                         });
@@ -2061,7 +3594,7 @@ export function RestaurantIQDashboard({
                             <path
                               d={d}
                               fill="none"
-                              stroke="#60a5fa"
+                              stroke="#2563eb"
                               strokeWidth="2.5"
                               strokeLinecap="round"
                             />
@@ -2073,8 +3606,8 @@ export function RestaurantIQDashboard({
                                       cx={pt.x}
                                       cy={pt.y}
                                       r={pt.isToday ? 4 : 3}
-                                      fill="#1e40af"
-                                      stroke="#60a5fa"
+                                      fill="#1e3a8a"
+                                      stroke="#2563eb"
                                       strokeWidth="2"
                                     />
                                     <text
@@ -2083,7 +3616,7 @@ export function RestaurantIQDashboard({
                                       textAnchor="middle"
                                       fontSize="8"
                                       fontWeight="700"
-                                      fill="#60a5fa"
+                                      fill="#2563eb"
                                     >
                                       {pt.orders}
                                     </text>
@@ -2108,7 +3641,7 @@ export function RestaurantIQDashboard({
                     )}
                     {(graphMetric === "both" || graphMetric === "orders") && (
                       <span className="legend-entry">
-                        <span className="color-swatch orders" /> {dimension === "menu" ? "Items (Count)" : "Orders (Count)"}
+                        <span className="color-swatch orders" /> {dimension === "menu_category" ? "Items (Count)" : "Orders (Count)"}
                       </span>
                     )}
                   </div>
@@ -2127,8 +3660,8 @@ export function RestaurantIQDashboard({
               </div>
             </div>
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* 5. CREATIVE BRANDED RIBBON FOOTER */}
       <footer className="branded-ribbon-footer">
@@ -2147,8 +3680,8 @@ export function RestaurantIQDashboard({
       <style jsx>{`
         .restaurant-iq-page {
           min-height: 100vh;
-          background: #faf7f2;
-          color: #1c1917;
+          background: #f8fafc;
+          color: #0f172a;
           font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
           padding: 20px 24px;
           display: flex;
@@ -2156,7 +3689,7 @@ export function RestaurantIQDashboard({
           gap: 18px;
         }
 
-        /* 1. Header */
+        /* 1. Top Header with Logo & Subscript */
         .iq-top-header {
           display: flex;
           justify-content: space-between;
@@ -2166,11 +3699,48 @@ export function RestaurantIQDashboard({
           background: #ffffff;
           padding: 16px 20px;
           border-radius: 14px;
-          border: 1px solid #ede7dc;
+          border: 1px solid #e2e8f0;
           box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
         }
 
-        .restaurant-title-wrap {
+        .header-left {
+          display: flex;
+          align-items: center;
+          gap: 16px;
+          flex-wrap: wrap;
+        }
+
+        .brand-logo-group {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+        }
+
+        .iq-logo-squircle {
+          width: 44px;
+          height: 44px;
+          border-radius: 12px;
+          background: linear-gradient(145deg, #064e3b 0%, #065f46 45%, #059669 100%);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: #ffffff;
+          font-size: 22px;
+          font-weight: 900;
+          letter-spacing: -0.5px;
+          box-shadow: 0 4px 10px rgba(5, 150, 105, 0.28), inset 0 1px 1px rgba(255, 255, 255, 0.25);
+          flex-shrink: 0;
+          font-family: Inter, system-ui, -apple-system, sans-serif;
+        }
+
+        .brand-names-column {
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+          gap: 2px;
+        }
+
+        .restaurant-title-row {
           display: flex;
           align-items: center;
           gap: 10px;
@@ -2178,11 +3748,21 @@ export function RestaurantIQDashboard({
         }
 
         .restaurant-title {
-          font-size: 22px;
+          font-size: 20px;
           font-weight: 800;
-          color: #1c1917;
+          color: #0f172a;
           margin: 0;
-          letter-spacing: -0.4px;
+          line-height: 1.2;
+          letter-spacing: -0.3px;
+        }
+
+        .brand-subscript {
+          font-size: 11.5px;
+          font-weight: 700;
+          color: #059669;
+          text-transform: uppercase;
+          letter-spacing: 0.8px;
+          line-height: 1;
         }
 
         .live-pacing-tag {
@@ -2191,9 +3771,9 @@ export function RestaurantIQDashboard({
           gap: 6px;
           font-size: 10.5px;
           font-weight: 800;
-          background: #eaf6ee;
-          color: #167a49;
-          border: 1px solid #bfe3cc;
+          background: #ecfdf5;
+          color: #065f46;
+          border: 1px solid #a7f3d0;
           padding: 3px 9px;
           border-radius: 999px;
           letter-spacing: 0.4px;
@@ -2203,8 +3783,8 @@ export function RestaurantIQDashboard({
           width: 7px;
           height: 7px;
           border-radius: 50%;
-          background: #167a49;
-          box-shadow: 0 0 0 2px rgba(22, 122, 73, 0.25);
+          background: #059669;
+          box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.25);
           animation: pulse 1.8s infinite;
         }
 
@@ -2217,25 +3797,7 @@ export function RestaurantIQDashboard({
           display: flex;
           align-items: center;
           gap: 8px;
-          margin-top: 6px;
           flex-wrap: wrap;
-        }
-
-        .location-chip {
-          display: inline-flex;
-          align-items: center;
-          gap: 6px;
-          font-size: 11.5px;
-          font-weight: 700;
-          color: #047857;
-          background: #ecfdf5;
-          border: 1px solid #a7f3d0;
-          padding: 3px 9px;
-          border-radius: 6px;
-        }
-
-        .tz-flag {
-          font-size: 12px;
         }
 
         .date-chip, .shift-chip {
@@ -2244,17 +3806,17 @@ export function RestaurantIQDashboard({
           gap: 5px;
           font-size: 11.5px;
           font-weight: 600;
-          color: #78716c;
-          background: #faf7f2;
-          border: 1px solid #ede7dc;
-          padding: 3px 8px;
+          color: #64748b;
+          background: #f1f5f9;
+          border: 1px solid #e2e8f0;
+          padding: 4px 10px;
           border-radius: 6px;
         }
 
         .shift-chip {
-          background: #fef9ee;
-          color: #b47814;
-          border-color: #fde68a;
+          background: #eff6ff;
+          color: #1d4ed8;
+          border-color: #bfdbfe;
           font-weight: 700;
         }
 
@@ -2278,12 +3840,12 @@ export function RestaurantIQDashboard({
         }
 
         .refresh-btn {
-          background: #f97316;
+          background: #0f172a;
           color: #ffffff;
         }
 
         .refresh-btn:hover {
-          background: #ea580c;
+          background: #1e293b;
         }
 
         .refresh-btn.spin svg {
@@ -2296,9 +3858,9 @@ export function RestaurantIQDashboard({
         }
 
         .logout-btn {
-          background: #faf7f2;
-          border: 1px solid #ede7dc;
-          color: #78716c;
+          background: #ffffff;
+          border: 1px solid #e2e8f0;
+          color: #64748b;
         }
 
         .logout-btn:hover {
@@ -2307,337 +3869,1140 @@ export function RestaurantIQDashboard({
           border-color: #fecaca;
         }
 
-        /* 2. Top KPI Cards */
-        .kpi-top-grid {
+        /* 2. Master Benchmark Card (Revenue Left | Orders Right) */
+        .kpi-top-section {
+          width: 100%;
+        }
+
+        .master-benchmark-card {
+          background: #ffffff;
+          border: 1px solid #e2e8f0;
+          border-radius: 16px;
+          padding: 18px 20px;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+          display: flex;
+          flex-direction: column;
+          gap: 14px;
+        }
+
+        .kpi-boxes-split {
           display: grid;
           grid-template-columns: 1fr 1fr;
           gap: 16px;
         }
 
-        @media (max-width: 768px) {
-          .kpi-top-grid {
-            grid-template-columns: 1fr;
-          }
-        }
-
-        .paper-kpi-card {
-          background: #ffffff;
-          border: 1px solid #ede7dc;
+        .kpi-box-tile {
           border-radius: 14px;
-          padding: 18px 20px;
-          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+          padding: 16px 18px;
           display: flex;
           flex-direction: column;
           gap: 12px;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+          background: #ffffff;
+          border: 1.5px solid #e2e8f0;
         }
 
-        .kpi-card-header {
+        .kpi-box-tile.revenue-box {
+          border: 2px solid #10b981;
+          background: #f0fdf4;
+          box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.12), 0 2px 4px rgba(16, 185, 129, 0.04);
+        }
+
+        .kpi-box-tile.orders-box {
+          border: 2px solid #2563eb;
+          background: #eff6ff;
+          box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12), 0 2px 4px rgba(37, 99, 235, 0.04);
+        }
+
+        .box-header-row {
           display: flex;
           justify-content: space-between;
-          align-items: flex-start;
+          align-items: center;
         }
 
-        .kpi-sub-title {
-          font-size: 12px;
-          font-weight: 700;
-          color: #78716c;
+        .box-title {
+          font-size: 12.5px;
+          font-weight: 800;
           text-transform: uppercase;
           letter-spacing: 0.4px;
+          display: flex;
+          align-items: center;
+          gap: 6px;
         }
 
-        .kpi-value {
-          font-size: 32px;
+        .revenue-box .box-title { color: #047857; }
+        .orders-box .box-title { color: #1d4ed8; }
+
+        .status-pill {
+          font-size: 10px;
           font-weight: 800;
-          color: #1c1917;
-          margin: 4px 0 0;
-          letter-spacing: -0.6px;
+          padding: 2px 7px;
+          border-radius: 4px;
         }
 
-        .kpi-unit {
-          font-size: 15px;
+        .status-pill.revenue-pill { background: #10b981; color: #ffffff; }
+        .status-pill.orders-pill { background: #2563eb; color: #ffffff; }
+
+        /* Metric Tier Cards (Today on top, MTD below) */
+        .metric-tier-card {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+          padding: 10px 12px;
+          border-radius: 10px;
+          cursor: pointer;
+          transition: all 0.18s ease;
+          border: 1px solid transparent;
+        }
+
+        .metric-tier-card:hover {
+          background: rgba(255, 255, 255, 0.85);
+          border-color: rgba(0, 0, 0, 0.08);
+          transform: translateY(-1px);
+        }
+
+        .metric-tier-card.active-tier {
+          background: #ffffff;
+          border: 1.5px solid rgba(0, 0, 0, 0.12);
+          box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+        }
+
+        .metric-tier-card.mtd-tier {
+          background: rgba(255, 255, 255, 0.65);
+          border: 1px solid rgba(0, 0, 0, 0.06);
+        }
+
+        .metric-tier-card.mtd-tier.active-tier {
+          background: #ffffff;
+          border: 1.5px solid rgba(0, 0, 0, 0.14);
+          box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+        }
+
+        .metric-tier-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          font-size: 11px;
+          font-weight: 700;
+          color: #64748b;
+          text-transform: uppercase;
+          letter-spacing: 0.3px;
+        }
+
+        .tier-tag {
+          font-weight: 800;
+          color: #0f172a;
+        }
+
+        .tier-subtext {
+          font-size: 10.5px;
+          color: #64748b;
           font-weight: 600;
-          color: #a8a29e;
+        }
+
+        .metric-val-wrap {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+
+        .rev-number {
+          font-size: 27px;
+          font-weight: 900;
+          letter-spacing: -0.5px;
+          line-height: 1.1;
+        }
+
+        .rev-up { color: #047857; }
+        .rev-down { color: #b91c1c; }
+        .rev-mtd-green { color: #047857; }
+
+        .orders-count-group {
+          display: flex;
+          align-items: baseline;
+          gap: 6px;
+        }
+
+        .orders-number {
+          font-size: 27px;
+          font-weight: 900;
+          letter-spacing: -0.5px;
+          line-height: 1.1;
+        }
+
+        .blue-orders { color: #2563eb; }
+
+        .orders-unit-label {
+          font-size: 12px;
+          font-weight: 700;
+          color: #64748b;
         }
 
         .growth-pill {
           display: inline-flex;
           align-items: center;
-          gap: 4px;
-          padding: 5px 10px;
-          border-radius: 999px;
-          font-size: 13px;
+          gap: 3px;
+          font-size: 11.5px;
           font-weight: 800;
+          padding: 3px 8px;
+          border-radius: 999px;
+          line-height: 1.2;
         }
 
         .growth-pill.positive {
-          background: #eaf6ee;
-          color: #167a49;
-          border: 1px solid #bfe3cc;
+          background: #ecfdf5;
+          color: #047857;
+          border: 1px solid #a7f3d0;
         }
 
         .growth-pill.negative {
-          background: #fdf0ee;
-          color: #c23820;
-          border: 1px solid #f6c8c0;
+          background: #fef2f2;
+          color: #b91c1c;
+          border: 1px solid #fecaca;
         }
 
-        .delta-subscript {
-          font-size: 11px;
+        .box-inner-divider {
+          height: 1px;
+          background: rgba(0, 0, 0, 0.07);
+          margin: 2px 0;
+        }
+
+        .chip-neutral-days {
+          font-size: 10.5px;
           font-weight: 700;
-          opacity: 0.85;
-          margin-left: 2px;
-        }
-
-        .kpi-benchmark-row {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          flex-wrap: wrap;
-          gap: 8px;
-          padding: 10px 12px;
-          background: #faf7f2;
-          border-radius: 10px;
-          border: 1px solid #ede7dc;
-        }
-
-        .benchmark-stat {
-          font-size: 12.5px;
-          color: #78716c;
-        }
-
-        .benchmark-label {
-          margin-right: 5px;
-        }
-
-        .benchmark-val {
-          color: #1c1917;
-          font-weight: 700;
-        }
-
-        .delta-tag {
-          font-size: 12px;
-          font-weight: 800;
-          padding: 3px 8px;
+          background: #f1f5f9;
+          color: #475569;
+          border: 1px solid #e2e8f0;
+          padding: 2px 7px;
           border-radius: 6px;
         }
 
-        .delta-tag.positive {
-          background: #eaf6ee;
-          color: #167a49;
-          border: 1px solid #bfe3cc;
+        .mtd-runrate-text {
+          font-size: 11.5px;
+          font-weight: 700;
+          color: #047857;
         }
 
-        .delta-tag.negative {
-          background: #fdf0ee;
-          color: #c23820;
-          border: 1px solid #f6c8c0;
+        .mtd-runrate-text.blue {
+          color: #2563eb;
         }
 
-        .benchmark-caption {
-          font-size: 10.5px;
-          color: #a8a29e;
-          margin: 0;
-          font-style: italic;
-        }
-
-        /* 3. Dimension Selector */
-        .dimension-selector-section {
+        /* Combined Benchmark Footer Strip */
+        .benchmark-combined-strip {
           display: flex;
           justify-content: space-between;
           align-items: center;
+          background: #f8fafc;
+          border: 1px dashed #e2e8f0;
+          border-radius: 10px;
+          padding: 10px 14px;
+          font-size: 12px;
           flex-wrap: wrap;
-          gap: 10px;
+          gap: 8px;
         }
 
-        .dimension-pill-nav {
+        .bench-info-left {
           display: flex;
+          align-items: center;
+          gap: 6px;
+          color: #64748b;
+          flex-wrap: wrap;
+        }
+
+        .bench-label {
+          color: #64748b;
+        }
+
+        .bench-stat-bold {
+          font-weight: 800;
+          color: #0f172a;
+        }
+
+        .bench-bullet {
+          color: #cbd5e1;
+          font-weight: 900;
+        }
+
+        .bench-delta-tag {
+          font-weight: 800;
+          font-size: 11.5px;
+          padding: 4px 10px;
+          border-radius: 6px;
+        }
+
+        .bench-delta-tag.negative {
+          background: #fef2f2;
+          color: #b91c1c;
+          border: 1px solid #fecaca;
+        }
+
+        .bench-delta-tag.positive {
+          background: #ecfdf5;
+          color: #047857;
+          border: 1px solid #a7f3d0;
+        }
+
+        .benchmark-footnote {
+          font-size: 10.5px;
+          color: #94a3b8;
+          margin: -4px 0 0 2px;
+        }
+
+        /* 3. SAME-DAY VERTICAL BAR CHART & 4-DIMENSION EXPLORER */
+        .same-day-chart-section {
+          width: 100%;
+        }
+
+        .same-day-chart-card {
           background: #ffffff;
-          padding: 4px;
-          border-radius: 12px;
-          border: 1px solid #ede7dc;
-          box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+          border: 1px solid #e2e8f0;
+          border-radius: 16px;
+          padding: 20px 22px;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
+        }
+
+        .chart-header-row {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-start;
+          flex-wrap: wrap;
+          gap: 14px;
+        }
+
+        .chart-header-left {
+          display: flex;
+          flex-direction: column;
           gap: 4px;
+        }
+
+        .chart-title-badge {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          background: #f1f5f9;
+          border: 1px solid #cbd5e1;
+          padding: 3px 8px;
+          border-radius: 999px;
+          width: fit-content;
+        }
+
+        .live-dot {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          background: #10b981;
+          box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+        }
+
+        .badge-text {
+          font-size: 10.5px;
+          font-weight: 800;
+          color: #475569;
+          letter-spacing: 0.5px;
+        }
+
+        .chart-main-title {
+          font-size: 16px;
+          font-weight: 800;
+          color: #0f172a;
+          margin: 0;
+          letter-spacing: -0.3px;
+        }
+
+        .chart-subtitle {
+          font-size: 12px;
+          color: #64748b;
+          margin: 0;
+        }
+
+        .chart-metric-toggle-group {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .toggle-label {
+          font-size: 11px;
+          font-weight: 700;
+          color: #64748b;
+          text-transform: uppercase;
+        }
+
+        .metric-toggle-pills {
+          display: flex;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 10px;
+          padding: 3px;
+          gap: 2px;
+        }
+
+        .toggle-btn {
+          border: 0;
+          background: transparent;
+          font-size: 11.5px;
+          font-weight: 700;
+          padding: 6px 12px;
+          border-radius: 7px;
+          color: #64748b;
+          cursor: pointer;
+          transition: all 0.15s ease;
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+        }
+
+        .toggle-btn:hover {
+          color: #0f172a;
+        }
+
+        .toggle-btn.active-orders {
+          background: #2563eb;
+          color: #ffffff;
+          box-shadow: 0 2px 4px rgba(37, 99, 235, 0.25);
+        }
+
+        .toggle-btn.active-revenue {
+          background: #059669;
+          color: #ffffff;
+          box-shadow: 0 2px 4px rgba(5, 150, 105, 0.25);
+        }
+
+        .toggle-btn.active-both {
+          background: #0f172a;
+          color: #ffffff;
+          box-shadow: 0 2px 4px rgba(15, 23, 42, 0.25);
+        }
+
+        /* 4 Dimension Category Buttons */
+        .dimension-tab-bar {
+          display: grid;
+          grid-template-columns: repeat(4, 1fr);
+          gap: 10px;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 12px;
+          padding: 6px;
         }
 
         .dim-tab-btn {
-          border: 0;
-          background: transparent;
-          font-size: 12.5px;
-          font-weight: 700;
-          padding: 8px 16px;
+          border: 1px solid #e2e8f0;
+          background: #ffffff;
           border-radius: 9px;
-          color: #78716c;
+          padding: 10px 16px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
           cursor: pointer;
-          transition: all 0.15s ease;
+          transition: all 0.18s ease;
+          text-align: center;
+          box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+        }
+
+        .dim-tab-btn:hover {
+          border-color: #cbd5e1;
+          background: #f1f5f9;
         }
 
         .dim-tab-btn.active {
-          background: #f97316;
+          background: #0f172a;
+          border-color: #0f172a;
           color: #ffffff;
-          box-shadow: 0 2px 5px rgba(249, 115, 22, 0.25);
+          box-shadow: 0 3px 8px rgba(15, 23, 42, 0.2);
         }
 
-        .dimension-hint {
-          font-size: 11.5px;
-          color: #a8a29e;
+        .dim-tab-icon {
+          font-size: 18px;
+          line-height: 1;
+          flex-shrink: 0;
+        }
+
+        .dim-tab-title {
+          font-size: 13px;
+          font-weight: 800;
+          color: #0f172a;
+          white-space: nowrap;
+        }
+
+        .dim-tab-btn.active .dim-tab-title {
+          color: #ffffff;
+        }
+
+        .dimension-summary-subbar {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          background: #f1f5f9;
+          border: 1px solid #e2e8f0;
+          border-radius: 10px;
+          padding: 8px 14px;
+          font-size: 12px;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .summary-guide-text {
+          font-weight: 600;
+          color: #334155;
+        }
+
+        .click-guide-pill {
+          font-size: 11px;
+          font-weight: 800;
+          color: #047857;
+          background: #ecfdf5;
+          border: 1px solid #a7f3d0;
+          padding: 2px 8px;
+          border-radius: 999px;
+        }
+
+        .click-to-inspect-badge {
+          font-size: 9.5px;
+          font-weight: 700;
+          color: #64748b;
+          background: #f1f5f9;
+          border: 1px solid #e2e8f0;
+          padding: 2px 6px;
+          border-radius: 999px;
+          margin-top: 2px;
+          transition: all 0.15s ease;
+        }
+
+        .bar-column-wrapper:hover .click-to-inspect-badge {
+          background: #0f172a;
+          color: #ffffff;
+          border-color: #0f172a;
+        }
+
+        /* Vertical Bars Canvas */
+        .vertical-bars-container {
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 14px;
+          padding: 20px 16px 14px;
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+        }
+
+        .bars-scroll-track {
+          display: flex;
+          align-items: flex-end;
+          justify-content: space-around;
+          gap: 14px;
+          min-width: fit-content;
+        }
+
+        .bar-column-wrapper {
+          flex: 1;
+          min-width: 110px;
+          max-width: 180px;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          cursor: pointer;
+          border-radius: 12px;
+          padding: 10px 8px;
+          transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+          background: transparent;
+          border: 1px solid transparent;
+        }
+
+        .bar-column-wrapper:hover {
+          background: #ffffff;
+          border-color: #cbd5e1;
+          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+          transform: translateY(-2px);
+        }
+
+        .bar-column-wrapper.is-selected-bar {
+          background: #ffffff;
+          border-color: #0f172a;
+          box-shadow: 0 4px 16px rgba(15, 23, 42, 0.1);
+        }
+
+        .bar-top-metrics {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 3px;
+          margin-bottom: 8px;
+          min-height: 40px;
+          justify-content: flex-end;
+        }
+
+        .bar-val-primary {
+          font-size: 13px;
+          font-weight: 800;
+          line-height: 1.2;
+        }
+
+        .bar-val-primary.blue-metric {
+          color: #2563eb;
+        }
+
+        .bar-val-primary.green-metric {
+          color: #059669;
+        }
+
+        .dual-metric-header {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          font-size: 12px;
+          font-weight: 800;
+        }
+
+        .green-txt {
+          color: #059669;
+        }
+
+        .blue-txt {
+          color: #2563eb;
+        }
+
+        .divider {
+          color: #cbd5e1;
+        }
+
+        .bar-delta-tag {
+          font-size: 10.5px;
+          font-weight: 800;
+          padding: 2px 6px;
+          border-radius: 999px;
+        }
+
+        .bar-delta-tag.up {
+          background: #ecfdf5;
+          color: #047857;
+          border: 1px solid #a7f3d0;
+        }
+
+        .bar-delta-tag.down {
+          background: #fef2f2;
+          color: #b91c1c;
+          border: 1px solid #fecaca;
+        }
+
+        /* Height Stage */
+        .bars-height-stage {
+          width: 100%;
+          height: 150px;
+          display: flex;
+          align-items: flex-end;
+          justify-content: center;
+          padding: 0 4px;
+        }
+
+        .dual-bars-row {
+          width: 100%;
+          display: flex;
+          align-items: flex-end;
+          justify-content: center;
+          gap: 6px;
+          height: 100%;
+        }
+
+        .single-bar {
+          width: 20px;
+          border-radius: 6px 6px 0 0;
+          transition: height 0.4s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s ease;
+        }
+
+        .single-bar.full-width {
+          width: 38px;
+        }
+
+        .single-bar.rev-bar {
+          background: linear-gradient(180deg, #10b981 0%, #059669 100%);
+        }
+
+        .single-bar.order-bar {
+          background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+        }
+
+        .bar-column-wrapper:hover .single-bar {
+          filter: brightness(1.08);
+        }
+
+        .bar-ground-line {
+          width: 100%;
+          height: 2px;
+          background: #cbd5e1;
+          margin-bottom: 10px;
+        }
+
+        /* Bottom Item Button */
+        .bar-item-btn {
+          width: 100%;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 4px;
+        }
+
+        .bar-item-icon {
+          width: 28px;
+          height: 28px;
+          border-radius: 8px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 13px;
+          color: #ffffff;
+          font-weight: 800;
+          box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .bar-item-name {
+          font-size: 12px;
+          font-weight: 800;
+          color: #0f172a;
+          text-align: center;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          max-width: 100%;
+        }
+
+        .bar-item-share {
+          font-size: 10px;
+          color: #64748b;
           font-weight: 600;
         }
 
-        /* 4. Dashboard Body Grid */
-        .dashboard-body-grid {
-          display: grid;
-          grid-template-columns: 380px 1fr;
-          gap: 18px;
-          align-items: start;
+        .active-check-badge {
+          font-size: 9.5px;
+          font-weight: 800;
+          color: #ffffff;
+          background: #0f172a;
+          padding: 2px 6px;
+          border-radius: 999px;
+          margin-top: 2px;
         }
 
-        @media (max-width: 1024px) {
-          .dashboard-body-grid {
-            grid-template-columns: 1fr;
-          }
+        /* Chart Footer */
+        .chart-footer-bar {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          border-top: 1px solid #e2e8f0;
+          padding-top: 10px;
+          font-size: 11.5px;
+          color: #64748b;
+          flex-wrap: wrap;
+          gap: 8px;
         }
 
-        /* Metric Cards Column */
-        .metric-cards-column {
+        .footer-legend-left {
+          display: flex;
+          align-items: center;
+          gap: 14px;
+        }
+
+        .legend-indicator {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          font-weight: 600;
+        }
+
+        .legend-dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 2px;
+        }
+
+        .legend-dot.green-dot {
+          background: #10b981;
+        }
+
+        .legend-dot.blue-dot {
+          background: #2563eb;
+        }
+
+        .footer-click-hint {
+          font-size: 11px;
+          color: #64748b;
+          font-weight: 600;
+        }
+
+        /* Desktop vs Mobile Bar Display Toggles */
+        .desktop-only-bars {
+          display: block;
+        }
+
+        .mobile-only-bars {
+          display: none;
+        }
+
+        /* Mobile Horizontal Bars Styling */
+        .mobile-bars-container {
+          width: 100%;
           display: flex;
           flex-direction: column;
-          gap: 12px;
+          gap: 8px;
         }
 
-        .paper-breakdown-card {
+        .mobile-hbar-card {
           background: #ffffff;
-          border: 1.5px solid #ede7dc;
-          border-radius: 14px;
-          padding: 14px 16px;
-          cursor: pointer;
-          transition: all 0.2s ease;
+          border: 1px solid #e2e8f0;
+          border-radius: 12px;
+          padding: 11px 13px;
           display: flex;
           flex-direction: column;
-          gap: 12px;
+          gap: 7px;
+          cursor: pointer;
+          transition: all 0.15s ease;
+          box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
         }
 
-        .paper-breakdown-card:hover {
-          transform: translateY(-2px);
-          border-color: #f97316;
-          box-shadow: 0 4px 12px rgba(249, 115, 22, 0.08);
+        .mobile-hbar-card:active,
+        .mobile-hbar-card:hover {
+          background: #f8fafc;
+          border-color: #cbd5e1;
         }
 
-        .paper-breakdown-card.selected-card {
-          border-color: #f97316;
-          background: #fffbf7;
-          box-shadow: 0 0 0 1px #f97316, 0 4px 12px rgba(249, 115, 22, 0.1);
+        .mobile-hbar-card.selected {
+          background: #ffffff;
+          border-color: #0f172a;
+          box-shadow: 0 3px 12px rgba(15, 23, 42, 0.08);
         }
 
-        .item-card-top {
+        .mobile-hbar-top {
           display: flex;
           justify-content: space-between;
           align-items: center;
         }
 
-        .item-identity {
+        .mobile-hbar-identity {
           display: flex;
           align-items: center;
+          gap: 9px;
+        }
+
+        .mobile-hbar-icon {
+          width: 24px;
+          height: 24px;
+          border-radius: 6px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 11px;
+          color: #ffffff;
+          font-weight: 800;
+        }
+
+        .mobile-hbar-name {
+          font-size: 13px;
+          font-weight: 800;
+          color: #0f172a;
+        }
+
+        .mobile-hbar-metrics {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .mobile-hbar-val {
+          font-size: 13px;
+          font-weight: 800;
+        }
+
+        .mobile-hbar-val.blue {
+          color: #2563eb;
+        }
+
+        .mobile-hbar-val.green {
+          color: #059669;
+        }
+
+        .mobile-hbar-delta {
+          font-size: 10px;
+          font-weight: 800;
+          padding: 2px 6px;
+          border-radius: 999px;
+        }
+
+        .mobile-hbar-delta.pos {
+          background: #ecfdf5;
+          color: #047857;
+        }
+
+        .mobile-hbar-delta.neg {
+          background: #fef2f2;
+          color: #b91c1c;
+        }
+
+        .mobile-hbar-track {
+          position: relative;
+          width: 100%;
+          height: 7px;
+          background: #f1f5f9;
+          border-radius: 999px;
+          overflow: hidden;
+        }
+
+        .mobile-hbar-fill {
+          height: 100%;
+          border-radius: 999px;
+          transition: width 0.35s ease;
+        }
+
+        .mobile-hbar-fill.blue-fill {
+          background: linear-gradient(90deg, #3b82f6, #2563eb);
+        }
+
+        .mobile-hbar-fill.green-fill {
+          background: linear-gradient(90deg, #10b981, #059669);
+        }
+
+        .mobile-hbar-footer {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          font-size: 10.5px;
+          color: #64748b;
+        }
+
+        .mobile-selected-badge {
+          font-size: 9px;
+          font-weight: 800;
+          color: #ffffff;
+          background: #0f172a;
+          padding: 2px 7px;
+          border-radius: 999px;
+        }
+
+        .mobile-tap-hint {
+          font-size: 10px;
+          font-weight: 700;
+          color: #2563eb;
+        }
+
+        .mobile-swipe-indicator {
+          display: none;
+          font-size: 10.5px;
+          font-weight: 800;
+          color: #047857;
+          background: #ecfdf5;
+          border: 1px solid #a7f3d0;
+          padding: 2px 8px;
+          border-radius: 999px;
+          letter-spacing: 0.2px;
+        }
+
+        @media (max-width: 1024px) {
+          .dimension-tab-bar {
+            grid-template-columns: repeat(2, 1fr);
+          }
+
+          .chart-header-row {
+            flex-direction: column;
+          }
+
+          .vertical-bars-container {
+            padding: 16px 8px 10px;
+          }
+
+          .bars-scroll-track {
+            justify-content: flex-start;
+          }
+
+          .mobile-swipe-indicator {
+            display: inline-flex;
+            align-items: center;
+          }
+
+          /* Switches to the stacked, one-per-row comparison view here —
+             matching the same 1024px breakpoint the rest of the
+             dashboard already collapses at, instead of waiting until
+             768px. Below full desktop width, the 4-column bar chart has
+             no room to breathe (labels/values clip, horizontal scroll
+             appears) — the vertical list is the readable choice for
+             comparing channels/categories anywhere narrower than that.
+          */
+          .desktop-only-bars {
+            display: none;
+          }
+
+          .mobile-only-bars {
+            display: flex;
+          }
+        }
+
+        @media (max-width: 768px) {
+          .dimension-tab-bar {
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+          }
+
+          .dim-tab-btn {
+            padding: 9px 8px;
+            font-size: 12px;
+          }
+        }
+
+        /* 4. Horizontal Bar Chart (replaces the old vertical card list —
+           lives inside same-day-chart-card, right below the dimension tabs) */
+        .horizontal-bar-chart {
+          display: flex;
+          flex-direction: column;
+          gap: 14px;
+          padding-top: 4px;
+          border-top: 1px solid #e2e8f0;
+        }
+
+        .bar-chart-header-row {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          flex-wrap: wrap;
           gap: 10px;
         }
 
-        .item-icon-bubble {
-          width: 28px;
-          height: 28px;
-          border-radius: 8px;
-          display: grid;
-          place-items: center;
-          color: #ffffff;
+        .bar-chart-header-label {
+          font-size: 12px;
           font-weight: 800;
-          font-size: 13px;
-        }
-
-        .item-name {
-          font-size: 14px;
-          font-weight: 700;
-          color: #1c1917;
-        }
-
-        .item-tag {
-          font-size: 10.5px;
-          font-weight: 800;
-          padding: 2px 8px;
-          border-radius: 6px;
-        }
-
-        /* Strict Two-Column Split */
-        .card-columns-grid {
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 12px;
-          border-top: 1px solid #ede7dc;
-          padding-top: 10px;
-        }
-
-        .card-column {
-          display: flex;
-          flex-direction: column;
-          gap: 4px;
-        }
-
-        .card-column.revenue-col {
-          border-right: 1px solid #ede7dc;
-          padding-right: 8px;
-        }
-
-        .col-label {
-          font-size: 10.5px;
-          font-weight: 700;
-          color: #a8a29e;
+          color: #64748b;
           text-transform: uppercase;
           letter-spacing: 0.4px;
         }
 
-        .col-main-val {
+        .bar-chart-rows {
           display: flex;
-          align-items: baseline;
-          gap: 6px;
-          flex-wrap: wrap;
+          flex-direction: column;
+          gap: 10px;
         }
 
-        .val-text {
-          font-size: 17px;
+        .bar-chart-row {
+          display: grid;
+          grid-template-columns: 150px 1fr 165px;
+          align-items: center;
+          gap: 12px;
+          padding: 6px;
+          border-radius: 10px;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          border: 1.5px solid transparent;
+        }
+
+        .bar-chart-row:hover {
+          background: #f8fafc;
+        }
+
+        .bar-chart-row.bar-row-selected {
+          border-color: #10b981;
+          background: #f0fdf4;
+        }
+
+        .bar-row-label {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          min-width: 0;
+        }
+
+        .bar-row-icon {
+          width: 24px;
+          height: 24px;
+          border-radius: 7px;
+          display: grid;
+          place-items: center;
+          color: #ffffff;
           font-weight: 800;
-          color: #1c1917;
+          font-size: 12px;
+          flex-shrink: 0;
         }
 
-        .mini-growth {
-          font-size: 11px;
-          font-weight: 800;
-        }
-
-        .mini-growth.positive {
-          color: #167a49;
-        }
-
-        .mini-growth.negative {
-          color: #c23820;
-        }
-
-        .column-delta-footer {
-          margin-top: 4px;
-          font-size: 11px;
+        .bar-row-name {
+          font-size: 13px;
           font-weight: 700;
-          padding: 4px 6px;
-          border-radius: 6px;
-          display: inline-block;
+          color: #0f172a;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+
+        .bar-row-track {
+          background: #f1f5f9;
+          border-radius: 7px;
+          height: 30px;
+          overflow: hidden;
+        }
+
+        .bar-row-fill {
+          height: 100%;
+          border-radius: 7px;
+          transition: width 0.3s ease;
+        }
+
+        .bar-row-value {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 8px;
           white-space: nowrap;
         }
 
-        .column-delta-footer.pos-footer {
-          background: #eaf6ee;
-          color: #167a49;
-          border: 1px solid #bfe3cc;
+        .bar-row-num {
+          font-size: 13px;
+          font-weight: 800;
+          color: #0f172a;
         }
 
-        .column-delta-footer.neg-footer {
-          background: #fdf0ee;
+        .bar-row-growth {
+          font-size: 11.5px;
+          font-weight: 700;
+        }
+
+        .bar-row-growth.positive {
+          color: #059669;
+        }
+
+        .bar-row-growth.negative {
           color: #c23820;
-          border: 1px solid #f6c8c0;
+        }
+
+        @media (max-width: 640px) {
+          .bar-chart-row {
+            grid-template-columns: 100px 1fr 110px;
+          }
+
+          .bar-row-name {
+            font-size: 12px;
+          }
+        }
+
+        /* Full-page category drilldown (opened by clicking a bar) */
+        .dimension-drilldown-page {
+          display: flex;
+          flex-direction: column;
+          gap: 14px;
+        }
+
+        .back-to-dashboard-btn {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          background: none;
+          border: none;
+          padding: 0;
+          color: #2563eb;
+          font-size: 13px;
+          font-weight: 700;
+          cursor: pointer;
+          width: fit-content;
+        }
+
+        .back-to-dashboard-btn:hover {
+          text-decoration: underline;
         }
 
         /* Drilldown Column */
@@ -2649,7 +5014,7 @@ export function RestaurantIQDashboard({
 
         .drilldown-paper-card {
           background: #ffffff;
-          border: 1px solid #ede7dc;
+          border: 1px solid #e2e8f0;
           border-radius: 16px;
           padding: 20px;
           box-shadow: 0 1px 4px rgba(0, 0, 0, 0.03);
@@ -2686,21 +5051,21 @@ export function RestaurantIQDashboard({
         .drilldown-title {
           font-size: 18px;
           font-weight: 800;
-          color: #1c1917;
+          color: #0f172a;
           margin: 0 0 2px;
         }
 
         .drilldown-subtitle {
           font-size: 12px;
-          color: #78716c;
+          color: #64748b;
         }
 
         .date-filter-group {
           display: flex;
-          background: #faf7f2;
+          background: #f1f5f9;
           padding: 3px;
           border-radius: 10px;
-          border: 1px solid #ede7dc;
+          border: 1px solid #e2e8f0;
           gap: 3px;
         }
 
@@ -2711,23 +5076,23 @@ export function RestaurantIQDashboard({
           font-weight: 700;
           padding: 6px 12px;
           border-radius: 7px;
-          color: #78716c;
+          color: #64748b;
           cursor: pointer;
           transition: all 0.15s ease;
         }
 
         .filter-btn.active {
-          background: #f97316;
+          background: #0f172a;
           color: #ffffff;
-          box-shadow: 0 1px 4px rgba(249, 115, 22, 0.25);
+          box-shadow: 0 1px 4px rgba(15, 23, 42, 0.25);
         }
 
         .custom-dates-bar {
           display: flex;
           align-items: center;
           gap: 14px;
-          background: #faf7f2;
-          border: 1px solid #ede7dc;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
           padding: 8px 14px;
           border-radius: 10px;
         }
@@ -2738,11 +5103,11 @@ export function RestaurantIQDashboard({
           gap: 6px;
           font-size: 12px;
           font-weight: 600;
-          color: #78716c;
+          color: #64748b;
         }
 
         .date-input-wrap input {
-          border: 1px solid #ede7dc;
+          border: 1px solid #e2e8f0;
           border-radius: 6px;
           padding: 4px 8px;
           font-size: 12px;
@@ -2763,8 +5128,8 @@ export function RestaurantIQDashboard({
         }
 
         .cumulative-card {
-          background: #fffbf7;
-          border: 1px solid #fed7aa;
+          background: #f0fdf4;
+          border: 1px solid #bbf7d0;
           border-radius: 12px;
           padding: 14px 16px;
           display: flex;
@@ -2773,14 +5138,14 @@ export function RestaurantIQDashboard({
         }
 
         .cumulative-card.orders-cum {
-          background: #f0f7ff;
+          background: #eff6ff;
           border-color: #bfdbfe;
         }
 
         .cum-label {
           font-size: 11px;
           font-weight: 700;
-          color: #78716c;
+          color: #64748b;
           text-transform: uppercase;
         }
 
@@ -2793,7 +5158,7 @@ export function RestaurantIQDashboard({
         .cum-number {
           font-size: 26px;
           font-weight: 800;
-          color: #1c1917;
+          color: #0f172a;
         }
 
         .cum-unit {
@@ -2807,7 +5172,7 @@ export function RestaurantIQDashboard({
           justify-content: space-between;
           align-items: center;
           font-size: 11px;
-          color: #78716c;
+          color: #64748b;
           margin-top: 4px;
           border-top: 1px dashed rgba(0, 0, 0, 0.08);
           padding-top: 6px;
@@ -2816,7 +5181,7 @@ export function RestaurantIQDashboard({
         .cum-period-tag {
           font-size: 10.5px;
           font-weight: 800;
-          color: #ea580c;
+          color: #059669;
         }
 
         .cum-period-tag.blue {
@@ -2825,8 +5190,8 @@ export function RestaurantIQDashboard({
 
         /* Trend Graph */
         .trend-graph-container {
-          background: #faf7f2;
-          border: 1px solid #ede7dc;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
           border-radius: 14px;
           padding: 16px;
           display: flex;
@@ -2845,7 +5210,7 @@ export function RestaurantIQDashboard({
         .graph-heading {
           font-size: 13px;
           font-weight: 800;
-          color: #1c1917;
+          color: #0f172a;
           margin: 0 0 2px;
           text-transform: uppercase;
           letter-spacing: 0.3px;
@@ -2853,7 +5218,7 @@ export function RestaurantIQDashboard({
 
         .graph-subheading {
           font-size: 11px;
-          color: #78716c;
+          color: #64748b;
         }
 
         .graph-mode-toggle {
@@ -2861,7 +5226,7 @@ export function RestaurantIQDashboard({
           background: #ffffff;
           padding: 2px;
           border-radius: 8px;
-          border: 1px solid #ede7dc;
+          border: 1px solid #e2e8f0;
         }
 
         .mode-btn {
@@ -2871,12 +5236,12 @@ export function RestaurantIQDashboard({
           font-weight: 700;
           padding: 4px 10px;
           border-radius: 6px;
-          color: #78716c;
+          color: #64748b;
           cursor: pointer;
         }
 
         .mode-btn.active {
-          background: #f97316;
+          background: #0f172a;
           color: #ffffff;
         }
 
@@ -2895,7 +5260,7 @@ export function RestaurantIQDashboard({
           text-align: center;
           background: rgba(255, 255, 255, 0.6);
           border-radius: 10px;
-          border: 1px dashed #ede7dc;
+          border: 1px dashed #e2e8f0;
         }
 
         .interactive-svg {
@@ -2918,8 +5283,8 @@ export function RestaurantIQDashboard({
           justify-content: space-between;
           align-items: center;
           font-size: 11px;
-          color: #78716c;
-          border-top: 1px solid #ede7dc;
+          color: #64748b;
+          border-top: 1px solid #e2e8f0;
           padding-top: 8px;
           flex-wrap: wrap;
           gap: 8px;
@@ -2945,24 +5310,24 @@ export function RestaurantIQDashboard({
         }
 
         .color-swatch.rev {
-          background: #f97316;
+          background: #10b981;
         }
 
         .color-swatch.orders {
-          background: #60a5fa;
+          background: #2563eb;
           border-radius: 50%;
         }
 
         .dashed-swatch {
           width: 14px;
           height: 0;
-          border-top: 2px dashed #71717a;
+          border-top: 2px dashed #94a3b8;
         }
 
         /* Summary Box */
         .drilldown-summary-box {
-          background: #fff7ed;
-          border: 1px solid #ffedd5;
+          background: #f0fdf4;
+          border: 1px solid #bbf7d0;
           border-radius: 12px;
           padding: 12px 14px;
           display: flex;
@@ -2973,13 +5338,13 @@ export function RestaurantIQDashboard({
         .summary-badge {
           font-size: 11.5px;
           font-weight: 800;
-          color: #ea580c;
+          color: #15803d;
         }
 
         .summary-text {
           font-size: 12px;
           font-weight: 600;
-          color: #1c1917;
+          color: #0f172a;
           margin: 0;
           line-height: 1.4;
         }
@@ -2989,7 +5354,7 @@ export function RestaurantIQDashboard({
           position: relative;
           background: #ffffff;
           border-radius: 14px;
-          border: 1px solid #ede7dc;
+          border: 1px solid #e2e8f0;
           padding: 14px 20px;
           display: flex;
           justify-content: center;
@@ -3003,7 +5368,7 @@ export function RestaurantIQDashboard({
           inset: 0 auto auto 0;
           width: 100%;
           height: 2px;
-          background: linear-gradient(90deg, transparent, #f97316, transparent);
+          background: linear-gradient(90deg, transparent, #10b981, transparent);
         }
 
         .footer-content {
@@ -3019,12 +5384,12 @@ export function RestaurantIQDashboard({
           width: 22px;
           height: 22px;
           border-radius: 6px;
-          background: linear-gradient(135deg, #f97316, #d97706);
+          background: linear-gradient(135deg, #0f172a, #10b981);
           color: #ffffff;
           font-size: 11px;
           font-weight: 900;
           letter-spacing: -0.5px;
-          box-shadow: 0 2px 4px rgba(249, 115, 22, 0.2);
+          box-shadow: 0 2px 4px rgba(16, 185, 129, 0.2);
         }
 
         .footer-title-text {
@@ -3037,15 +5402,15 @@ export function RestaurantIQDashboard({
         }
 
         .brand-name {
-          color: #1c1917;
+          color: #0f172a;
         }
 
         .bullet-sep {
-          color: #f97316;
+          color: #10b981;
         }
 
         .brand-tagline {
-          background: linear-gradient(90deg, #ea580c, #d97706);
+          background: linear-gradient(90deg, #059669, #2563eb);
           -webkit-background-clip: text;
           -webkit-text-fill-color: transparent;
           font-weight: 800;
@@ -3062,28 +5427,48 @@ export function RestaurantIQDashboard({
         ========================================================= */
         @media (max-width: 640px) {
           .restaurant-iq-page {
-            padding: 10px;
-            gap: 12px;
+            padding: 8px;
+            gap: 10px;
             overflow-x: hidden;
           }
 
           .iq-top-header {
             flex-direction: column;
             align-items: stretch;
-            padding: 12px 14px;
-            gap: 10px;
+            padding: 8px 12px;
+            gap: 6px;
           }
 
           .restaurant-title {
-            font-size: 18px;
+            font-size: 16px;
           }
 
-          .restaurant-title-wrap {
+          .brand-logo-group {
             gap: 8px;
+          }
+
+          .iq-logo-squircle {
+            width: 32px;
+            height: 32px;
+            font-size: 16px;
+            border-radius: 9px;
+          }
+
+          /* Pure branding text, not information — the one line an owner
+             glancing at their phone can afford to lose in exchange for
+             getting to the revenue number faster. */
+          .brand-subscript {
+            display: none;
           }
 
           .header-meta {
             margin-top: 0;
+            gap: 6px;
+          }
+
+          .date-chip, .shift-chip {
+            padding: 2px 6px;
+            font-size: 10px;
           }
 
           .header-right {
@@ -3097,22 +5482,33 @@ export function RestaurantIQDashboard({
             padding: 9px 10px;
           }
 
-          .kpi-top-grid {
+          .master-benchmark-card {
+            padding: 10px 12px;
             gap: 10px;
           }
 
-          .paper-kpi-card {
-            padding: 14px 16px;
+          .kpi-boxes-split {
+            grid-template-columns: 1fr;
+            gap: 10px;
           }
 
-          .kpi-value {
-            font-size: 24px;
+          .kpi-box-tile {
+            padding: 10px 12px;
+            gap: 8px;
           }
 
-          .kpi-benchmark-row {
+          /* This is the ONE number an owner opens this on their phone
+             for — it should be the biggest, most unmissable thing on
+             screen, not smaller than the desktop version. */
+          .rev-number, .orders-number {
+            font-size: 28px;
+          }
+
+          .benchmark-combined-strip {
             flex-direction: column;
             align-items: flex-start;
-            gap: 6px;
+            gap: 8px;
+            padding: 10px 12px;
           }
 
           .dimension-selector-section {
@@ -3136,16 +5532,8 @@ export function RestaurantIQDashboard({
             flex-shrink: 0;
           }
 
-          .card-columns-grid {
-            grid-template-columns: 1fr;
-            gap: 14px;
-          }
-
-          .card-column.revenue-col {
-            border-right: none;
-            padding-right: 0;
-            border-bottom: 1px solid #ede7dc;
-            padding-bottom: 12px;
+          .bar-chart-row {
+            grid-template-columns: 90px 1fr 100px;
           }
 
           .date-filter-group {

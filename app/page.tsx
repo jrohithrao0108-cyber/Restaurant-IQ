@@ -6153,6 +6153,64 @@ export default function HomePage() {
     };
   }, [currentUser?.restaurantId]);
 
+  // Realtime table/section sync — mirrors the orders channel above.
+  // Without this, a table/section change only ever showed up on whichever
+  // device actually made it (via onSectionsChanged's manual refetch) —
+  // any OTHER open session (a manager on their phone, a second tab) would
+  // keep showing the old layout until its own next unrelated refresh.
+  useEffect(() => {
+    if (
+      !isSupabaseConfigured ||
+      !currentUser ||
+      currentUser.role === "SUPER_ADMIN" ||
+      !currentUser.restaurantId ||
+      currentUser.restaurantId === "demo-restaurant-1"
+    ) {
+      return;
+    }
+
+    const restaurantId = currentUser.restaurantId;
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    const refreshTablesAndSections = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      // Debounced: creating a section then immediately adding a table
+      // into it fires two change events in quick succession — one
+      // refetch covers both instead of two redundant ones racing.
+      debounceTimer = setTimeout(() => {
+        loadRestaurantData(restaurantId);
+      }, 500);
+    };
+
+    const channel = supabase
+      .channel(`tables-live-${restaurantId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "restaurant_tables",
+          filter: `restaurant_id=eq.${restaurantId}`,
+        },
+        refreshTablesAndSections
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "table_sections",
+          filter: `restaurant_id=eq.${restaurantId}`,
+        },
+        refreshTablesAndSections
+      )
+      .subscribe();
+
+    return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      void supabase.removeChannel(channel);
+    };
+  }, [currentUser?.restaurantId]);
+
   async function loadRestaurants() {
     setLoading(true);
     setDatabaseError(null);
@@ -6393,15 +6451,25 @@ export default function HomePage() {
         console.warn("Could not load table sections:", e);
       }
 
-      // Auto-persist T1 through T30 into database if fewer than 30 tables exist.
-      // NOTE: this predates the sections feature — it force-fills a fixed
-      // T1-T30 regardless of how the restaurant actually wants their floor
-      // laid out. Now that sections exist, this is somewhat redundant with
-      // "Manage Sections" letting an owner define their own table count —
-      // kept for backward compatibility, but newly-seeded tables are
-      // assigned into the first existing section (rather than left
-      // unassigned/orphaned) so they still show up correctly grouped.
-      if (!restaurantId.startsWith("demo-") && formattedTables.length < 30) {
+      // Auto-persist T1 through T30 into database if fewer than 30 tables
+      // exist — but ONLY for a restaurant that hasn't touched the sections
+      // feature yet. This predates sections and force-fills a fixed T1-T30
+      // regardless of how the restaurant actually wants their floor laid
+      // out; once an owner has deliberately created their own sections
+      // (Outside/Family/AC/etc.), this must stop injecting a generic
+      // hardcoded layout on top of their real one. Every restaurant gets
+      // at least a "Main" section from the original migration, so this
+      // check is really "still on the untouched default," not "has zero
+      // sections at all."
+      const hasCustomizedSections =
+        (tableSections || []).length > 1 ||
+        ((tableSections || []).length === 1 && tableSections[0].name.toLowerCase() !== "main");
+
+      if (
+        !restaurantId.startsWith("demo-") &&
+        formattedTables.length < 30 &&
+        !hasCustomizedSections
+      ) {
         const existingNums = new Set(
           formattedTables.map((t) => t.tableNumber.trim().toUpperCase())
         );
