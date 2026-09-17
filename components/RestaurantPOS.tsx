@@ -503,7 +503,7 @@ export function RestaurantPOS({
 
   const [retryingTempId, setRetryingTempId] = useState<string | null>(null);
   const [retryingAll, setRetryingAll] = useState(false);
-  const [showRoundBreakdown, setShowRoundBreakdown] = useState(true);
+  const [showRoundBreakdown, setShowRoundBreakdown] = useState(false);
 
   // Resets a permanently-failed order back into rotation and immediately
   // asks the sync manager to try it, rather than waiting for the next
@@ -1010,6 +1010,16 @@ export function RestaurantPOS({
     const isDineIn = order.source === "DINE_IN";
     const cleanTable = isDineIn ? (order.table || "").trim().toUpperCase() : "";
 
+    const itemCount = (order.items || []).reduce((s, i) => s + (Number(i.qty) || 0), 0);
+    const confirmedSettle = window.confirm(
+      `Settle Table ${cleanTable || order.table}?\n\nDine-In${
+        cleanTable ? ` · Table ${cleanTable}` : ""
+      }\n${itemCount} item${itemCount === 1 ? "" : "s"} · ${money(
+        order.total
+      )}\n\nThis closes the order — it can't be added to after this.`
+    );
+    if (!confirmedSettle) return;
+
     if (cleanTable) setSettlingTableNumber(cleanTable);
 
     try {
@@ -1230,36 +1240,53 @@ export function RestaurantPOS({
         let newRoundCount = priorRoundCount;
         let newRoundBreakdown = priorRoundBreakdown;
 
-        if (shouldPrintKot) {
-          // Diff against everything already sent to the kitchen for THIS
-          // TABLE, so a dish already cooking/served never reprints just
-          // because the cart (left populated after Save) still shows it.
-          //
-          // This is reconstructed by summing every prior round's items
-          // from the PERSISTED roundBreakdown — not from an in-memory ref.
-          // A ref-based cache reset on every page reload/remount, which
-          // meant a reload between R1 and R2 made R1's items look "new"
-          // again: duplicated in the round breakdown AND reprinted as a
-          // second physical KOT ticket for dishes already cooking.
-          // roundBreakdown survives reload (it's saved on the Order object
-          // the same way kotRoundCount is), so this can't happen anymore.
-          const alreadySentQtyByKey = new Map<string, number>();
-          priorRoundBreakdown.forEach((r) => {
-            r.items.forEach((i) => {
-              const key = `${i.id}-${i.notes || ""}`;
-              alreadySentQtyByKey.set(key, (alreadySentQtyByKey.get(key) || 0) + i.qty);
-            });
+        // Diff against everything already recorded for THIS TABLE (whether
+        // that came from a prior Save or a prior KOT — both count as a
+        // round now), so a dish already logged never gets counted twice.
+        //
+        // This is reconstructed by summing every prior round's items from
+        // the PERSISTED roundBreakdown — not from an in-memory ref. A
+        // ref-based cache reset on every page reload/remount, which meant
+        // a reload between R1 and R2 made R1's items look "new" again:
+        // duplicated in the round breakdown AND reprinted as a second
+        // physical KOT ticket for dishes already cooking. roundBreakdown
+        // survives reload (it's saved on the Order object the same way
+        // kotRoundCount is), so this can't happen anymore.
+        const alreadySentQtyByKey = new Map<string, number>();
+        priorRoundBreakdown.forEach((r) => {
+          r.items.forEach((i) => {
+            const key = `${i.id}-${i.notes || ""}`;
+            alreadySentQtyByKey.set(key, (alreadySentQtyByKey.get(key) || 0) + i.qty);
           });
-          const diffItems = savedItems
-            .map((item) => {
-              const key = `${item.id}-${item.notes || ""}`;
-              const deltaQty = item.qty - (alreadySentQtyByKey.get(key) || 0);
-              return deltaQty > 0 ? { ...item, qty: deltaQty } : null;
-            })
-            .filter((i): i is (typeof savedItems)[number] => i !== null);
+        });
+        const diffItems = savedItems
+          .map((item) => {
+            const key = `${item.id}-${item.notes || ""}`;
+            const deltaQty = item.qty - (alreadySentQtyByKey.get(key) || 0);
+            return deltaQty > 0 ? { ...item, qty: deltaQty } : null;
+          })
+          .filter((i): i is (typeof savedItems)[number] => i !== null);
 
-          if (diffItems.length > 0) {
-            newRoundCount = priorRoundCount + 1;
+        if (diffItems.length > 0) {
+          newRoundCount = priorRoundCount + 1;
+          // Record exactly what was NEW in this round — not the running
+          // cart total — so the on-screen breakdown can show "R1: X, Y"
+          // then "R2: Z" underneath, instead of one merged list. This
+          // happens on Save too, not just KOT: Save = KOT-print, so a
+          // round is a round whether or not a physical ticket fired.
+          newRoundBreakdown = [
+            ...newRoundBreakdown,
+            {
+              round: newRoundCount,
+              items: diffItems.map((i) => ({ id: i.id, name: i.name, qty: i.qty, notes: i.notes })),
+            },
+          ];
+
+          // The daily KOT counter and the physical print stay strictly
+          // tied to an actual print happening — Save creating a round
+          // must never advance "today's Nth KOT printed" count or fire
+          // anything at the kitchen printer.
+          if (shouldPrintKot) {
             const globalKotNumber = getNextDailyKotNumber();
             const kotLabel = `KOT #${globalKotNumber} · Table ${cleanTable} · Round ${newRoundCount}`;
             try {
@@ -1275,19 +1302,9 @@ export function RestaurantPOS({
             } catch (e) {
               console.warn("KOT print skipped or dialog closed:", e);
             }
-            // Record exactly what was NEW in this round — not the running
-            // cart total — so the on-screen breakdown can show "R1: X, Y"
-            // then "R2: Z" underneath, instead of one merged list.
-            newRoundBreakdown = [
-              ...newRoundBreakdown,
-              {
-                round: newRoundCount,
-                items: diffItems.map((i) => ({ id: i.id, name: i.name, qty: i.qty, notes: i.notes })),
-              },
-            ];
-          } else {
-            showToast("No new items to send to the kitchen since the last KOT.", "info");
           }
+        } else if (shouldPrintKot) {
+          showToast("No new items to send to the kitchen since the last KOT.", "info");
         }
 
         // Reuse the SAME order id across every round of this sitting —
@@ -1587,6 +1604,27 @@ export function RestaurantPOS({
       showToast("Cart is empty! Please add dishes before settling.", "info");
       return;
     }
+
+    // Settle closes the order out for good — confirm exactly what's being
+    // closed (channel, table, total) before it happens, so a mis-tap can't
+    // silently close the wrong table's or the wrong channel's order.
+    const confirmLabel =
+      source === "DINE_IN"
+        ? table
+          ? `Dine-In · Table ${table}`
+          : "Dine-In (no table)"
+        : source === "TAKEAWAY"
+          ? "Takeaway"
+          : source === "SWIGGY"
+            ? "Swiggy"
+            : "Zomato";
+    const itemCount = cart.reduce((s, i) => s + (Number(i.qty) || 0), 0);
+    const confirmedSettle = window.confirm(
+      `Settle this order?\n\n${confirmLabel}\n${itemCount} item${itemCount === 1 ? "" : "s"} · ${money(
+        grandTotal
+      )}\n\nThis closes the order — it can't be added to after this.`
+    );
+    if (!confirmedSettle) return;
 
     const cleanTable = source === "DINE_IN" ? (table ? table.trim().toUpperCase() : null) : null;
     const existingOrderForSitting =
@@ -4432,44 +4470,59 @@ export function RestaurantPOS({
         .tables-30-grid {
           flex: 1;
           display: grid;
-          grid-template-columns: repeat(6, 1fr);
-          grid-template-rows: repeat(5, 1fr);
-          gap: 6px;
+          grid-template-columns: repeat(8, 1fr);
+          grid-auto-rows: minmax(0, 1fr);
+          gap: 5px;
           overflow-y: auto;
         }
 
         .table-tile-card {
-          background: #ffffff;
-          border: 1.5px solid #ede7dc;
-          border-radius: 7px;
-          padding: 6px 8px;
+          border-radius: 6px;
+          padding: 4px 6px;
           display: flex;
           flex-direction: column;
           justify-content: space-between;
           cursor: pointer;
           transition: all 0.12s ease;
           min-height: 0;
-          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
         }
 
         .table-tile-card:hover {
-          border-color: #93c5fd;
           transform: translateY(-1px);
-          box-shadow: 0 3px 8px rgba(217, 151, 38, 0.08);
         }
 
         .table-tile-card.current {
-          border-color: #d99726;
-          box-shadow: 0 0 0 1.5px #d99726;
+          border-color: #d99726 !important;
+          box-shadow: 0 0 0 2px #d99726 !important;
+          opacity: 1 !important;
         }
 
         .table-tile-card.vacant {
+          background: #f4f2ee;
+          border: 1.5px solid #e5e0d5;
           border-left: 3.5px solid #10b981;
+          box-shadow: none;
+        }
+
+        .table-tile-card.vacant:hover {
+          background: #ffffff;
+          border-color: #93c5fd;
+          box-shadow: 0 3px 8px rgba(217, 151, 38, 0.1);
+        }
+
+        .table-tile-card.vacant .tile-title b,
+        .table-tile-card.vacant .tile-title small {
+          color: #9a938a;
         }
 
         .table-tile-card.occupied {
-          border-left: 3.5px solid #ef4444;
-          background: #fffafa;
+          background: #fef2f2;
+          border: 2px solid #ef4444;
+          box-shadow: 0 2px 8px rgba(239, 68, 68, 0.25);
+        }
+
+        .table-tile-card.occupied:hover {
+          box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35);
         }
 
         .tile-head {
@@ -4480,14 +4533,14 @@ export function RestaurantPOS({
         }
 
         .tile-title b {
-          font-size: 13.5px;
+          font-size: 12.5px;
           font-weight: 900;
           color: #1c1917;
           margin-right: 4px;
         }
 
         .tile-title small {
-          font-size: 10px;
+          font-size: 9px;
           color: #78716c;
           font-weight: 600;
         }
@@ -4543,32 +4596,32 @@ export function RestaurantPOS({
         }
 
         .round-breakdown-panel {
-          margin: 0 10px 8px;
-          padding: 8px 10px;
+          margin: 0 10px 6px;
+          padding: 6px 9px;
           border-radius: 8px;
           background: #faf5ff;
           border: 1px solid #ede9fe;
-          max-height: 160px;
+          max-height: 96px;
           overflow-y: auto;
         }
 
         .round-breakdown-empty {
-          font-size: 11px;
+          font-size: 10.5px;
           color: #78716c;
           font-weight: 600;
         }
 
         .round-breakdown-group + .round-breakdown-group {
-          margin-top: 8px;
-          padding-top: 8px;
+          margin-top: 5px;
+          padding-top: 5px;
           border-top: 1px dashed #ddd6fe;
         }
 
         .round-breakdown-label {
-          font-size: 10.5px;
+          font-size: 10px;
           font-weight: 800;
           color: #6d28d9;
-          margin-bottom: 3px;
+          margin-bottom: 2px;
           letter-spacing: 0.02em;
         }
 
@@ -4576,9 +4629,10 @@ export function RestaurantPOS({
           display: flex;
           justify-content: space-between;
           gap: 8px;
-          font-size: 11.5px;
+          font-size: 10.5px;
           color: #44403c;
-          padding: 1px 0;
+          padding: 0;
+          line-height: 1.4;
         }
 
         .round-breakdown-qty {
@@ -5056,13 +5110,13 @@ export function RestaurantPOS({
           background: #ffffff;
           border: 1.5px solid #ede7dc;
           border-radius: 7px;
-          padding: 6px 8px;
+          padding: 5px 7px;
           display: flex;
           flex-direction: column;
           justify-content: space-between;
           cursor: pointer;
           transition: all 0.12s ease;
-          min-height: 92px;
+          min-height: 80px;
           box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
           position: relative;
           overflow: hidden;
@@ -5153,10 +5207,10 @@ export function RestaurantPOS({
 
         .dish-name {
           margin: 0;
-          font-size: 12px;
+          font-size: 13px;
           font-weight: 700;
           color: #1c1917;
-          line-height: 1.25;
+          line-height: 1.28;
           display: -webkit-box;
           -webkit-line-clamp: 2;
           -webkit-box-orient: vertical;
@@ -5176,13 +5230,13 @@ export function RestaurantPOS({
           display: flex;
           align-items: center;
           gap: 2px;
-          padding: 0 9px;
-          height: 28px;
+          padding: 0 7px;
+          height: 22px;
           background: #faf7f2;
           border: 1px solid #e7e0d3;
-          border-radius: 6px;
+          border-radius: 5px;
           color: #44403c;
-          font-size: 11px;
+          font-size: 10px;
           font-weight: 700;
           cursor: pointer;
           transition: all 0.12s ease;

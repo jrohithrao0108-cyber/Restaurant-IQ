@@ -126,7 +126,7 @@ export function ModernLogin({
 
       onLogin(userObj);
     } catch (err: any) {
-      console.error("LOGIN ERROR:", err);
+      console.warn("LOGIN ERROR:", err);
 
       const isNetworkIssue =
         err?.message?.includes("Failed to fetch") ||

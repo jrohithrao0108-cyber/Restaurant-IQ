@@ -50,6 +50,8 @@ import { printKitchenOrderTicket } from "@/lib/printing/kotPrinter";
 import { printCustomerBillReceipt } from "@/lib/printing/receiptPrinter";
 import {
   enqueueOfflineOrder,
+  getOfflineOrdersQueue,
+  removeOfflineOrder,
   cacheMenuItems,
   getCachedMenuItems,
   cacheTables,
@@ -400,11 +402,18 @@ function getMenuPrice(row: any) {
 }
 
 function getMenuCategory(row: any) {
+  // row can legitimately be null: any order_item whose menu_item_id is
+  // null (see offlineSync.ts — demo/offline-fallback items with
+  // non-UUID ids are stored with menu_item_id: null on purpose) has no
+  // matching menu_items row for Supabase's join to return, so `row` here
+  // is null rather than an object. Fall back to an empty object instead
+  // of crashing on `row.category`.
+  const safeRow = row || {};
   return normalizeCategory(
-    row.category ??
-      row.category_name ??
-      row.menu_category ??
-      row.category_title ??
+    safeRow.category ??
+      safeRow.category_name ??
+      safeRow.menu_category ??
+      safeRow.category_title ??
       ""
   );
 }
@@ -613,7 +622,7 @@ function Sidebar({
             </div>
 
             <div>
-              <b>
+              <b className="restaurant-name-highlight">
                 {user.restaurantName ||
                   "Your restaurant"}
               </b>
@@ -952,37 +961,80 @@ function TableView({
     setClosingTable(tableNumber);
     try {
       // Find all open orders matching this exact table number
-      const openOrderIds = orders
-        .filter(
-          (order) =>
-            order.source === "DINE_IN" &&
-            order.table?.trim() === cleanTable &&
-            !order.closedAt &&
-            order.databaseId
-        )
-        .map((order) => order.databaseId as string);
+      const matchingOrders = orders.filter(
+        (order) =>
+          order.source === "DINE_IN" &&
+          order.table?.trim() === cleanTable &&
+          !order.closedAt
+      );
 
-      if (openOrderIds.length === 0) {
+      if (matchingOrders.length === 0) {
         alert(`No open orders found for Table ${cleanTable}.`);
         return;
       }
 
+      // Route through the same durable offline queue every other close/
+      // settle action uses (see RestaurantPOS.tsx's handleClearTableOrder),
+      // instead of a raw un-queued Supabase call. Two real problems that
+      // fixes:
+      //   1. Offline resilience: the old call just threw and gave up with
+      //      no internet — nothing was saved, nothing retried. Now it's
+      //      durably queued and the background sync manager handles it,
+      //      online now or the moment connectivity returns.
+      //   2. Correctness for a still-local table: a table's *current*
+      //      order, before it's ever been Settled, only has a synthetic
+      //      local id (never a real Supabase UUID — OPEN orders
+      //      intentionally don't sync until Settled). The old filter kept
+      //      any order with a truthy databaseId, so it could hand a fake
+      //      id straight to Supabase — that update call would silently
+      //      match zero rows, report no error, and this code would still
+      //      say "closed successfully" while the real local order sat
+      //      completely untouched, ready to reappear once it eventually
+      //      synced on its own.
+      const queue = await getOfflineOrdersQueue(restaurantId || undefined);
+      const localRecord = queue.find(
+        (q) =>
+          !q.permanentlyFailed &&
+          q.orderType === "DINE_IN" &&
+          q.tableNumber === cleanTable
+      );
+      if (localRecord) {
+        // Never reached Supabase — removing it locally is enough to close it.
+        await removeOfflineOrder(localRecord.tempId);
+      }
+
       const closedAtIso = new Date().toISOString();
 
-      const { error } = await supabase
-        .from("orders")
-        .update({ closed_at: closedAtIso })
-        .in("id", openOrderIds);
+      for (const order of matchingOrders) {
+        await enqueueOfflineOrder({
+          tempId: `force-close-${cleanTable}-${order.id}-${Date.now()}`,
+          restaurantId,
+          createdByUserId: null,
+          orderNumber: order.id,
+          orderType: "DINE_IN",
+          tableNumber: cleanTable,
+          channel: "DINE_IN",
+          paymentMode: order.payment || "CASH",
+          total: order.total,
+          status: "CANCELLED",
+          items: order.items || [],
+          createdAt: order.createdAt || closedAtIso,
+          syncAttempts: 0,
+          orderPhase: "SETTLED",
+        });
+      }
 
-      if (error) throw error;
-
-      // Call parent close handler or trigger state update
+      // Local UI state (todayOrders, occupied-table tracking, etc.) lives
+      // in the parent — this component's job ends at the durable write above.
       await onCloseTable(cleanTable);
 
       alert(`Table ${cleanTable} closed successfully.`);
     } catch (err: any) {
       console.error("CLOSE TABLE ERROR:", err);
-      alert(err?.message || "Could not close this table's order.");
+      alert(
+        err?.message ||
+          "Could not close this table's order right now. If you're offline, it's saved and will finish closing once you're back online."
+      );
     } finally {
       setClosingTable(null);
     }
@@ -5720,6 +5772,13 @@ export default function HomePage() {
 
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [mounted, setMounted] = useState(false);
+  // Distinguishes "user pressed Logout" from "the network dropped and a
+  // token refresh failed" — only the former should ever clear a saved
+  // login. Supabase's onAuthStateChange fires with session=null in BOTH
+  // cases, so without this flag there's no way to tell them apart, and a
+  // POS terminal with flaky WiFi ends up forcing a fresh login every time
+  // the connection blips.
+  const explicitSignOutRef = useRef(false);
 
   const [tab, setTab] =
     useState<Tab>("new");
@@ -5838,18 +5897,47 @@ export default function HomePage() {
     let isCurrent = true;
 
     async function checkExistingSession() {
+      let hadSavedUser = false;
       try {
         const saved = localStorage.getItem("restaurant_iq_user");
         if (saved && isCurrent) {
           const parsed = JSON.parse(saved);
           setCurrentUser(parsed);
-          if (parsed?.id?.startsWith("demo-") || !isSupabaseConfigured) {
-            return;
-          }
+          hadSavedUser = true;
+          // Trust this cached login immediately and unconditionally — do
+          // NOT fall through to supabase.auth.getSession() below for any
+          // account type. getSession() silently attempts a token refresh
+          // if the access token has expired (Supabase's default is ~1
+          // hour), and that refresh requires network. With no internet,
+          // the refresh fails, getSession() comes back with no session,
+          // and the old code below treated that identically to "never
+          // logged in" — wiping a perfectly valid cached login just
+          // because WiFi was down at that moment. A POS terminal with
+          // spotty connectivity would then demand a fresh
+          // username/password every time the connection blipped, which is
+          // exactly what shouldn't happen: staff should be able to stay
+          // logged in for weeks/months on a device, offline or not.
+          //
+          // We still opportunistically re-validate in the background
+          // below (only when actually online), so a real deactivation
+          // eventually still takes effect — it just never happens purely
+          // as a side effect of being offline.
         }
       } catch (e) {}
 
       if (!isSupabaseConfigured) return;
+
+      // Background revalidation — best-effort only. Runs whether or not
+      // we had a saved user, but its failure modes must NEVER clear
+      // currentUser/localStorage on their own; only a definitive "this
+      // account is deactivated" result (which requires a successful,
+      // online round-trip to Supabase) is allowed to log anyone out here.
+      if (hadSavedUser && (typeof navigator === "undefined" || navigator.onLine === false)) {
+        // Already offline — don't even attempt the round-trip; there's
+        // nothing to learn from it and no point risking a slow/hanging
+        // request. Stay logged in on the cached identity as-is.
+        return;
+      }
 
       try {
         const {
@@ -5857,7 +5945,15 @@ export default function HomePage() {
         } = await supabase.auth.getSession();
 
         if (!session?.user) {
-          if (isCurrent) {
+          // No session — could genuinely mean "never logged in" (no saved
+          // user either), or it could mean an expired-token refresh just
+          // failed for some reason even though we appear online (e.g. a
+          // captive portal, a flaky connection that passes the
+          // navigator.onLine check but can't actually reach Supabase).
+          // Only treat this as a real logout when there was NO cached
+          // login to begin with — if there was one, leave it alone rather
+          // than guessing.
+          if (!hadSavedUser && isCurrent) {
             setCurrentUser(null);
             try {
               localStorage.removeItem("restaurant_iq_user");
@@ -5883,7 +5979,17 @@ export default function HomePage() {
           .eq("auth_user_id", session.user.id)
           .maybeSingle();
 
-        if (error || !data || data.is_active === false) {
+        // A query error here (network blip mid-request, RLS hiccup, etc.)
+        // is NOT proof the account is gone — only an explicit is_active
+        // === false, successfully read, means that. Anything else: leave
+        // the cached login as-is rather than logging the user out on an
+        // ambiguous failure.
+        if (error) {
+          console.error("SESSION REVALIDATION ERROR (ignored, keeping cached login):", error);
+          return;
+        }
+
+        if (!data || data.is_active === false) {
           if (data?.is_active === false) {
             await supabase.auth.signOut();
           }
@@ -5916,7 +6022,9 @@ export default function HomePage() {
           } catch (e) {}
         }
       } catch (err) {
-        console.error("SESSION RESTORE ERROR:", err);
+        // Network/unexpected error — keep whatever cached login we had
+        // (or lack thereof); never actively log out on an exception here.
+        console.error("SESSION REVALIDATION ERROR (ignored, keeping cached login):", err);
       }
     }
 
@@ -5926,15 +6034,13 @@ export default function HomePage() {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!session && isCurrent) {
-        try {
-          const saved = localStorage.getItem("restaurant_iq_user");
-          if (saved) {
-            const parsed = JSON.parse(saved);
-            if (parsed?.id?.startsWith("demo-") || !isSupabaseConfigured) {
-              return;
-            }
-          }
-        } catch (e) {}
+        // Only an explicit, user-initiated logout (handleLogout sets this
+        // flag right before calling supabase.auth.signOut()) is allowed to
+        // clear a cached login here. Supabase fires this same callback
+        // with session=null after ANY failed token refresh too — which on
+        // a device that's merely offline would otherwise force a fresh
+        // login for no real reason.
+        if (!explicitSignOutRef.current) return;
 
         setCurrentUser(null);
         try {
@@ -6096,10 +6202,69 @@ export default function HomePage() {
     setDatabaseError(null);
 
     if (!isSupabaseConfigured || restaurantId === "demo-restaurant-1") {
-      setProducts(DEMO_PRODUCTS);
+      // Demo login has been removed from this app, so DEMO_PRODUCTS
+      // (fake dishes with non-UUID ids that fail to sync — see
+      // offlineSync.ts) must never populate the real menu. If this branch
+      // is ever hit — Supabase misconfigured, or a stray demo restaurantId
+      // — show an empty menu instead so nothing unsellable can be ordered.
+      setProducts([]);
       setRestaurantTables(DEMO_TABLES);
       setTodayOrders(DEMO_TODAY_ORDERS);
+      if (!isSupabaseConfigured) {
+        setDatabaseError(
+          "Supabase isn't configured for this app (missing/placeholder environment variables) — showing no menu items."
+        );
+      }
       setLoading(false);
+      return;
+    }
+
+    // Offline-first short-circuit: navigator.onLine === false means the
+    // browser already knows there's no connection, so don't even attempt
+    // the Supabase calls below. A fetch made while offline doesn't always
+    // reject quickly — depending on OS/network stack it can sit pending
+    // for a long time before failing, which is what made this screen look
+    // permanently stuck on "Connecting to restaurant database...". Going
+    // straight to cached/demo data here means the app is usable within
+    // milliseconds of losing WiFi instead of waiting on a call that may
+    // never resolve.
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      try {
+        const cachedMenu = await getCachedMenuItems(restaurantId);
+        if (cachedMenu && cachedMenu.length > 0) {
+          setProducts(cachedMenu);
+        } else {
+          // No real menu cached yet — do NOT fall back to DEMO_PRODUCTS
+          // here. Those are fake dishes ("Paneer Tikka" etc.) with
+          // non-UUID ids; if staff order one while offline, it queues
+          // locally and then fails to sync forever (see offlineSync.ts —
+          // "invalid input syntax for type uuid"). An empty menu with a
+          // clear message is safer than dishes that look real but can't
+          // actually be sold.
+          setProducts([]);
+        }
+
+        const cachedTbls = await getCachedTables(restaurantId);
+        setRestaurantTables(cachedTbls && cachedTbls.length > 0 ? cachedTbls : DEMO_TABLES);
+
+        // Do NOT substitute DEMO_TODAY_ORDERS here. It renders through the
+        // exact same UI as real orders — a demo table shown as "occupied"
+        // is visually indistinguishable from a real one, and staff acting
+        // on it (thinking a table has a real order when it doesn't) is a
+        // genuine operational hazard, not just a cosmetic issue. Showing
+        // the true state — no cached orders yet, tables genuinely vacant —
+        // with a clear message is the safe default; DEMO_TODAY_ORDERS was
+        // only ever meant for the intentional demo-restaurant login path
+        // above, not as an offline placeholder for a real restaurant.
+
+        setDatabaseError(
+          cachedMenu && cachedMenu.length > 0
+            ? "You're offline. Showing the last saved menu and tables — orders will sync once you're back online."
+            : "You're offline and no menu has been downloaded yet on this device. Connect to WiFi once so the real menu can be cached, then it'll be available offline too."
+        );
+      } finally {
+        setLoading(false);
+      }
       return;
     }
 
@@ -6253,12 +6418,17 @@ export default function HomePage() {
         err
       );
 
-      // Offline fallback: load cached menu & tables if available, or demo data
+      // Offline fallback: load cached menu & tables if available. Menu
+      // intentionally does NOT fall back to DEMO_PRODUCTS — those are fake
+      // dishes with non-UUID ids that fail to sync if ordered (see
+      // offlineSync.ts). Tables can still use a generic DEMO_TABLES
+      // placeholder since table numbers are plain text, not IDs that need
+      // to match a real database row.
       const cachedMenu = await getCachedMenuItems(restaurantId);
       if (cachedMenu && cachedMenu.length > 0) {
         setProducts(cachedMenu);
       } else {
-        setProducts(DEMO_PRODUCTS);
+        setProducts([]);
       }
       const cachedTbls = await getCachedTables(restaurantId);
       if (cachedTbls && cachedTbls.length > 0) {
@@ -6267,9 +6437,16 @@ export default function HomePage() {
         setRestaurantTables(DEMO_TABLES);
       }
 
-      if (todayOrders.length === 0) {
-        setTodayOrders(DEMO_TODAY_ORDERS);
-      }
+      // Do NOT substitute DEMO_TODAY_ORDERS here either — same reasoning
+      // as the navigator.onLine === false branch above: it renders
+      // through the exact same UI as real orders, so a fake "occupied"
+      // table is indistinguishable from a real one. This catch fires
+      // whenever the real fetch fails for ANY reason (offline, Supabase
+      // down, a bad network path) — navigator.onLine is not reliable
+      // enough to guarantee that branch is the only place a failure can
+      // land, as confirmed by this exact fallback firing even with WiFi
+      // fully disabled, because localhost traffic succeeds regardless of
+      // whether the machine has real internet access.
     } finally {
       setLoading(false);
     }
@@ -6341,17 +6518,50 @@ export default function HomePage() {
   function handlePlaced(
     order: Order
   ) {
+    const isRealUuid = (v?: string | null) =>
+      Boolean(v && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v));
+
     setTodayOrders((current) => {
       const cleanTable = order.table ? order.table.trim().toUpperCase() : null;
       let matched = false;
       const next = current.map((o) => {
         const oTable = o.table ? o.table.trim().toUpperCase() : null;
         const isSameDb = Boolean(order.databaseId && o.databaseId === order.databaseId);
-        const isSameId = Boolean(order.id && o.id === order.id);
+
+        // order.id is the order_number, not the real database UUID — and
+        // order_number is NOT guaranteed unique. Demo/test data reuses
+        // literal values (e.g. the same "DEMO-1004" label across many
+        // genuinely different database rows), and client-generated
+        // numbers are only the last 5 digits of a timestamp, which repeat
+        // every ~100 seconds. Once EITHER side already has a real, synced
+        // database identity, a shared order_number alone must never be
+        // trusted to mean "this is the same order" — only fall back to
+        // it while at least one side is still a local, not-yet-synced
+        // placeholder with no real id to compare yet.
+        const eitherHasRealId = isRealUuid(order.databaseId) || isRealUuid(o.databaseId);
+        const isSameId = !eitherHasRealId && Boolean(order.id && o.id === order.id);
+
         const isSameOpenTable = Boolean(cleanTable && oTable === cleanTable && !o.closedAt);
 
         if (isSameDb || isSameId || isSameOpenTable) {
           matched = true;
+
+          // Once a record is closed, treat that as final. A stale/
+          // out-of-order onPlaced call for the same id (e.g. a delayed
+          // "still open" update from an earlier Save, racing in AFTER a
+          // Settle for the same table already landed and closed it) must
+          // never be allowed to downgrade it — `closedAt` itself can't be
+          // un-set below (the `||` only ever adds one), but `status`
+          // could silently flip back from "COMPLETED" to "PENDING" since
+          // a falsy order.closedAt on the stale update would fall through
+          // to `order.status || o.status`, and the stale order's own
+          // truthy status would win over the correct, already-closed one.
+          // Ignoring stale updates against an already-closed record
+          // entirely closes that gap.
+          if (o.closedAt && !order.closedAt) {
+            return o;
+          }
+
           return {
             ...o,
             ...order,
@@ -6382,58 +6592,22 @@ export default function HomePage() {
   async function handleCloseTable(
     tableNumber: string
   ) {
-    const openOrderIds = todayOrders
-      .filter(
-        (order) =>
-          order.source === "DINE_IN" &&
-          order.table === tableNumber &&
-          !order.closedAt &&
-          order.databaseId
-      )
-      .map((order) => order.databaseId as string);
-
-    if (openOrderIds.length === 0) return;
-
+    // TableView's own handleCloseTable already did the durable, offline-
+    // safe write (via enqueueOfflineOrder) before calling this as
+    // onCloseTable — this is purely a local UI-state update now, not a
+    // second Supabase call. The old version duplicated the same raw
+    // Supabase update here AND in TableView for every close, and — same
+    // as that one — had no offline fallback of its own.
     const closedAtIso = new Date().toISOString();
-
-    if (!isSupabaseConfigured || currentUser?.restaurantId === "demo-restaurant-1") {
-      setTodayOrders((current) =>
-        current.map((order) =>
-          openOrderIds.includes(order.databaseId as string)
-            ? { ...order, closedAt: closedAtIso }
-            : order
-        )
-      );
-      return;
-    }
-
-    try {
-      const { error } = await supabase
-        .from("orders")
-        .update({ closed_at: closedAtIso })
-        .in("id", openOrderIds);
-
-      if (error) throw error;
-
-      setTodayOrders((current) =>
-        current.map((order) =>
-          openOrderIds.includes(
-            order.databaseId as string
-          )
-            ? { ...order, closedAt: closedAtIso }
-            : order
-        )
-      );
-    } catch (err: any) {
-      console.error(
-        "CLOSE TABLE ERROR:",
-        err
-      );
-      alert(
-        err?.message ||
-          "Could not close this table's order."
-      );
-    }
+    setTodayOrders((current) =>
+      current.map((order) =>
+        order.source === "DINE_IN" &&
+        order.table === tableNumber &&
+        !order.closedAt
+          ? { ...order, closedAt: closedAtIso }
+          : order
+      )
+    );
   }
 
   function handleRestaurantCreated(
@@ -6454,6 +6628,7 @@ export default function HomePage() {
   }
 
   async function handleLogout() {
+    explicitSignOutRef.current = true;
     try {
       localStorage.removeItem("restaurant_iq_user");
     } catch (e) {}
@@ -7085,6 +7260,18 @@ export default function HomePage() {
           display: block;
           font-size: 15px;
           color: #1c1917;
+        }
+
+        .restaurant-name-highlight {
+          display: inline-block !important;
+          font-size: 14px !important;
+          font-weight: 800 !important;
+          color: #b47814 !important;
+          background: #fef9ee !important;
+          border: 1px solid #fde68a !important;
+          padding: 2px 9px !important;
+          border-radius: 8px !important;
+          letter-spacing: -0.1px;
         }
 
         .restaurant-id small {

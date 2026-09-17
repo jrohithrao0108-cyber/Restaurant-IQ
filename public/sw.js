@@ -5,23 +5,22 @@
 // loaded). This file is what lets the app *load* at all after the tab is
 // closed, the machine restarts, or the browser crashes while offline.
 //
-// STRATEGY (no build-time plugin, so this can't precache exact hashed
-// Next.js chunk filenames — those change every deploy):
-//   - Navigation requests (the HTML document, e.g. opening /pos):
-//     network-first, falling back to the last cached copy of that page
-//     if the network is unavailable.
-//   - Static assets (/_next/static/*, images, fonts): cache-first, since
-//     these are content-hashed by Next.js and safe to cache forever once
-//     fetched — a new deploy gets new hashes, so this never serves stale
-//     code.
-//   - Everything else (API calls, Supabase requests): NOT intercepted —
-//     goes straight to the network. Order data offline is handled entirely
-//     by IndexedDB (see src/lib/offline/*), not by this service worker.
+// CACHE_VERSION IS CRITICAL AND MUST CHANGE ON EVERY DEPLOY.
+// If it doesn't, old cached HTML/JS from a previous build never gets
+// evicted — the activate handler below only deletes caches from an OLDER
+// version string, so a version string that never changes means nothing
+// old is ever cleaned up. Every deploy you've ever tested keeps
+// accumulating in the same bucket forever, and an offline refresh can
+// silently resurrect an arbitrarily old build (old bugs included) with no
+// errors and no visible sign anything's stale.
 //
-// Every successful online visit silently "warms" the cache for the next
-// offline visit — no separate build step required.
-
-const CACHE_VERSION = "pos-shell-v1";
+// Bump this to something that changes automatically, not a string you
+// have to remember to edit. Easiest reliable option without extra build
+// tooling: the current date+time, updated by hand right before each
+// deploy. Better option if you want it fully automatic: read Next.js's
+// own generated .next/BUILD_ID at build time and inline it here via a
+// small prebuild script — ask if you want that wired up.
+const CACHE_VERSION = "pos-shell-2026-09-17-01"; // <-- CHANGE THIS EVERY DEPLOY
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 
 // Update this to the real path(s) staff actually open the POS from, so the
@@ -55,7 +54,9 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(
     (async () => {
       // Drop caches from any previous CACHE_VERSION so old deploys don't
-      // pile up in storage forever.
+      // pile up in storage forever. This only actually does anything if
+      // CACHE_VERSION was bumped since the last deploy — see the warning
+      // above.
       const keys = await caches.keys();
       await Promise.all(
         keys
@@ -86,7 +87,10 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return;
 
   // Navigations (opening/reloading a page): network-first, cache fallback.
-  // This is what makes "reopen the app with zero internet" actually work.
+  // This is what makes "reopen the app with zero internet" actually work
+  // — but ONLY serves genuinely CURRENT content, because activate() above
+  // just purged every older cache. The fallback here can only ever be as
+  // fresh as your last deploy's CACHE_VERSION bump.
   if (req.mode === "navigate") {
     event.respondWith(
       (async () => {
@@ -112,6 +116,10 @@ self.addEventListener("fetch", (event) => {
 
   // Static, content-hashed assets: cache-first — safe to trust forever,
   // and this is what makes the app's JS/CSS actually available offline.
+  // Safe specifically because Next.js content-hashes these filenames, so a
+  // new deploy's files never collide with old ones under the same name —
+  // the risk here is purely stale HTML pointing at chunks that no longer
+  // exist after a version bump, which activate()'s cleanup prevents.
   if (isStaticAsset(url)) {
     event.respondWith(
       (async () => {

@@ -244,7 +244,15 @@ class OfflineSyncManager {
     if (item.items && item.items.length > 0) {
       const orderItems = item.items.map((i) => ({
         order_id: orderRecord.id,
-        menu_item_id: i.id,
+        // Demo/offline-fallback menu items (see DEMO_PRODUCTS / cached menu
+        // fallback in page.tsx) use ids like "demo-p1" — not real UUIDs.
+        // order_items.menu_item_id is a uuid column, so sending one of
+        // those strings straight through fails the whole insert with
+        // "invalid input syntax for type uuid" and the order never syncs.
+        // name_snapshot/price_snapshot already carry everything needed to
+        // display and total this line item, so menu_item_id can safely be
+        // null when it isn't a real menu row.
+        menu_item_id: toValidUuidOrNull(i.id),
         name_snapshot: i.name,
         price_snapshot: i.price,
         qty: i.qty,
