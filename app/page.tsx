@@ -118,6 +118,7 @@ type Order = {
   createdAt: string;
   closedAt?: string | null;
   status?: string;
+  billNo?: number;
 };
 
 type RestaurantRow = {
@@ -130,6 +131,13 @@ type RestaurantTable = {
   tableNumber: string;
   capacity: number;
   isActive: boolean;
+  sectionId?: string | null;
+};
+
+type TableSection = {
+  id: string;
+  name: string;
+  displayOrder: number;
 };
 
 type UserRow = {
@@ -5823,6 +5831,7 @@ export default function HomePage() {
 
   const [restaurantTables, setRestaurantTables] =
     useState<RestaurantTable[]>([]);
+  const [tableSections, setTableSections] = useState<TableSection[]>([]);
 
   const [
     restaurants,
@@ -6345,7 +6354,7 @@ export default function HomePage() {
         error: tablesError,
       } = await supabase
         .from("restaurant_tables")
-        .select("id, table_number, capacity, is_active")
+        .select("id, table_number, capacity, is_active, section_id")
         .eq("restaurant_id", restaurantId)
         .order("table_number");
 
@@ -6358,17 +6367,50 @@ export default function HomePage() {
         tableNumber: String(table.table_number),
         capacity: Number(table.capacity) || 0,
         isActive: table.is_active !== false,
+        sectionId: table.section_id ? String(table.section_id) : null,
       }));
 
-      // Auto-persist T1 through T30 into database if fewer than 30 tables exist
+      // Sections change rarely compared to tables/orders, so this is kept
+      // as a simple online-only fetch (same treatment as menu edits) —
+      // no offline queue for section management in this pass.
+      try {
+        const { data: rawSections, error: sectionsError } = await supabase
+          .from("table_sections")
+          .select("id, name, display_order")
+          .eq("restaurant_id", restaurantId)
+          .order("display_order");
+
+        if (!sectionsError && rawSections) {
+          setTableSections(
+            rawSections.map((s: any) => ({
+              id: String(s.id),
+              name: String(s.name),
+              displayOrder: Number(s.display_order) || 0,
+            }))
+          );
+        }
+      } catch (e) {
+        console.warn("Could not load table sections:", e);
+      }
+
+      // Auto-persist T1 through T30 into database if fewer than 30 tables exist.
+      // NOTE: this predates the sections feature — it force-fills a fixed
+      // T1-T30 regardless of how the restaurant actually wants their floor
+      // laid out. Now that sections exist, this is somewhat redundant with
+      // "Manage Sections" letting an owner define their own table count —
+      // kept for backward compatibility, but newly-seeded tables are
+      // assigned into the first existing section (rather than left
+      // unassigned/orphaned) so they still show up correctly grouped.
       if (!restaurantId.startsWith("demo-") && formattedTables.length < 30) {
         const existingNums = new Set(
           formattedTables.map((t) => t.tableNumber.trim().toUpperCase())
         );
+        const defaultSectionId = tableSections[0]?.id || null;
         const missingToInsert: Array<{
           restaurant_id: string;
           table_number: string;
           capacity: number;
+          section_id: string | null;
         }> = [];
 
         for (let i = 1; i <= 30; i++) {
@@ -6380,6 +6422,7 @@ export default function HomePage() {
               restaurant_id: restaurantId,
               table_number: tNum,
               capacity: cap,
+              section_id: defaultSectionId,
             });
           }
         }
@@ -6389,7 +6432,7 @@ export default function HomePage() {
             const { data: inserted, error: insertErr } = await supabase
               .from("restaurant_tables")
               .insert(missingToInsert)
-              .select("id, table_number, capacity, is_active");
+              .select("id, table_number, capacity, is_active, section_id");
 
             if (!insertErr && inserted) {
               const newFormatted = inserted.map((t: any) => ({
@@ -6397,6 +6440,7 @@ export default function HomePage() {
                 tableNumber: String(t.table_number),
                 capacity: Number(t.capacity) || 0,
                 isActive: t.is_active !== false,
+                sectionId: t.section_id ? String(t.section_id) : null,
               }));
               formattedTables = [...formattedTables, ...newFormatted];
             }
@@ -7029,6 +7073,9 @@ export default function HomePage() {
                 restaurantTables={
                   restaurantTables
                 }
+                tableSections={
+                  tableSections
+                }
                 orders={
                   todayOrders
                 }
@@ -7036,6 +7083,11 @@ export default function HomePage() {
                   handlePlaced
                 }
                 onMenuChanged={() =>
+                  loadRestaurantData(
+                    currentUser.restaurantId
+                  )
+                }
+                onSectionsChanged={() =>
                   loadRestaurantData(
                     currentUser.restaurantId
                   )

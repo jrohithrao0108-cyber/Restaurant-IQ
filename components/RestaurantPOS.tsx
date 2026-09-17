@@ -40,6 +40,8 @@ import {
   getCachedTables,
   getLocalSettings,
   getNextDailyKotNumber,
+  getNextDailyBillNumber,
+  restoreDailyCountersFromServer,
   removeOfflineOrder,
   retryOfflineOrder,
   type QueuedOfflineOrder,
@@ -92,6 +94,11 @@ export type Order = {
     kotNumber?: number;
     items: Array<{ id: string; name: string; qty: number; notes?: string }>;
   }>;
+  // Assigned exactly ONCE, at Settle, via getNextDailyBillNumber — never
+  // recomputed on reprint. Older orders settled before this existed won't
+  // have it; print call sites fall back to the legacy position-derived
+  // getDailyBillNumber() for those specifically.
+  billNo?: number;
 };
 
 export type RestaurantTable = {
@@ -99,6 +106,13 @@ export type RestaurantTable = {
   tableNumber: string;
   capacity: number;
   isActive: boolean;
+  sectionId?: string | null;
+};
+
+export type TableSection = {
+  id: string;
+  name: string;
+  displayOrder: number;
 };
 
 type HeldOrder = {
@@ -306,9 +320,11 @@ export function RestaurantPOS({
   initialTable,
   tableSelectionToken,
   restaurantTables,
+  tableSections,
   orders,
   onPlaced,
   onMenuChanged,
+  onSectionsChanged,
   onLogout,
 }: {
   products: Product[];
@@ -319,9 +335,11 @@ export function RestaurantPOS({
   initialTable?: string;
   tableSelectionToken?: number;
   restaurantTables: RestaurantTable[];
+  tableSections?: TableSection[];
   orders?: Order[];
   onPlaced: (o: Order) => void;
   onMenuChanged?: () => Promise<void> | void;
+  onSectionsChanged?: () => Promise<void> | void;
   onLogout?: () => void;
 }) {
   const safeCreatedByUserId = isValidUuid(createdByUserId) ? createdByUserId : null;
@@ -367,6 +385,7 @@ export function RestaurantPOS({
   const [discountPercent, setDiscountPercent] = useState<number>(0);
   const [discountFlat, setDiscountFlat] = useState<number>(0);
   const [applyGst, setApplyGst] = useState(true);
+  const [gstPercent, setGstPercent] = useState<number>(() => getLocalSettings().gstPercent ?? 5);
   const [paymentMode, setPaymentMode] = useState<string>("UPI");
   const [cashTendered, setCashTendered] = useState<string>("");
 
@@ -381,6 +400,170 @@ export function RestaurantPOS({
   const [pendingSaveOnTableSelect, setPendingSaveOnTableSelect] = useState(false);
   const [showRecentBillsModal, setShowRecentBillsModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+
+  // --- Table sections (Outside/Family/AC etc.) ---
+  const [showSectionsModal, setShowSectionsModal] = useState(false);
+  const [newSectionName, setNewSectionName] = useState("");
+  const [creatingSection, setCreatingSection] = useState(false);
+  const [addTableForSection, setAddTableForSection] = useState<string | null>(null);
+  const [newTableNumberInSection, setNewTableNumberInSection] = useState("");
+  const [newTableCapacityInSection, setNewTableCapacityInSection] = useState("4");
+  const [addingTableInSection, setAddingTableInSection] = useState(false);
+
+  // Shared by every section/table-management action below: turns a raw
+  // Postgres/network error into something actually actionable, instead of
+  // e.g. a raw unique-constraint violation message or "Failed to fetch."
+  function friendlySectionErrorMessage(e: any, fallback: string): string {
+    const msg = String(e?.message || "");
+    const isNetworkIssue =
+      msg.includes("Failed to fetch") ||
+      msg.includes("NetworkError") ||
+      msg.includes("network") ||
+      e?.name === "TypeError" ||
+      (typeof navigator !== "undefined" && !navigator.onLine);
+    if (isNetworkIssue) {
+      return "You're offline — section/table changes need an internet connection. Try again once you're back online.";
+    }
+    // Postgres unique_violation — e.g. two staff creating the same section
+    // name at nearly the same moment, past the client-side check above.
+    if (e?.code === "23505" || msg.toLowerCase().includes("duplicate key")) {
+      return "That name is already taken — someone may have just added it. Refresh and check the list.";
+    }
+    return msg || fallback;
+  }
+
+  async function handleCreateSection() {
+    const name = newSectionName.trim();
+    if (!name) {
+      showToast("Enter a section name.", "info");
+      return;
+    }
+    if (name.length > 40) {
+      showToast("Section name is too long (max 40 characters).", "error");
+      return;
+    }
+    if ((tableSections || []).some((s) => s.name.toLowerCase() === name.toLowerCase())) {
+      showToast(`A section called "${name}" already exists.`, "error");
+      return;
+    }
+    setCreatingSection(true);
+    try {
+      const displayOrder = (tableSections || []).length;
+      const { error } = await supabase.from("table_sections").insert({
+        restaurant_id: restaurantId,
+        name,
+        display_order: displayOrder,
+      });
+      if (error) throw error;
+      setNewSectionName("");
+      showToast(`Section "${name}" created.`, "success");
+      if (onSectionsChanged) await onSectionsChanged();
+    } catch (e: any) {
+      showToast(friendlySectionErrorMessage(e, "Couldn't create section."), "error");
+    } finally {
+      setCreatingSection(false);
+    }
+  }
+
+  async function handleAddTableToSection(sectionId: string) {
+    const num = newTableNumberInSection.trim().toUpperCase();
+    const cap = Number(newTableCapacityInSection) || 4;
+    if (!num) {
+      showToast("Enter a table number/name.", "info");
+      return;
+    }
+    if (cap <= 0 || cap > 50) {
+      showToast("Enter a realistic seat count (1-50).", "error");
+      return;
+    }
+    if (restaurantTables.some((t) => t.tableNumber.trim().toUpperCase() === num)) {
+      showToast(`Table ${num} already exists.`, "error");
+      return;
+    }
+    setAddingTableInSection(true);
+    try {
+      const { error } = await supabase.from("restaurant_tables").insert({
+        restaurant_id: restaurantId,
+        table_number: num,
+        capacity: cap,
+        section_id: sectionId,
+      });
+      if (error) throw error;
+      setNewTableNumberInSection("");
+      setNewTableCapacityInSection("4");
+      setAddTableForSection(null);
+      showToast(`Table ${num} added.`, "success");
+      if (onSectionsChanged) await onSectionsChanged();
+    } catch (e: any) {
+      showToast(friendlySectionErrorMessage(e, "Couldn't add table."), "error");
+    } finally {
+      setAddingTableInSection(false);
+    }
+  }
+
+  async function handleToggleTableActive(tableId: string, currentlyActive: boolean) {
+    try {
+      const { error } = await supabase
+        .from("restaurant_tables")
+        .update({ is_active: !currentlyActive })
+        .eq("id", tableId);
+      if (error) throw error;
+      showToast(currentlyActive ? "Table disabled." : "Table re-enabled.", "success");
+      if (onSectionsChanged) await onSectionsChanged();
+    } catch (e: any) {
+      showToast(friendlySectionErrorMessage(e, "Couldn't update the table."), "error");
+    }
+  }
+
+  // Moves an EXISTING table into a different section — distinct from
+  // handleAddTableToSection, which only creates brand-new tables. Without
+  // this, a restaurant whose existing tables all landed in the default
+  // "Main" section (from the migration) would have no way to reorganize
+  // them into new sections without creating confusing duplicates.
+  async function handleMoveTableToSection(tableId: string, newSectionId: string) {
+    try {
+      const { error } = await supabase
+        .from("restaurant_tables")
+        .update({ section_id: newSectionId })
+        .eq("id", tableId);
+      if (error) throw error;
+      showToast("Table moved.", "success");
+      if (onSectionsChanged) await onSectionsChanged();
+    } catch (e: any) {
+      showToast(friendlySectionErrorMessage(e, "Couldn't move the table."), "error");
+    }
+  }
+
+  // Groups real tables (not the fixed-30 padded list) by section, sorted
+  // by each section's display order. Falls back to null (the old flat
+  // 30-tile grid) if this restaurant has no sections defined yet.
+  const tablesBySectionGrouped = useMemo(() => {
+    if (!tableSections || tableSections.length === 0) return null;
+    const sortedSections = [...tableSections].sort((a, b) => a.displayOrder - b.displayOrder);
+    // Disabled tables are hidden from the working grid entirely — that's
+    // the point ("remove unnecessary tables, free up the space") — but
+    // they still exist in restaurantTables/DB so they can be found and
+    // re-enabled from the Manage Sections modal.
+    const activeTablesOnly = restaurantTables.filter((t) => t.isActive !== false);
+    const unassigned = activeTablesOnly.filter(
+      (t) => !t.sectionId || !tableSections.some((s) => s.id === t.sectionId)
+    );
+    const groups = sortedSections.map((s) => ({
+      section: s,
+      tables: activeTablesOnly
+        .filter((t) => t.sectionId === s.id)
+        .sort((a, b) => a.tableNumber.localeCompare(b.tableNumber, undefined, { numeric: true })),
+    }));
+    if (unassigned.length > 0) {
+      groups.push({
+        section: { id: "__unassigned__", name: "Unassigned", displayOrder: 999 },
+        tables: unassigned.sort((a, b) =>
+          a.tableNumber.localeCompare(b.tableNumber, undefined, { numeric: true })
+        ),
+      });
+    }
+    return groups;
+  }, [tableSections, restaurantTables]);
 
   const [showAddModal, setShowAddModal] = useState(false);
   const [newItemName, setNewItemName] = useState("");
@@ -462,6 +645,16 @@ export function RestaurantPOS({
       saveTablesConfigToStorage(restaurantTables);
     }
   }, [restaurantTables]);
+
+  // Pull today's KOT/bill counters from the server once on startup, in
+  // case this device's local count is behind (cleared cache, a fresh
+  // device, or a second terminal catching up) — see
+  // restoreDailyCountersFromServer's own comments in offlineStorage.ts.
+  useEffect(() => {
+    if (restaurantId && !restaurantId.startsWith("demo-")) {
+      restoreDailyCountersFromServer(restaurantId);
+    }
+  }, [restaurantId]);
 
   const activeProducts = useMemo(() => {
     const raw = products && products.length > 0 ? products : DEMO_PRODUCTS;
@@ -605,7 +798,11 @@ export function RestaurantPOS({
     return { label: "Cloud synced", tone: "synced" };
   }
 
-  const activeTables = thirtyTables;
+  // Disabled tables must never appear anywhere a table can be picked/used
+  // from — filtering here, at the source, means every consumer (the table
+  // picker modal, capacity checks, etc.) is correct automatically instead
+  // of each one needing its own filter.
+  const activeTables = thirtyTables.filter((t) => t.isActive !== false);
 
   const categoriesWithCounts = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -843,7 +1040,7 @@ export function RestaurantPOS({
   }, [subtotal, discountPercent, discountFlat]);
 
   const taxableAmount = Math.max(0, subtotal - discountAmount);
-  const gstAmount = applyGst ? Math.round(taxableAmount * 0.05) : 0;
+  const gstAmount = applyGst ? Math.round(taxableAmount * (gstPercent / 100)) : 0;
   const grandTotal = Math.round(taxableAmount + gstAmount);
 
   const tenderNumber = Number(cashTendered) || 0;
@@ -1025,7 +1222,7 @@ export function RestaurantPOS({
         showToast("No items found on this table order.", "info");
         return;
       }
-      const billNo = getDailyBillNumber(order.id, order.databaseId);
+      const billNo = order.billNo ?? getDailyBillNumber(order.id, order.databaseId);
       printCustomerBillReceipt({
         restaurantName: restaurantName || "RestaurantIQ",
         orderNumber: order.id,
@@ -1039,8 +1236,8 @@ export function RestaurantPOS({
         items: order.items,
         subtotal: order.subtotal || order.total,
         discountAmount: order.discountAmount || 0,
-        taxCgstPercent: applyGst ? 2.5 : 0,
-        taxSgstPercent: applyGst ? 2.5 : 0,
+        taxCgstPercent: applyGst ? gstPercent / 2 : 0,
+        taxSgstPercent: applyGst ? gstPercent / 2 : 0,
         total: order.total,
         paperWidth: "80mm",
       });
@@ -1119,6 +1316,7 @@ export function RestaurantPOS({
         ...order,
         status: "COMPLETED",
         closedAt: new Date().toISOString(),
+        billNo: getNextDailyBillNumber(restaurantId),
       };
       onPlaced(closedOrder);
 
@@ -1336,7 +1534,7 @@ export function RestaurantPOS({
           // must never advance "today's Nth KOT printed" count or fire
           // anything at the kitchen printer.
           if (shouldPrintKot) {
-            const globalKotNumber = getNextDailyKotNumber();
+            const globalKotNumber = getNextDailyKotNumber(restaurantId);
             newRoundEntry.kotNumber = globalKotNumber;
             const kotLabel = `KOT #${globalKotNumber} · Table ${cleanTable} · Round ${newRoundCount}`;
             try {
@@ -1373,7 +1571,7 @@ export function RestaurantPOS({
             // kotNumber yet — this is really its FIRST print, so it earns
             // a fresh number now, which then sticks for every future
             // reprint of this same round.
-            const kotNumberForReprint = lastRound.kotNumber ?? getNextDailyKotNumber();
+            const kotNumberForReprint = lastRound.kotNumber ?? getNextDailyKotNumber(restaurantId);
             const kotLabel = `KOT #${kotNumberForReprint} · Table ${cleanTable} · Round ${lastRound.round} (Reprint)`;
             try {
               printKitchenOrderTicket({
@@ -1496,7 +1694,7 @@ export function RestaurantPOS({
         // never cleaned up. Settle & Pay is the only place a no-table
         // Dine-In order gets written, exactly like the other walk-up
         // channels, so an abandoned cart simply never becomes a record.
-        const globalKotNumber = shouldPrintKot ? getNextDailyKotNumber() : null;
+        const globalKotNumber = shouldPrintKot ? getNextDailyKotNumber(restaurantId) : null;
 
         if (shouldPrintKot) {
           try {
@@ -1520,7 +1718,7 @@ export function RestaurantPOS({
         // --- TAKEAWAY / SWIGGY / ZOMATO: just print, no local persistence here.
         // Placing/settling these goes through the normal Settle & Pay flow. ---
         if (shouldPrintKot) {
-          const globalKotNumber = getNextDailyKotNumber();
+          const globalKotNumber = getNextDailyKotNumber(restaurantId);
           try {
             printKitchenOrderTicket({
               restaurantName,
@@ -1658,7 +1856,7 @@ export function RestaurantPOS({
     const cleanTable = source === "DINE_IN" && table ? table.trim().toUpperCase() : null;
     const activeOrder = cleanTable ? tableOrderMap.get(cleanTable) : null;
     const orderNumber = activeOrder?.id || `BILL-${Date.now().toString().slice(-4)}`;
-    const billNo = getDailyBillNumber(activeOrder?.id, activeOrder?.databaseId);
+    const billNo = activeOrder?.billNo ?? getDailyBillNumber(activeOrder?.id, activeOrder?.databaseId);
 
     try {
       printCustomerBillReceipt({
@@ -1674,8 +1872,8 @@ export function RestaurantPOS({
         items: cart,
         subtotal,
         discountAmount,
-        taxCgstPercent: applyGst ? 2.5 : 0,
-        taxSgstPercent: applyGst ? 2.5 : 0,
+        taxCgstPercent: applyGst ? gstPercent / 2 : 0,
+        taxSgstPercent: applyGst ? gstPercent / 2 : 0,
         total: grandTotal,
         paperWidth: settings.paperWidth,
       });
@@ -1795,6 +1993,7 @@ export function RestaurantPOS({
         customerName,
         discountAmount: savedDiscountAmount,
         subtotal: savedSubtotal,
+        billNo: getNextDailyBillNumber(restaurantId),
       };
 
       onPlaced(newOrder);
@@ -1817,7 +2016,7 @@ export function RestaurantPOS({
         "success"
       );
 
-      const billNo = getDailyBillNumber(orderNumber, newOrder.databaseId);
+      const billNo = newOrder.billNo!;
       setTimeout(() => {
         if (autoPrintBillOnSettle) {
           try {
@@ -1834,8 +2033,8 @@ export function RestaurantPOS({
               items: savedItems,
               subtotal: savedSubtotal,
               discountAmount: savedDiscountAmount,
-              taxCgstPercent: applyGst ? 2.5 : 0,
-              taxSgstPercent: applyGst ? 2.5 : 0,
+              taxCgstPercent: applyGst ? gstPercent / 2 : 0,
+              taxSgstPercent: applyGst ? gstPercent / 2 : 0,
               total: savedGrandTotal,
               paperWidth: settings.paperWidth,
             });
@@ -1844,7 +2043,7 @@ export function RestaurantPOS({
 
         if (autoPrintKot) {
           try {
-            const settleKotNumber = getNextDailyKotNumber();
+            const settleKotNumber = getNextDailyKotNumber(restaurantId);
             printKitchenOrderTicket({
               restaurantName,
               orderNumber: `KOT #${settleKotNumber}`,
@@ -1896,8 +2095,27 @@ export function RestaurantPOS({
       setEditingItem(null);
       showToast(`Price updated to ₹${priceNum} for${editingItem.name}`, "success");
     } catch (e: any) {
-      showToast(e?.message || "Could not update price.", "error");
+      showToast(friendlyMenuErrorMessage(e, "Could not update price."), "error");
     }
+  }
+
+  // Menu edits (Add Dish, Bulk Menu) go straight to Supabase with no
+  // offline queue — unlike orders, they're infrequent enough that building
+  // a full offline queue for them isn't worth it, but a raw network error
+  // like "Failed to fetch" is useless to whoever's staring at it. This
+  // turns that into something actually actionable.
+  function friendlyMenuErrorMessage(e: any, fallback: string): string {
+    const msg = String(e?.message || "");
+    const isNetworkIssue =
+      msg.includes("Failed to fetch") ||
+      msg.includes("NetworkError") ||
+      msg.includes("network") ||
+      e?.name === "TypeError" ||
+      (typeof navigator !== "undefined" && !navigator.onLine);
+    if (isNetworkIssue) {
+      return "You're offline — menu changes need an internet connection. Try again once you're back online.";
+    }
+    return msg || fallback;
   }
 
   async function handleAddDish() {
@@ -1924,7 +2142,7 @@ export function RestaurantPOS({
       setNewItemPrice("");
       showToast(`Dish "${newItemName}" added successfully!`, "success");
     } catch (e: any) {
-      showToast(e?.message || "Failed to add dish.", "error");
+      showToast(friendlyMenuErrorMessage(e, "Failed to add dish."), "error");
     } finally {
       setAddingItem(false);
     }
@@ -2048,7 +2266,7 @@ export function RestaurantPOS({
       ]);
       setBulkText("");
     } catch (e: any) {
-      showToast(e?.message || "Failed to save bulk menu items.", "error");
+      showToast(friendlyMenuErrorMessage(e, "Failed to save bulk menu items."), "error");
     } finally {
       setSavingBulk(false);
     }
@@ -2337,6 +2555,14 @@ export function RestaurantPOS({
                 <button
                   type="button"
                   className="tables-toolbar-btn"
+                  onClick={() => setShowSectionsModal(true)}
+                >
+                  <SlidersHorizontal size={14} />
+                  <span>Manage Sections</span>
+                </button>
+                <button
+                  type="button"
+                  className="tables-toolbar-btn"
                   onClick={() => setActiveView("POS")}
                 >
                   <Utensils size={14} />
@@ -2399,8 +2625,8 @@ export function RestaurantPOS({
               </div>
             )}
 
-            <div className="tables-30-grid">
-              {thirtyTables.map((t) => {
+            {(() => {
+              function renderTableTile(t: RestaurantTable) {
                 const isOccupied = occupiedTableNumbers.has(t.tableNumber);
                 const activeOrder = tableOrderMap.get(t.tableNumber);
                 const isCurrent = table === t.tableNumber;
@@ -2496,19 +2722,99 @@ export function RestaurantPOS({
                           </button>
                         </div>
                       ) : (
-                        <button
-                          type="button"
-                          className="tile-new-order-btn"
-                          onClick={() => handleOpenTableOrder(t.tableNumber)}
-                        >
-                          + New Order
-                        </button>
+                        <div className="vacant-tile-actions">
+                          <button
+                            type="button"
+                            className="tile-new-order-btn"
+                            onClick={() => handleOpenTableOrder(t.tableNumber)}
+                          >
+                            + New Order
+                          </button>
+                          <button
+                            type="button"
+                            className="tile-disable-btn"
+                            onClick={() => handleToggleTableActive(t.id, true)}
+                            title="Disable this table (hides it, doesn't delete it — re-enable from Manage Sections)"
+                          >
+                            <X size={11} />
+                          </button>
+                        </div>
                       )}
                     </div>
                   </div>
                 );
-              })}
-            </div>
+              }
+
+              if (tablesBySectionGrouped) {
+                return (
+                  <div className="table-sections-container">
+                    {tablesBySectionGrouped.map(({ section, tables }) => (
+                      <div className="table-section-block" key={section.id}>
+                        <div className="table-section-header">
+                          <h3>{section.name}</h3>
+                          <span className="table-section-count">{tables.length} table{tables.length === 1 ? "" : "s"}</span>
+                          {section.id !== "__unassigned__" && (
+                            <button
+                              type="button"
+                              className="section-add-table-btn"
+                              onClick={() =>
+                                setAddTableForSection(addTableForSection === section.id ? null : section.id)
+                              }
+                            >
+                              <Plus size={12} />
+                              <span>Add Table</span>
+                            </button>
+                          )}
+                        </div>
+
+                        {addTableForSection === section.id && (
+                          <div className="section-add-table-form">
+                            <input
+                              type="text"
+                              placeholder="Table number (e.g. T31)"
+                              value={newTableNumberInSection}
+                              onChange={(e) => setNewTableNumberInSection(e.target.value)}
+                            />
+                            <input
+                              type="number"
+                              placeholder="Seats"
+                              value={newTableCapacityInSection}
+                              onChange={(e) => setNewTableCapacityInSection(e.target.value)}
+                              style={{ width: 70 }}
+                            />
+                            <button
+                              type="button"
+                              className="section-add-table-confirm"
+                              onClick={() => handleAddTableToSection(section.id)}
+                              disabled={addingTableInSection}
+                            >
+                              {addingTableInSection ? "Adding..." : "Add"}
+                            </button>
+                            <button
+                              type="button"
+                              className="section-add-table-cancel"
+                              onClick={() => setAddTableForSection(null)}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        )}
+
+                        <div className="tables-30-grid">
+                          {tables.map((t) => renderTableTile(t))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              }
+
+              return (
+                <div className="tables-30-grid">
+                  {thirtyTables.filter((t) => t.isActive !== false).map((t) => renderTableTile(t))}
+                </div>
+              );
+            })()}
           </div>
         ) : (
           <>
@@ -2967,19 +3273,41 @@ export function RestaurantPOS({
                           {pct}%
                         </button>
                       ))}
-                      <button
-                        type="button"
-                        className={`disc-pill ${discountFlat > 0 ? "active" : ""}`}
-                        onClick={() => {
-                          const flat = prompt("Enter flat discount in ₹:", "50");
-                          if (flat && !isNaN(Number(flat))) {
-                            setDiscountFlat(Number(flat));
-                            setDiscountPercent(0);
+                      <div className="disc-custom-input-group">
+                        <input
+                          type="number"
+                          min={0}
+                          max={100}
+                          placeholder="%"
+                          className="disc-custom-input"
+                          value={
+                            discountPercent > 0 && ![0, 5, 10, 15].includes(discountPercent)
+                              ? discountPercent
+                              : ""
                           }
-                        }}
-                      >
-                        {discountFlat > 0 ? `₹${discountFlat}` : "Flat ₹"}
-                      </button>
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            setDiscountPercent(v > 0 ? v : 0);
+                            if (v > 0) setDiscountFlat(0);
+                          }}
+                        />
+                        <span className="disc-custom-suffix">%</span>
+                      </div>
+                      <div className="disc-custom-input-group">
+                        <span className="disc-custom-prefix">₹</span>
+                        <input
+                          type="number"
+                          min={0}
+                          placeholder="Flat"
+                          className="disc-custom-input"
+                          value={discountFlat > 0 ? discountFlat : ""}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            setDiscountFlat(v > 0 ? v : 0);
+                            if (v > 0) setDiscountPercent(0);
+                          }}
+                        />
+                      </div>
                     </div>
                   </div>
                   {discountAmount > 0 && (
@@ -2996,7 +3324,25 @@ export function RestaurantPOS({
                       checked={applyGst}
                       onChange={(e) => setApplyGst(e.target.checked)}
                     />
-                    <span>Apply 5% GST (2.5% + 2.5%)</span>
+                    <span>Apply GST:</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={0.5}
+                      className="gst-percent-input"
+                      value={gstPercent}
+                      disabled={!applyGst}
+                      onClick={(e) => e.preventDefault()}
+                      onChange={(e) => {
+                        const v = Math.max(0, Number(e.target.value) || 0);
+                        setGstPercent(v);
+                        saveLocalSettings({ gstPercent: v });
+                      }}
+                    />
+                    <span className="gst-percent-suffix">
+                      % ({(gstPercent / 2).toFixed(gstPercent % 2 === 0 ? 0 : 1)}% + {(gstPercent / 2).toFixed(gstPercent % 2 === 0 ? 0 : 1)}%)
+                    </span>
                   </label>
                   <span>{money(gstAmount)}</span>
                 </div>
@@ -3267,7 +3613,7 @@ export function RestaurantPOS({
                   <div key={o.id} className="recent-order-item">
                     <div className="recent-order-main">
                       <div className="recent-order-top">
-                        <b>Bill #{getDailyBillNumber(o.id, o.databaseId)}</b>
+                        <b>Bill #{o.billNo ?? getDailyBillNumber(o.id, o.databaseId)}</b>
                         <small style={{ color: "#78716c", fontWeight: 600, fontSize: "10.5px" }}>({o.id})</small>
                         <span className="recent-time">{o.time}</span>
                         <span className="recent-channel">{o.source}</span>
@@ -3289,7 +3635,7 @@ export function RestaurantPOS({
                         className="reprint-btn"
                         onClick={() => {
                           const settings = getLocalSettings();
-                          const billNo = getDailyBillNumber(o.id, o.databaseId);
+                          const billNo = o.billNo ?? getDailyBillNumber(o.id, o.databaseId);
                           printCustomerBillReceipt({
                             restaurantName,
                             orderNumber: o.id,
@@ -3303,8 +3649,8 @@ export function RestaurantPOS({
                             items: o.items,
                             subtotal: o.subtotal || o.total,
                             discountAmount: o.discountAmount || 0,
-                            taxCgstPercent: applyGst ? 2.5 : 0,
-                            taxSgstPercent: applyGst ? 2.5 : 0,
+                            taxCgstPercent: applyGst ? gstPercent / 2 : 0,
+                            taxSgstPercent: applyGst ? gstPercent / 2 : 0,
                             total: o.total,
                             paperWidth: settings.paperWidth,
                           });
@@ -3815,6 +4161,137 @@ export function RestaurantPOS({
                 onClick={() => setShowSettingsModal(false)}
               >
                 Save & Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showSectionsModal && (
+        <div
+          className="pos-modal-overlay"
+          onClick={() => setShowSectionsModal(false)}
+        >
+          <div
+            className="pos-modal-card sections-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>Manage Table Sections</h3>
+              <button
+                type="button"
+                onClick={() => setShowSectionsModal(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="settings-body">
+              <p className="sections-modal-hint">
+                Group your tables into sections like "Outside," "Family," or "AC Hall." Each
+                section keeps its own tables — add more to any section anytime.
+              </p>
+
+              <div className="existing-sections-list">
+                {(tableSections || []).length === 0 && (
+                  <div className="no-sections-yet">No sections yet — add your first one below.</div>
+                )}
+                {(tableSections || [])
+                  .slice()
+                  .sort((a, b) => a.displayOrder - b.displayOrder)
+                  .map((s) => {
+                    const sectionTables = restaurantTables
+                      .filter((t) => t.sectionId === s.id)
+                      .sort((a, b) =>
+                        a.tableNumber.localeCompare(b.tableNumber, undefined, { numeric: true })
+                      );
+                    const activeCount = sectionTables.filter((t) => t.isActive !== false).length;
+                    return (
+                      <div className="existing-section-row" key={s.id}>
+                        <div className="section-row-head">
+                          <span className="section-row-name">{s.name}</span>
+                          <span className="section-row-count">
+                            {activeCount} active
+                            {sectionTables.length !== activeCount
+                              ? ` · ${sectionTables.length - activeCount} disabled`
+                              : ""}
+                          </span>
+                        </div>
+                        {sectionTables.length > 0 && (
+                          <div className="section-row-tables">
+                            {sectionTables.map((t) => (
+                              <div className="section-table-row" key={t.id}>
+                                <button
+                                  type="button"
+                                  className={`section-table-chip ${t.isActive === false ? "disabled" : ""}`}
+                                  onClick={() => handleToggleTableActive(t.id, t.isActive !== false)}
+                                  title={t.isActive === false ? "Tap to re-enable" : "Tap to disable"}
+                                >
+                                  {t.tableNumber}
+                                </button>
+                                {(tableSections || []).length > 1 && (
+                                  <select
+                                    className="section-table-move-select"
+                                    value={s.id}
+                                    onChange={(e) => {
+                                      const newSectionId = e.target.value;
+                                      if (newSectionId !== s.id) {
+                                        handleMoveTableToSection(t.id, newSectionId);
+                                      }
+                                    }}
+                                    title="Move to a different section"
+                                  >
+                                    {(tableSections || [])
+                                      .slice()
+                                      .sort((a, b) => a.displayOrder - b.displayOrder)
+                                      .map((opt) => (
+                                        <option key={opt.id} value={opt.id}>
+                                          {opt.name}
+                                        </option>
+                                      ))}
+                                  </select>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+              </div>
+
+              <div className="new-section-form">
+                <input
+                  type="text"
+                  placeholder="New section name (e.g. Outside, Family)"
+                  value={newSectionName}
+                  onChange={(e) => setNewSectionName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleCreateSection();
+                  }}
+                />
+                <button
+                  type="button"
+                  className="confirm-btn"
+                  onClick={handleCreateSection}
+                  disabled={creatingSection}
+                >
+                  {creatingSection ? "Adding..." : "+ Add Section"}
+                </button>
+              </div>
+              <p className="sections-modal-hint small">
+                Use "Add Table" on each section (in the Tables screen) to create brand-new
+                tables. To move an existing table into a different section, use the dropdown
+                next to its name above. Renaming/reordering/deleting sections isn't supported
+                yet — tell me if you need that next.
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="confirm-btn"
+                onClick={() => setShowSectionsModal(false)}
+              >
+                Done
               </button>
             </div>
           </div>
@@ -4602,6 +5079,237 @@ export function RestaurantPOS({
         }
 
         /* 6 COLUMNS X 5 ROWS TO FIT EXACTLY 30 TABLES ON SCREEN */
+        .table-sections-container {
+          flex: 1;
+          overflow-y: auto;
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
+        }
+
+        .table-section-block {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+
+        .table-section-header {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .table-section-header h3 {
+          font-size: 14px;
+          font-weight: 800;
+          color: #1c1917;
+          margin: 0;
+        }
+
+        .table-section-count {
+          font-size: 11px;
+          color: #78716c;
+          font-weight: 600;
+        }
+
+        .section-add-table-btn {
+          margin-left: auto;
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          padding: 4px 9px;
+          border-radius: 6px;
+          border: 1px solid #ede7dc;
+          background: #faf7f2;
+          color: #44403c;
+          font-size: 11px;
+          font-weight: 700;
+          cursor: pointer;
+        }
+
+        .section-add-table-btn:hover {
+          background: #d99726;
+          color: #ffffff;
+          border-color: #d99726;
+        }
+
+        .section-add-table-form {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          padding: 6px 8px;
+          background: #fef9ee;
+          border: 1px solid #fde68a;
+          border-radius: 6px;
+        }
+
+        .section-add-table-form input {
+          height: 28px;
+          padding: 0 8px;
+          border: 1px solid #ede7dc;
+          border-radius: 5px;
+          font-size: 12px;
+        }
+
+        .section-add-table-confirm,
+        .section-add-table-cancel {
+          height: 28px;
+          padding: 0 10px;
+          border-radius: 5px;
+          border: none;
+          font-size: 11.5px;
+          font-weight: 700;
+          cursor: pointer;
+        }
+
+        .section-add-table-confirm {
+          background: #16a34a;
+          color: #ffffff;
+        }
+
+        .section-add-table-cancel {
+          background: #ede7dc;
+          color: #57534e;
+        }
+
+        .vacant-tile-actions {
+          display: flex;
+          align-items: center;
+          gap: 3px;
+        }
+
+        .vacant-tile-actions .tile-new-order-btn {
+          flex: 1;
+        }
+
+        .tile-disable-btn {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 18px;
+          height: 18px;
+          flex-shrink: 0;
+          border: 1px solid #ede7dc;
+          background: #ffffff;
+          color: #a8a29e;
+          border-radius: 4px;
+          cursor: pointer;
+        }
+
+        .tile-disable-btn:hover {
+          background: #fef2f2;
+          color: #dc2626;
+          border-color: #fecaca;
+        }
+
+        .sections-modal-hint {
+          font-size: 12px;
+          color: #57534e;
+          line-height: 1.5;
+          margin: 0 0 12px;
+        }
+
+        .sections-modal-hint.small {
+          font-size: 10.5px;
+          color: #a8a29e;
+          margin: 10px 0 0;
+        }
+
+        .existing-sections-list {
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          margin-bottom: 14px;
+        }
+
+        .no-sections-yet {
+          font-size: 12px;
+          color: #a8a29e;
+          font-style: italic;
+        }
+
+        .existing-section-row {
+          border: 1px solid #ede7dc;
+          border-radius: 8px;
+          padding: 8px 10px;
+        }
+
+        .section-row-head {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 6px;
+        }
+
+        .section-row-name {
+          font-size: 13px;
+          font-weight: 700;
+          color: #1c1917;
+        }
+
+        .section-row-count {
+          font-size: 10.5px;
+          color: #78716c;
+          font-weight: 600;
+        }
+
+        .section-row-tables {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+        }
+
+        .section-table-row {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+
+        .section-table-chip {
+          padding: 3px 8px;
+          border-radius: 5px;
+          border: 1px solid #bbf7d0;
+          background: #ecfdf5;
+          color: #15803d;
+          font-size: 11px;
+          font-weight: 700;
+          cursor: pointer;
+          width: 52px;
+          flex-shrink: 0;
+        }
+
+        .section-table-chip.disabled {
+          border-color: #ede7dc;
+          background: #f4f2ee;
+          color: #a8a29e;
+          text-decoration: line-through;
+        }
+
+        .section-table-move-select {
+          flex: 1;
+          height: 24px;
+          padding: 0 6px;
+          border: 1px solid #ede7dc;
+          border-radius: 5px;
+          font-size: 10.5px;
+          color: #57534e;
+          background: #ffffff;
+        }
+
+        .new-section-form {
+          display: flex;
+          gap: 8px;
+        }
+
+        .new-section-form input {
+          flex: 1;
+          height: 36px;
+          padding: 0 10px;
+          border: 1px solid #ede7dc;
+          border-radius: 7px;
+          font-size: 13px;
+        }
+
         .tables-30-grid {
           flex: 1;
           display: grid;
@@ -5802,6 +6510,7 @@ export function RestaurantPOS({
         .discount-pills {
           display: flex;
           gap: 2px;
+          flex-wrap: wrap;
         }
 
         .disc-pill {
@@ -5822,9 +6531,59 @@ export function RestaurantPOS({
           border-color: #d99726;
         }
 
+        .disc-custom-input-group {
+          display: flex;
+          align-items: center;
+          gap: 2px;
+          height: 18px;
+          padding: 0 3px;
+          border: 1px solid #e7e0d3;
+          border-radius: 3px;
+          background: #ffffff;
+        }
+
+        .disc-custom-input {
+          width: 30px;
+          border: none;
+          outline: none;
+          font-size: 9.5px;
+          font-weight: 700;
+          color: #57534e;
+          background: transparent;
+        }
+
+        .disc-custom-suffix,
+        .disc-custom-prefix {
+          font-size: 9px;
+          color: #a8a29e;
+          font-weight: 700;
+        }
+
         .discount-applied-val {
           color: #16a34a;
           font-weight: 700;
+        }
+
+        .gst-percent-input {
+          width: 34px;
+          height: 18px;
+          padding: 0 3px;
+          border: 1px solid #e7e0d3;
+          border-radius: 3px;
+          font-size: 10.5px;
+          font-weight: 700;
+          color: #1c1917;
+          text-align: center;
+        }
+
+        .gst-percent-input:disabled {
+          background: #f4f2ee;
+          color: #a8a29e;
+        }
+
+        .gst-percent-suffix {
+          font-size: 10.5px;
+          color: #78716c;
         }
 
         .tax-row {

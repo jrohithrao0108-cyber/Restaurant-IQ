@@ -266,6 +266,10 @@ type LocalSettings = {
   // Off by default, same reasoning — Quick Settle (Tables grid) never
   // prints either way; "Bill" is a separate, explicit button there.
   autoPrintBillOnSettle: boolean;
+  // Combined GST %, split evenly into CGST/SGST halves for the receipt
+  // (e.g. 5 -> 2.5% + 2.5%). Editable per restaurant now — defaults to 5
+  // so behavior doesn't change for anyone until they explicitly edit it.
+  gstPercent: number;
 };
 
 export function getLocalSettings(): LocalSettings {
@@ -273,6 +277,7 @@ export function getLocalSettings(): LocalSettings {
     paperWidth: "80mm",
     autoPrintKot: false,
     autoPrintBillOnSettle: false,
+    gstPercent: 5,
   };
   if (typeof window === "undefined") return defaults;
   try {
@@ -295,22 +300,36 @@ export function saveLocalSettings(patch: Partial<LocalSettings>): void {
 }
 
 // ---------------------------------------------------------------------------
-// Daily KOT counter — device-local, resets each day. Every KOT print (any
-// table, any round, any order type) pulls the next number from this same
-// counter, so a printed ticket's number reflects "the Nth KOT printed
-// today," not anything tied to a specific table or order.
+// Daily KOT + Bill counters — local-first, server-checkpointed.
 //
-// NOTE: this is per-device by design (confirmed: one POS terminal per
-// restaurant for this client). If a second terminal is ever added for the
-// same restaurant, two devices would each hand out their own independent
-// sequence — this would need to move to a shared Supabase counter (with an
-// offline-reservation fallback) at that point.
+// A KOT/bill number must NEVER wait on a network round-trip to print —
+// that's the whole reason the previous version was purely local. But
+// purely local also meant a cleared cache (or a corrupted localStorage
+// value) silently reset the sequence back to 0/1, and a second POS
+// terminal for the same restaurant would hand out its own independent,
+// colliding sequence.
+//
+// This keeps the fast local increment (getNextDailyCounter returns
+// synchronously, immediately, exactly like before) but ALSO fires a
+// fire-and-forget "checkpoint" up to Supabase after every increment — an
+// idempotent "raise the server's count to at least this" call (see
+// checkpoint_daily_counter in the daily_counters migration), safe to call
+// repeatedly without ever double-counting. On startup (or whenever a new
+// day rolls over locally), restoreDailyCounterFromServer() tries to pull
+// the server's current value first, so a cleared cache or a fresh device
+// picks up where the real count actually left off instead of starting
+// over at 0.
+//
+// The "date" sent to the server is always the client's own computed IST
+// calendar date string — never left to Postgres's now(), which defaults
+// to UTC and would put the day boundary 5.5 hours off from India's actual
+// midnight.
 // ---------------------------------------------------------------------------
 
-const DAILY_KOT_COUNTER_KEY = "restaurant_iq_daily_kot_counter_v1";
+const DAILY_COUNTER_KEY_PREFIX = "restaurant_iq_daily_counter_v2_";
 
-type DailyKotCounterState = {
-  date: string; // YYYY-MM-DD, device-local date
+type DailyCounterState = {
+  date: string; // YYYY-MM-DD, device-local date (IST, assuming correct device timezone)
   count: number;
 };
 
@@ -321,23 +340,138 @@ function todayDateKey(): string {
   ).padStart(2, "0")}`;
 }
 
-/** Reserves and returns the next KOT number for today (starts at 1, resets daily). */
-export function getNextDailyKotNumber(): number {
+function counterStorageKey(counterType: "kot" | "bill"): string {
+  return `${DAILY_COUNTER_KEY_PREFIX}${counterType}`;
+}
+
+function readCounterState(counterType: "kot" | "bill"): DailyCounterState {
+  const today = todayDateKey();
+  try {
+    const raw = localStorage.getItem(counterStorageKey(counterType));
+    const state: DailyCounterState = raw ? JSON.parse(raw) : { date: today, count: 0 };
+    return state.date === today ? state : { date: today, count: 0 };
+  } catch {
+    return { date: today, count: 0 };
+  }
+}
+
+function writeCounterState(counterType: "kot" | "bill", state: DailyCounterState): void {
+  try {
+    localStorage.setItem(counterStorageKey(counterType), JSON.stringify(state));
+  } catch {}
+}
+
+// Fire-and-forget — never awaited by the caller, never blocks a print.
+// Uses a dynamic import so offlineStorage.ts doesn't need a hard,
+// always-loaded dependency on the Supabase client for what's fundamentally
+// a background best-effort sync.
+function checkpointCounterToServer(
+  counterType: "kot" | "bill",
+  restaurantId: string,
+  date: string,
+  count: number
+): void {
+  if (!restaurantId) return;
+  import("@/lib/supabase")
+    .then(({ supabase }) =>
+      supabase.rpc("checkpoint_daily_counter", {
+        p_restaurant_id: restaurantId,
+        p_counter_type: counterType,
+        p_date: date,
+        p_count: count,
+      })
+    )
+    .then((result: any) => {
+      // supabase.rpc() resolves successfully even when the call itself
+      // failed application-side (RLS blocked it, the RPC doesn't exist
+      // because a migration wasn't run, etc.) — it reports that via a
+      // resolved `error` field, not a rejected promise. Only checking
+      // .catch() below would silently miss all of that.
+      if (result?.error) {
+        console.warn(
+          `[${counterType} counter] checkpoint failed:`,
+          result.error.message || result.error
+        );
+      }
+    })
+    .catch((err) => {
+      // Expected and harmless while offline — the local count is already
+      // durable in localStorage; this is purely a resilience backup for
+      // cache-clear scenarios. No retry queue needed: the NEXT successful
+      // print will checkpoint an even higher number anyway.
+      console.warn(`[${counterType} counter] checkpoint skipped (likely offline):`, err?.message || err);
+    });
+}
+
+/**
+ * Reserves and returns the next number for today (starts at 1, resets
+ * daily) for either counter type. Synchronous and instant — never blocks
+ * on network. Also fires a background checkpoint to the server.
+ */
+function getNextDailyCounter(counterType: "kot" | "bill", restaurantId: string): number {
   if (typeof window === "undefined") return 1;
   try {
-    const today = todayDateKey();
-    const raw = localStorage.getItem(DAILY_KOT_COUNTER_KEY);
-    let state: DailyKotCounterState = raw ? JSON.parse(raw) : { date: today, count: 0 };
-    if (state.date !== today) {
-      state = { date: today, count: 0 };
-    }
+    const state = readCounterState(counterType);
     state.count += 1;
-    localStorage.setItem(DAILY_KOT_COUNTER_KEY, JSON.stringify(state));
+    writeCounterState(counterType, state);
+    checkpointCounterToServer(counterType, restaurantId, state.date, state.count);
     return state.count;
   } catch (err) {
-    console.error("Failed to get next daily KOT number:", err);
+    console.error(`Failed to get next daily ${counterType} number:`, err);
     // Extremely unlikely fallback path (localStorage unavailable/corrupt) —
     // still produces a usable, mostly-unique number rather than crashing.
     return Number(String(Date.now()).slice(-5));
+  }
+}
+
+/** Reserves and returns the next KOT number for today. */
+export function getNextDailyKotNumber(restaurantId: string): number {
+  return getNextDailyCounter("kot", restaurantId);
+}
+
+/** Reserves and returns the next Bill number for today — call ONCE per order, at Settle, and store the result on the order (billNo). Reprints must reuse that stored value, never call this again for the same order. */
+export function getNextDailyBillNumber(restaurantId: string): number {
+  return getNextDailyCounter("bill", restaurantId);
+}
+
+/**
+ * Call once on app startup (or whenever restaurantId becomes available).
+ * If the server's checkpoint for today is higher than what's stored
+ * locally — a cleared cache, a fresh device, or this being a second
+ * terminal that hasn't caught up yet — raises the local count to match,
+ * so the NEXT number handed out continues from the real sequence instead
+ * of restarting at 1 and colliding with tickets already printed today.
+ */
+export async function restoreDailyCountersFromServer(restaurantId: string): Promise<void> {
+  if (!restaurantId || typeof window === "undefined") return;
+  const today = todayDateKey();
+  try {
+    const { supabase } = await import("@/lib/supabase");
+    const { data, error } = await supabase
+      .from("daily_counters")
+      .select("counter_type, count")
+      .eq("restaurant_id", restaurantId)
+      .eq("date", today);
+
+    if (error) {
+      console.warn("Could not restore daily counters from server:", error.message || error);
+      return;
+    }
+    if (!data) return;
+
+    for (const row of data) {
+      const counterType = row.counter_type as "kot" | "bill";
+      if (counterType !== "kot" && counterType !== "bill") continue;
+      const local = readCounterState(counterType);
+      const serverCount = Number(row.count) || 0;
+      if (serverCount > local.count) {
+        writeCounterState(counterType, { date: today, count: serverCount });
+      }
+    }
+  } catch (err) {
+    // Offline at startup, or the migration/RPC isn't deployed yet — fall
+    // back silently to whatever's in local storage, exactly like before
+    // this feature existed.
+    console.warn("Could not restore daily counters from server:", err);
   }
 }
