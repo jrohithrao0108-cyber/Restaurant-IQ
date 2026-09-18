@@ -205,6 +205,20 @@ const HIST_ORDER_SELECT = `
   created_at
 `;
 
+// mv_orders_summary has no per-item category data (it's pre-aggregated
+// by day/hour/order_type/payment_mode), so the monthly trend's "Menu
+// category" split reads raw order_items directly instead — this is the
+// minimal shape needed for that: just enough to date-bucket each item
+// by its parent order's created_at and re-derive its category.
+const MONTHLY_MENU_CATEGORY_SELECT = `
+  created_at,
+  order_items (
+    price_snapshot,
+    qty,
+    menu_items ( category )
+  )
+`;
+
 function deriveSource(o: any): OrderSource {
   if (o.source) return o.source;
   const ch = (o.channel || "").toUpperCase();
@@ -213,6 +227,26 @@ function deriveSource(o: any): OrderSource {
   if (ch.includes("SWIGGY") || ot.includes("SWIGGY")) return "SWIGGY";
   if (ot.includes("DINE") || ch.includes("DINE") || o.table_number || o.table) return "DINE_IN";
   return "TAKEAWAY";
+}
+
+// Compact number formatting for bar-chart data labels — Indian-style
+// K/Lakhs rounding so labels stay short on mobile widths: plain 3-digit
+// numbers under 1,000, "12.3K" from 1,000-99,999, "2.14L" from 1,00,000
+// up. Pass isCurrency to prepend ₹ (used for revenue; order counts are
+// passed through without it).
+function formatCompactNumber(value: number, isCurrency: boolean): string {
+  const sign = value < 0 ? "-" : "";
+  const abs = Math.abs(value);
+  const prefix = isCurrency ? "₹" : "";
+  if (abs >= 100000) {
+    const lakhs = abs / 100000;
+    return `${sign}${prefix}${lakhs.toFixed(lakhs % 1 === 0 ? 0 : 2)}L`;
+  }
+  if (abs >= 1000) {
+    const thousands = abs / 1000;
+    return `${sign}${prefix}${thousands.toFixed(thousands % 1 === 0 ? 0 : 1)}K`;
+  }
+  return `${sign}${prefix}${Math.round(abs).toLocaleString("en-IN")}`;
 }
 
 function parseOrder(o: any): Order {
@@ -312,7 +346,7 @@ export function RestaurantIQDashboard({
   const [selectedItemId, setSelectedItemId] = useState<string>("ZOMATO");
   // Whether the full-page category drilldown is open. Clicking a bar in
   // the horizontal bar chart opens this exactly like clicking "Today"/
-  // "MTD" under Gross Revenue opens revenueTrendView below — a full
+  // "MTD" under Today's Revenue opens revenueTrendView below — a full
   // takeover of this section with its own back button, not a side panel.
   const [dimensionDrilldownOpen, setDimensionDrilldownOpen] = useState(false);
   const [dateRange, setDateRange] = useState<"today" | "7days" | "15days" | "mtd" | "30days" | "year_by_month" | "custom">("today");
@@ -1871,7 +1905,7 @@ export function RestaurantIQDashboard({
     });
   };
 
-  // Clicking "Today" or "MTD" under Gross Revenue opens a dedicated page
+  // Clicking "Today" or "MTD" under Today's Revenue opens a dedicated page
   // (not a scroll to the shared channel/category chart below, which is
   // scoped to whichever dimension item happens to be selected) — this is
   // the TOTAL, unfiltered revenue across every channel, its own separate
@@ -1914,14 +1948,9 @@ export function RestaurantIQDashboard({
   }
 
   // Dimension splits (order type / menu category / payment mode / hours)
-  // are computed as revenue sums, not order counts — not valid to show
-  // for the orders metric, so force back to "total" whenever it's active.
-  useEffect(() => {
-    if (revenueTrendMetric === "orders" && revenueTrendSplitDim !== "total") {
-      setRevenueTrendSplitDim("total");
-    }
-  }, [revenueTrendMetric, revenueTrendSplitDim]);
-
+  // work for both the revenue and orders metrics — for orders, each split
+  // bucket sums order counts (or item quantities for menu category)
+  // instead of ₹ amounts. See totalDailyRevenue7 / totalMonthlyRevenueYear.
   // Same 4 order-type buckets/colors as channelCards, kept in sync
   // deliberately so a channel's color always means the same thing
   // everywhere in the dashboard.
@@ -1978,6 +2007,7 @@ export function RestaurantIQDashboard({
     const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const splitConfig = getSplitConfig(revenueTrendSplitDim);
     const isMenuSplit = revenueTrendSplitDim === "menu_category";
+    const isOrdersMetric = revenueTrendMetric === "orders";
 
     const dailyMap = new Map<string, { rev: number; count: number; byDim: number[] }>();
     for (const o of [...todayOrders, ...historicalOrders]) {
@@ -1990,11 +2020,11 @@ export function RestaurantIQDashboard({
         (o.items || []).forEach((it) => {
           const rawCat = it.category === "Mains" ? "Main Course" : it.category;
           const idx = splitConfig.findIndex((c) => c.id === rawCat);
-          if (idx >= 0) cur.byDim[idx] += it.price * it.qty;
+          if (idx >= 0) cur.byDim[idx] += isOrdersMetric ? it.qty : it.price * it.qty;
         });
       } else if (splitConfig.length > 0) {
         splitConfig.forEach((c, idx) => {
-          if ((c as any).matcher(o)) cur.byDim[idx] += Number(o.total) || 0;
+          if ((c as any).matcher(o)) cur.byDim[idx] += isOrdersMetric ? 1 : Number(o.total) || 0;
         });
       }
       dailyMap.set(dStr, cur);
@@ -2039,7 +2069,7 @@ export function RestaurantIQDashboard({
       byDimSeries.push(stats.byDim);
     }
     return { labels, revs, counts, byDimSeries, splitConfig, cumRev: revs.reduce((a, b) => a + b, 0), cumCount: counts.reduce((a, b) => a + b, 0) };
-  }, [todayOrders, historicalOrders, now, revenueTrendSplitDim, dailyDateMode, dailyRangeStart, dailyRangeEnd, todayISTStr]);
+  }, [todayOrders, historicalOrders, now, revenueTrendSplitDim, revenueTrendMetric, dailyDateMode, dailyRangeStart, dailyRangeEnd, todayISTStr]);
 
   // Widens the loaded order history back far enough to cover a custom
   // daily range that reaches further back than the default load window —
@@ -2066,13 +2096,22 @@ export function RestaurantIQDashboard({
   // restaurant/day/hour/order_type/payment_mode — instead of downloading
   // and summing raw orders client-side, which is what made this view slow
   // in the first place. Menu category isn't covered by the summary table
-  // (it needs a join to order_items), so that split stays disabled for
-  // this specific view — see the disabled state on its pill below.
+  // (it needs a join to order_items), so that split bypasses it entirely
+  // and reads raw orders instead — see the monthlyMenuRows fetch below.
   const [monthlySummaryRows, setMonthlySummaryRows] = useState<any[] | null>(null);
   const [monthlySummaryLoading, setMonthlySummaryLoading] = useState(false);
+  // Demo accounts (and any setup without Supabase configured) never had
+  // mv_orders_summary rows to fetch, so monthlySummaryRows stayed null
+  // forever and the monthly trend view (Last 7 / Last 12 Months, This
+  // Year) got stuck on its loading skeleton indefinitely. For that case
+  // totalMonthlyRevenueYear below builds the same monthly aggregates
+  // directly from todayOrders/historicalOrders instead, exactly like
+  // totalDailyRevenue7 already does for the 7-day view.
+  const useDemoMonthlySource = !isSupabaseConfigured || restaurantId === "demo-restaurant-1";
 
   useEffect(() => {
-    if (revenueTrendView !== "monthly" || !restaurantId || restaurantId === "demo-restaurant-1") return;
+    if (revenueTrendView !== "monthly" || !restaurantId || useDemoMonthlySource) return;
+
     let cancelled = false;
     setMonthlySummaryLoading(true);
     const rangeStart =
@@ -2109,11 +2148,82 @@ export function RestaurantIQDashboard({
     return () => {
       cancelled = true;
     };
-  }, [revenueTrendView, restaurantId, todayISTStr, monthlyDateMode, monthlyRangeStart, monthlyRangeEnd]);
+  }, [revenueTrendView, restaurantId, useDemoMonthlySource, todayISTStr, monthlyDateMode, monthlyRangeStart, monthlyRangeEnd]);
+
+  // Menu category bypasses mv_orders_summary entirely — it has no
+  // category column, so this fetches raw orders (with their items and
+  // each item's menu category) for the same date window instead, and
+  // totalMonthlyRevenueYear below aggregates it client-side. Only runs
+  // when that split is actually selected, so switching dimensions back
+  // to Total/Order type/etc. doesn't pay this extra query's cost.
+  const [monthlyMenuRows, setMonthlyMenuRows] = useState<any[] | null>(null);
+  const [monthlyMenuLoading, setMonthlyMenuLoading] = useState(false);
+
+  useEffect(() => {
+    if (
+      revenueTrendView !== "monthly" ||
+      revenueTrendSplitDim !== "menu_category" ||
+      !restaurantId ||
+      useDemoMonthlySource
+    )
+      return;
+
+    let cancelled = false;
+    setMonthlyMenuLoading(true);
+    const rangeStart =
+      monthlyDateMode === "custom" && monthlyRangeStart
+        ? monthlyRangeStart
+        : monthlyDateMode === "last7"
+        ? monthStartNMonthsAgo(6, todayISTStr)
+        : monthlyDateMode === "last12"
+        ? monthStartNMonthsAgo(11, todayISTStr)
+        : `${todayISTStr.slice(0, 4)}-01-01`;
+    const rangeEndDay =
+      monthlyDateMode === "custom" && monthlyRangeEnd && monthlyRangeEnd < todayISTStr
+        ? monthlyRangeEnd
+        : todayISTStr;
+    // Unlike the mv_orders_summary fetch, this reads raw orders directly,
+    // so there's no "today is missing from the view" problem to work
+    // around — push the upper bound one day past rangeEndDay so today's
+    // (mid-day IST) timestamps are actually included, then filter down
+    // to real IST calendar days below with getFastISTParts.
+    const rangeEndExclusiveMs = new Date(`${rangeEndDay}T00:00:00+05:30`).getTime() + 86400000;
+    const rangeEndExclusiveIST = getFastISTParts(rangeEndExclusiveMs).dateStr;
+
+    supabase
+      .from("orders")
+      .select(MONTHLY_MENU_CATEGORY_SELECT)
+      .eq("restaurant_id", restaurantId)
+      .gte("created_at", `${rangeStart}T00:00:00+05:30`)
+      .lt("created_at", `${rangeEndExclusiveIST}T00:00:00+05:30`)
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.warn("Could not load menu category breakdown:", error.message || error);
+          setMonthlyMenuRows([]);
+        } else {
+          setMonthlyMenuRows(data || []);
+        }
+        setMonthlyMenuLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    revenueTrendView,
+    revenueTrendSplitDim,
+    restaurantId,
+    useDemoMonthlySource,
+    todayISTStr,
+    monthlyDateMode,
+    monthlyRangeStart,
+    monthlyRangeEnd,
+  ]);
 
   const totalMonthlyRevenueYear = useMemo(() => {
     const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     const splitConfig = getSplitConfig(revenueTrendSplitDim);
+    const isOrdersMetric = revenueTrendMetric === "orders";
     const rows = monthlySummaryRows || [];
 
     // The span of months actually being viewed — Jan-through-current-month
@@ -2137,49 +2247,106 @@ export function RestaurantIQDashboard({
     const totalMonths = Math.min(36, (endYear - startYear) * 12 + (endMonth - startMonth) + 1);
 
     const monthlyMap = new Map<string, { rev: number; count: number; byDim: number[] }>();
-    for (const row of rows) {
-      const monthKey = String(row.order_date).slice(0, 7);
-      const cur = monthlyMap.get(monthKey) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
-      const rowRev = Number(row.revenue) || 0;
-      cur.rev += rowRev;
-      cur.count += Number(row.order_count) || 0;
-      if (revenueTrendSplitDim === "order_type") {
-        const idx = splitConfig.findIndex((c) => c.id === row.order_type);
-        if (idx >= 0) cur.byDim[idx] += rowRev;
-      } else if (revenueTrendSplitDim === "payment_mode") {
-        splitConfig.forEach((c, idx) => {
-          if ((c as any).matcher({ source: row.order_type, payment: row.payment_mode } as Order)) {
-            cur.byDim[idx] += rowRev;
-          }
-        });
-      } else if (revenueTrendSplitDim === "hours") {
-        const hour = Number(row.order_hour) || 0;
-        splitConfig.forEach((c, idx) => {
-          if ((c as any).matcher({ istHour: hour } as Order)) cur.byDim[idx] += rowRev;
-        });
-      }
-      monthlyMap.set(monthKey, cur);
-    }
 
-    // Append TODAY live — computed straight from todayOrders, never from
-    // the summary table — but ONLY if today actually falls within the
-    // range being viewed (a custom range entirely in the past shouldn't
-    // have today's numbers injected into it).
-    const todayFallsInView = todayISTStr >= viewStart && todayISTStr <= viewEnd;
-    if (todayFallsInView) {
-      const currentMonthKey = todayISTStr.slice(0, 7);
-      const todayCur = monthlyMap.get(currentMonthKey) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
-      for (const o of todayOrders) {
+    if (useDemoMonthlySource) {
+      // No mv_orders_summary to read (demo account / Supabase not
+      // configured) — build the same monthly aggregates straight from
+      // todayOrders + historicalOrders, exactly like totalDailyRevenue7
+      // does for the 7-day view. This also naturally covers "today"
+      // (no separate live-append step needed, unlike the Supabase path
+      // below where the summary table excludes today by design).
+      for (const o of [...todayOrders, ...historicalOrders]) {
+        const dStr = o.istDateStr || (o.createdAt ? getFastISTParts(o.createdAt).dateStr : "");
+        if (!dStr || dStr < viewStart || dStr > viewEnd) continue;
+        const monthKey = dStr.slice(0, 7);
+        const cur = monthlyMap.get(monthKey) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
         const rev = Number(o.total) || 0;
-        todayCur.rev += rev;
-        todayCur.count += 1;
-        if (revenueTrendSplitDim !== "menu_category" && splitConfig.length > 0) {
+        cur.rev += rev;
+        cur.count += 1;
+        if (revenueTrendSplitDim === "menu_category") {
+          (o.items || []).forEach((it) => {
+            const rawCat = it.category === "Mains" ? "Main Course" : it.category;
+            const idx = splitConfig.findIndex((c) => c.id === rawCat);
+            if (idx >= 0) cur.byDim[idx] += isOrdersMetric ? it.qty : it.price * it.qty;
+          });
+        } else if (splitConfig.length > 0) {
           splitConfig.forEach((c, idx) => {
-            if ((c as any).matcher(o)) todayCur.byDim[idx] += rev;
+            if ((c as any).matcher(o)) cur.byDim[idx] += isOrdersMetric ? 1 : rev;
           });
         }
+        monthlyMap.set(monthKey, cur);
       }
-      monthlyMap.set(currentMonthKey, todayCur);
+    } else {
+      for (const row of rows) {
+        const monthKey = String(row.order_date).slice(0, 7);
+        const cur = monthlyMap.get(monthKey) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
+        const rowRev = Number(row.revenue) || 0;
+        const rowCount = Number(row.order_count) || 0;
+        cur.rev += rowRev;
+        cur.count += rowCount;
+        if (revenueTrendSplitDim === "order_type") {
+          const idx = splitConfig.findIndex((c) => c.id === row.order_type);
+          if (idx >= 0) cur.byDim[idx] += isOrdersMetric ? rowCount : rowRev;
+        } else if (revenueTrendSplitDim === "payment_mode") {
+          splitConfig.forEach((c, idx) => {
+            if ((c as any).matcher({ source: row.order_type, payment: row.payment_mode } as Order)) {
+              cur.byDim[idx] += isOrdersMetric ? rowCount : rowRev;
+            }
+          });
+        } else if (revenueTrendSplitDim === "hours") {
+          const hour = Number(row.order_hour) || 0;
+          splitConfig.forEach((c, idx) => {
+            if ((c as any).matcher({ istHour: hour } as Order)) cur.byDim[idx] += isOrdersMetric ? rowCount : rowRev;
+          });
+        }
+        monthlyMap.set(monthKey, cur);
+      }
+
+      // Append TODAY live — computed straight from todayOrders, never from
+      // the summary table — but ONLY if today actually falls within the
+      // range being viewed (a custom range entirely in the past shouldn't
+      // have today's numbers injected into it).
+      const todayFallsInView = todayISTStr >= viewStart && todayISTStr <= viewEnd;
+      if (todayFallsInView) {
+        const currentMonthKey = todayISTStr.slice(0, 7);
+        const todayCur = monthlyMap.get(currentMonthKey) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
+        for (const o of todayOrders) {
+          const rev = Number(o.total) || 0;
+          todayCur.rev += rev;
+          todayCur.count += 1;
+          if (revenueTrendSplitDim !== "menu_category" && splitConfig.length > 0) {
+            splitConfig.forEach((c, idx) => {
+              if ((c as any).matcher(o)) todayCur.byDim[idx] += isOrdersMetric ? 1 : rev;
+            });
+          }
+        }
+        monthlyMap.set(currentMonthKey, todayCur);
+      }
+
+      // Menu category isn't in mv_orders_summary, so its byDim numbers
+      // come entirely from the raw-order bypass fetch above (which
+      // already includes today, unlike the summary-table rows) — walk
+      // it separately and merge into the same monthlyMap the summary
+      // rows already populated with rev/count, filling in only byDim.
+      if (revenueTrendSplitDim === "menu_category") {
+        for (const row of monthlyMenuRows || []) {
+          const dStr = row.created_at ? getFastISTParts(row.created_at).dateStr : "";
+          if (!dStr || dStr < viewStart || dStr > viewEnd) continue;
+          const monthKey = dStr.slice(0, 7);
+          const cur = monthlyMap.get(monthKey) || { rev: 0, count: 0, byDim: splitConfig.map(() => 0) };
+          (row.order_items || []).forEach((i: any) => {
+            const price = Number(i.price_snapshot) || 0;
+            const qty = Number(i.qty) || 0;
+            const rawCat =
+              (Array.isArray(i.menu_items) ? i.menu_items[0]?.category : i.menu_items?.category) ||
+              "Mains";
+            const cat = rawCat === "Mains" ? "Main Course" : rawCat;
+            const idx = splitConfig.findIndex((c) => c.id === cat);
+            if (idx >= 0) cur.byDim[idx] += isOrdersMetric ? qty : price * qty;
+          });
+          monthlyMap.set(monthKey, cur);
+        }
+      }
     }
 
     const labels: string[] = [];
@@ -2198,15 +2365,23 @@ export function RestaurantIQDashboard({
       byDimSeries.push(stats.byDim);
     }
     return { labels, revs, counts, byDimSeries, splitConfig, cumRev: revs.reduce((a, b) => a + b, 0), cumCount: counts.reduce((a, b) => a + b, 0) };
-  }, [monthlySummaryRows, todayISTStr, revenueTrendSplitDim, todayOrders, monthlyDateMode, monthlyRangeStart, monthlyRangeEnd]);
+  }, [monthlySummaryRows, monthlyMenuRows, useDemoMonthlySource, todayOrders, historicalOrders, todayISTStr, revenueTrendSplitDim, revenueTrendMetric, monthlyDateMode, monthlyRangeStart, monthlyRangeEnd]);
 
   // Loading until real data is actually ready — for "monthly" specifically,
   // that means waiting for the summary-table fetch to finish, not just the
   // initial page load, otherwise months would flash as zero before
-  // correcting themselves a moment later.
+  // correcting themselves a moment later. In demo mode there's no
+  // summary-table fetch at all (see useDemoMonthlySource above), so
+  // monthlySummaryRows would otherwise sit at null forever and this used
+  // to get stuck showing the loading skeleton indefinitely — fall back to
+  // the normal "has the base order data loaded" check in that case.
   const isRevenueTrendLoading =
     revenueTrendView === "monthly"
-      ? monthlySummaryRows === null || monthlySummaryLoading
+      ? useDemoMonthlySource
+        ? !hasFetched || localRefreshing
+        : monthlySummaryRows === null ||
+          monthlySummaryLoading ||
+          (revenueTrendSplitDim === "menu_category" && (monthlyMenuRows === null || monthlyMenuLoading))
       : !hasFetched || localRefreshing;
 
   const isRefreshing = propIsRefreshing || localRefreshing;
@@ -2451,27 +2626,20 @@ export function RestaurantIQDashboard({
             )}
           </div>
 
-          {!isOrdersMetric && (
-            <div className="revenue-trend-view-selector">
-              <span className="revenue-trend-view-label">View</span>
-              <div className="revenue-trend-view-pills">
-                {(["total", "order_type", "menu_category", "payment_mode", "hours"] as const).map((dim) => {
-                  const isMenuDisabled = dim === "menu_category" && revenueTrendView === "monthly";
-                  return (
-                    <button
-                      key={dim}
-                      className={`revenue-trend-view-pill ${revenueTrendSplitDim === dim ? "active" : ""}`}
-                      onClick={() => !isMenuDisabled && setRevenueTrendSplitDim(dim)}
-                      disabled={isMenuDisabled}
-                      title={isMenuDisabled ? "Not available for the yearly view yet" : undefined}
-                    >
-                      {splitLabels[dim]}
-                    </button>
-                  );
-                })}
-              </div>
+          <div className="revenue-trend-view-selector">
+            <span className="revenue-trend-view-label">View</span>
+            <div className="revenue-trend-view-pills">
+              {(["total", "order_type", "menu_category", "payment_mode", "hours"] as const).map((dim) => (
+                <button
+                  key={dim}
+                  className={`revenue-trend-view-pill ${revenueTrendSplitDim === dim ? "active" : ""}`}
+                  onClick={() => setRevenueTrendSplitDim(dim)}
+                >
+                  {splitLabels[dim]}
+                </button>
+              ))}
             </div>
-          )}
+          </div>
 
           {isRevenueTrendLoading ? (
             <div className="revenue-trend-loading">
@@ -2495,51 +2663,63 @@ export function RestaurantIQDashboard({
               </div>
 
               <div className="revenue-trend-chart-area">
-                <div className="revenue-trend-bars-row">
-                  {data.labels.map((label, i) => {
-                    const heightPct = Math.max(2, Math.round((values[i] / maxVal) * 100));
-                    const isLast = i === data.labels.length - 1;
-                    if (revenueTrendSplitDim === "total" || data.splitConfig.length === 0 || isOrdersMetric) {
+                <div
+                  className="revenue-trend-scroll-wrap"
+                  style={{ minWidth: `${data.labels.length * 42}px` }}
+                >
+                  <div className="revenue-trend-bars-row">
+                    {data.labels.map((label, i) => {
+                      const heightPct = Math.max(2, Math.round((values[i] / maxVal) * 100));
+                      const isLast = i === data.labels.length - 1;
+                      const dataLabel = formatCompactNumber(values[i], !isOrdersMetric);
+                      if (revenueTrendSplitDim === "total" || data.splitConfig.length === 0) {
+                        return (
+                          <div key={label} className="revenue-trend-bar-col">
+                            <span className={`revenue-trend-bar-datalabel ${isLast ? "is-current" : ""}`}>
+                              {dataLabel}
+                            </span>
+                            <div
+                              className={`revenue-trend-bar ${isLast ? "is-current" : ""}`}
+                              style={{ height: `${heightPct}%` }}
+                              title={`${label}: ${isOrdersMetric ? `${values[i]} orders` : `₹${values[i].toLocaleString("en-IN")}`}`}
+                            />
+                          </div>
+                        );
+                      }
+                      const dimValues = data.byDimSeries[i] || [];
                       return (
                         <div key={label} className="revenue-trend-bar-col">
-                          <div
-                            className={`revenue-trend-bar ${isLast ? "is-current" : ""}`}
-                            style={{ height: `${heightPct}%` }}
-                            title={`${label}: ${isOrdersMetric ? `${values[i]} orders` : `₹${values[i].toLocaleString("en-IN")}`}`}
-                          />
+                          <span className={`revenue-trend-bar-datalabel ${isLast ? "is-current" : ""}`}>
+                            {dataLabel}
+                          </span>
+                          <div className="revenue-trend-stacked-bar" style={{ height: `${heightPct}%` }}>
+                            {data.splitConfig.map((c, ci) => {
+                              const segVal = dimValues[ci] || 0;
+                              const segPct = values[i] > 0 ? (segVal / values[i]) * 100 : 0;
+                              return segPct > 0 ? (
+                                <div
+                                  key={c.id}
+                                  className="revenue-trend-bar-segment"
+                                  style={{ height: `${segPct}%`, background: c.color }}
+                                  title={`${c.name}: ${isOrdersMetric ? `${Math.round(segVal)} orders` : `₹${Math.round(segVal).toLocaleString("en-IN")}`}`}
+                                />
+                              ) : null;
+                            })}
+                          </div>
                         </div>
                       );
-                    }
-                    const dimValues = data.byDimSeries[i] || [];
-                    return (
-                      <div key={label} className="revenue-trend-bar-col">
-                        <div className="revenue-trend-stacked-bar" style={{ height: `${heightPct}%` }}>
-                          {data.splitConfig.map((c, ci) => {
-                            const segVal = dimValues[ci] || 0;
-                            const segPct = data.revs[i] > 0 ? (segVal / data.revs[i]) * 100 : 0;
-                            return segPct > 0 ? (
-                              <div
-                                key={c.id}
-                                className="revenue-trend-bar-segment"
-                                style={{ height: `${segPct}%`, background: c.color }}
-                                title={`${c.name}: ₹${Math.round(segVal).toLocaleString("en-IN")}`}
-                              />
-                            ) : null;
-                          })}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-                <div className="revenue-trend-labels-row">
-                  {data.labels.map((label, i) => (
-                    <span
-                      key={label}
-                      className={`revenue-trend-day-label ${i === data.labels.length - 1 ? "is-current" : ""}`}
-                    >
-                      {label}
-                    </span>
-                  ))}
+                    })}
+                  </div>
+                  <div className="revenue-trend-labels-row">
+                    {data.labels.map((label, i) => (
+                      <span
+                        key={label}
+                        className={`revenue-trend-day-label ${i === data.labels.length - 1 ? "is-current" : ""}`}
+                      >
+                        {label}
+                      </span>
+                    ))}
+                  </div>
                 </div>
               </div>
 
@@ -2694,6 +2874,13 @@ export function RestaurantIQDashboard({
             flex-direction: column;
             gap: 6px;
           }
+          .revenue-trend-scroll-wrap {
+            /* Mobile constraint: never widen the chart card to fit more
+               bars/labels — scroll horizontally within it instead. */
+            overflow-x: auto;
+            overflow-y: hidden;
+            -webkit-overflow-scrolling: touch;
+          }
           .revenue-trend-bars-row {
             display: flex;
             align-items: flex-end;
@@ -2701,10 +2888,22 @@ export function RestaurantIQDashboard({
             height: 160px;
           }
           .revenue-trend-bar-col {
-            flex: 1;
+            flex: 1 0 34px;
             height: 100%;
             display: flex;
-            align-items: flex-end;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 4px;
+          }
+          .revenue-trend-bar-datalabel {
+            font-size: 9.5px;
+            font-weight: 700;
+            color: #64748b;
+            white-space: nowrap;
+          }
+          .revenue-trend-bar-datalabel.is-current {
+            color: #047857;
           }
           .revenue-trend-bar {
             width: 100%;
@@ -2729,7 +2928,7 @@ export function RestaurantIQDashboard({
             gap: 8px;
           }
           .revenue-trend-day-label {
-            flex: 1;
+            flex: 1 0 34px;
             text-align: center;
             font-size: 10.5px;
             color: #94a3b8;
@@ -2824,7 +3023,7 @@ export function RestaurantIQDashboard({
                 style={{ cursor: "pointer" }}
               >
                 <span className="box-title">
-                  <span>💰</span> Gross Revenue
+                  <span>💰</span> Today's Revenue
                 </span>
                 <span className="status-pill revenue-pill">REVENUE</span>
               </div>
@@ -2841,7 +3040,7 @@ export function RestaurantIQDashboard({
               >
                 <div className="metric-tier-header">
                   <span className="tier-tag">Today ({topMetrics.monthShortName} {getFastISTParts(now).dateStr.slice(-2)})</span>
-                  <span className="tier-subtext">vs 3-Wk {weekdayName} Pacing</span>
+                  <span className="tier-subtext">vs Usual {weekdayName} Pacing</span>
                 </div>
                 <div className="metric-val-wrap">
                   <span className={`rev-number ${topMetrics.revUp ? "rev-up" : "rev-down"}`}>
@@ -2890,7 +3089,7 @@ export function RestaurantIQDashboard({
                 style={{ cursor: "pointer" }}
               >
                 <span className="box-title">
-                  <span>📦</span> Total Orders &amp; Bills
+                  <span>📦</span> Today's Orders
                 </span>
                 <span className="status-pill orders-pill">ORDERS</span>
               </div>
@@ -2907,7 +3106,7 @@ export function RestaurantIQDashboard({
               >
                 <div className="metric-tier-header">
                   <span className="tier-tag">Today ({topMetrics.monthShortName} {getFastISTParts(now).dateStr.slice(-2)})</span>
-                  <span className="tier-subtext">vs 3-Wk {weekdayName} Pacing</span>
+                  <span className="tier-subtext">vs Usual {weekdayName} Pacing</span>
                 </div>
                 <div className="metric-val-wrap">
                   <div className="orders-count-group">
@@ -2955,7 +3154,7 @@ export function RestaurantIQDashboard({
           {/* COMBINED BENCHMARK FOOTER STRIP */}
           <div className="benchmark-combined-strip">
             <div className="bench-info-left">
-              <span className="bench-label">Usual {weekdayName} (Same Time):</span>
+              <span className="bench-label">Usual {weekdayName}:</span>
               <strong className="bench-stat-bold">
                 ₹{Math.round(topMetrics.baselineRev).toLocaleString("en-IN")}
               </strong>
@@ -3058,7 +3257,7 @@ export function RestaurantIQDashboard({
 
           {/* HORIZONTAL BAR CHART — one bar per category in the active
               dimension. Clicking a bar opens the full-page drilldown
-              below, exactly like clicking a Gross Revenue KPI opens
+              below, exactly like clicking a Today's Revenue KPI opens
               revenueTrendView. Bars with a zero value for the active
               metric are dropped rather than drawn as a sliver. */}
           {(() => {
@@ -3091,15 +3290,17 @@ export function RestaurantIQDashboard({
                 </div>
 
                 <div className="bar-chart-rows">
+                  {barItems.length === 0 && (
+                    <div className="bar-chart-empty">
+                      No {chartMetric === "orders" ? "orders" : "revenue"} yet for {dimensionLabel.toLowerCase()} in this period.
+                    </div>
+                  )}
                   {barItems.map((item) => {
                     const val = item[metricKey] as number;
                     const pct = Math.max(4, Math.round((val / maxVal) * 100));
                     const isUp = metricKey === "orders" ? item.orderUp : item.revUp;
                     const growthLabel = metricKey === "orders" ? item.orderGrowth : item.revGrowth;
-                    const displayVal =
-                      metricKey === "orders"
-                        ? val.toLocaleString("en-IN")
-                        : `₹${val.toLocaleString("en-IN")}`;
+                    const displayVal = formatCompactNumber(val, metricKey !== "orders");
                     const isSelected = item.id === selectedItemId;
 
                     return (
@@ -3533,7 +3734,7 @@ export function RestaurantIQDashboard({
                                   fill="currentColor"
                                   opacity={isTodayBar ? 1 : 0.8}
                                 >
-                                  {r >= 1000 ? `₹${(r / 1000).toFixed(1)}k` : `₹${Math.round(r)}`}
+                                  {formatCompactNumber(r, true)}
                                 </text>
                               </>
                             )}
@@ -4879,6 +5080,16 @@ export function RestaurantIQDashboard({
           display: flex;
           flex-direction: column;
           gap: 10px;
+        }
+
+        .bar-chart-empty {
+          font-size: 13px;
+          color: #94a3b8;
+          text-align: center;
+          padding: 20px 12px;
+          background: #f8fafc;
+          border: 1px dashed #e2e8f0;
+          border-radius: 10px;
         }
 
         .bar-chart-row {
