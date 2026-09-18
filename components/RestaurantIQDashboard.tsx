@@ -1993,6 +1993,12 @@ export function RestaurantIQDashboard({
     { id: "Breads", name: "Breads", color: "#a16207" },
     { id: "Desserts", name: "Desserts", color: "#db2777" },
     { id: "Beverages", name: "Beverages", color: "#0284c7" },
+    // Catch-all for items whose menu_items.category doesn't match one of
+    // the 6 canonical names above (e.g. an old/renamed category still
+    // referenced by historical order_items) — without this, that revenue
+    // silently disappears from the stacked bar instead of being counted,
+    // which visually reads as a mostly-empty bar under a correct total.
+    { id: "Other", name: "Other", color: "#94a3b8" },
   ];
 
   function getSplitConfig(dim: typeof revenueTrendSplitDim) {
@@ -2020,7 +2026,8 @@ export function RestaurantIQDashboard({
         (o.items || []).forEach((it) => {
           const rawCat = it.category === "Mains" ? "Main Course" : it.category;
           const idx = splitConfig.findIndex((c) => c.id === rawCat);
-          if (idx >= 0) cur.byDim[idx] += isOrdersMetric ? it.qty : it.price * it.qty;
+          const bucket = idx >= 0 ? idx : splitConfig.findIndex((c) => c.id === "Other");
+          if (bucket >= 0) cur.byDim[bucket] += isOrdersMetric ? it.qty : it.price * it.qty;
         });
       } else if (splitConfig.length > 0) {
         splitConfig.forEach((c, idx) => {
@@ -2267,7 +2274,8 @@ export function RestaurantIQDashboard({
           (o.items || []).forEach((it) => {
             const rawCat = it.category === "Mains" ? "Main Course" : it.category;
             const idx = splitConfig.findIndex((c) => c.id === rawCat);
-            if (idx >= 0) cur.byDim[idx] += isOrdersMetric ? it.qty : it.price * it.qty;
+            const bucket = idx >= 0 ? idx : splitConfig.findIndex((c) => c.id === "Other");
+            if (bucket >= 0) cur.byDim[bucket] += isOrdersMetric ? it.qty : it.price * it.qty;
           });
         } else if (splitConfig.length > 0) {
           splitConfig.forEach((c, idx) => {
@@ -2342,7 +2350,8 @@ export function RestaurantIQDashboard({
               "Mains";
             const cat = rawCat === "Mains" ? "Main Course" : rawCat;
             const idx = splitConfig.findIndex((c) => c.id === cat);
-            if (idx >= 0) cur.byDim[idx] += isOrdersMetric ? qty : price * qty;
+            const bucket = idx >= 0 ? idx : splitConfig.findIndex((c) => c.id === "Other");
+            if (bucket >= 0) cur.byDim[bucket] += isOrdersMetric ? qty : price * qty;
           });
           monthlyMap.set(monthKey, cur);
         }
