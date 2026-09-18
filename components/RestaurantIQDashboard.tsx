@@ -448,14 +448,16 @@ export function RestaurantIQDashboard({
           `${getISTDateStr(lookbackStart)}T00:00:00+05:30`
         ).toISOString();
 
-        const [todayRes, recentRows, olderRows] = await Promise.all([
-          supabase
-            .from("orders")
-            .select(TODAY_ORDER_SELECT)
-            .eq("restaurant_id", restaurantId)
-            .gte("created_at", todayStartUtcIso)
-            .neq("status", "CANCELLED")
-            .order("created_at", { ascending: false }),
+        const [todayRows, recentRows, olderRows] = await Promise.all([
+          fetchAllPages(
+            supabase
+              .from("orders")
+              .select(TODAY_ORDER_SELECT)
+              .eq("restaurant_id", restaurantId)
+              .gte("created_at", todayStartUtcIso)
+              .neq("status", "CANCELLED")
+              .order("created_at", { ascending: false })
+          ),
           fetchAllPages(
             supabase
               .from("orders")
@@ -478,11 +480,7 @@ export function RestaurantIQDashboard({
           ),
         ]);
 
-        if (todayRes.error) {
-          console.warn("Notice: today's live query info:", todayRes.error.message || todayRes.error);
-        }
-
-        const parsedToday = (todayRes.data || []).map(parseOrder);
+        const parsedToday = todayRows.map(parseOrder);
         const allHistRows = [...recentRows, ...olderRows];
         const parsedHist = allHistRows.map(parseOrder);
 
@@ -492,19 +490,17 @@ export function RestaurantIQDashboard({
         setLoadedHistoryStartStr(getISTDateStr(lookbackStart));
       } else {
         // Real-time incremental path: Only re-fetch today's orders (~50ms)
-        const todayRes = await supabase
-          .from("orders")
-          .select(TODAY_ORDER_SELECT)
-          .eq("restaurant_id", restaurantId)
-          .gte("created_at", todayStartUtcIso)
-          .neq("status", "CANCELLED")
-          .order("created_at", { ascending: false });
+        const todayRows = await fetchAllPages(
+          supabase
+            .from("orders")
+            .select(TODAY_ORDER_SELECT)
+            .eq("restaurant_id", restaurantId)
+            .gte("created_at", todayStartUtcIso)
+            .neq("status", "CANCELLED")
+            .order("created_at", { ascending: false })
+        );
 
-        if (todayRes.error) {
-          console.warn("Notice: today's live query info:", todayRes.error.message || todayRes.error);
-        }
-
-        const parsedToday = (todayRes.data || []).map(parseOrder);
+        const parsedToday = todayRows.map(parseOrder);
         setInternalTodayOrders(parsedToday);
       }
     } catch (err: any) {
@@ -657,6 +653,77 @@ export function RestaurantIQDashboard({
     }
     return map;
   }, [historicalOrders]);
+
+  // Day-wise revenue/orders + running totals for the "Daily Summary" table —
+  // scoped to a single calendar month (this month or last month), matching
+  // the MTD convention already used elsewhere in this dashboard, so the
+  // cumulative columns always start fresh from the 1st rather than
+  // carrying over whatever partial trailing days a lookback window
+  // happens to have loaded before that.
+  const [showDailySummary, setShowDailySummary] = useState(false);
+  const [dailySummaryMonthOffset, setDailySummaryMonthOffset] = useState<0 | 1>(0); // 0 = this month, 1 = last month
+  const dailySummaryMonthStart =
+    dailySummaryMonthOffset === 0 ? `${todayISTStr.slice(0, 7)}-01` : monthStartNMonthsAgo(1, todayISTStr);
+  const dailySummaryMonthEnd = useMemo(() => {
+    if (dailySummaryMonthOffset === 0) return todayISTStr;
+    // Last day of last month = the day right before this month's 1st.
+    // Computed via explicit-offset millisecond arithmetic (like the rest of
+    // this file's date math), not local Date.setMonth()/setDate(0) — those
+    // operate in the browser's local timezone, which silently disagrees
+    // with the explicit "+05:30" the string was built with and can collapse
+    // this back onto dailySummaryMonthStart itself.
+    const thisMonthStart = `${todayISTStr.slice(0, 7)}-01`;
+    const dayBeforeMs = new Date(`${thisMonthStart}T00:00:00+05:30`).getTime() - 86400000;
+    return getFastISTParts(dayBeforeMs).dateStr;
+  }, [dailySummaryMonthOffset, todayISTStr]);
+
+  // "Last month" can fall outside whatever history is currently loaded
+  // (the default lookback only guarantees the last 35 days) — widen it on
+  // demand, the same way a custom date range does elsewhere in this file.
+  useEffect(() => {
+    if (!showDailySummary || dailySummaryMonthOffset === 0) return;
+    if (!loadedHistoryStartStr) return;
+    if (dailySummaryMonthStart < loadedHistoryStartStr) {
+      loadOlderHistory(dailySummaryMonthStart);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showDailySummary, dailySummaryMonthOffset, dailySummaryMonthStart, loadedHistoryStartStr]);
+
+  const dailySummaryStillLoadingOlderMonth =
+    dailySummaryMonthOffset === 1 &&
+    (!loadedHistoryStartStr || dailySummaryMonthStart < loadedHistoryStartStr);
+
+  const dailySummaryRows = useMemo(() => {
+    const perDay = new Map<string, { rev: number; count: number }>();
+    historicalOrdersByDate.forEach((orders, dStr) => {
+      if (dStr < dailySummaryMonthStart || dStr > dailySummaryMonthEnd) return;
+      let rev = 0;
+      for (const o of orders) rev += Number(o.total) || 0;
+      perDay.set(dStr, { rev, count: orders.length });
+    });
+    if (dailySummaryMonthOffset === 0 && todayOrders.length > 0) {
+      let rev = 0;
+      for (const o of todayOrders) rev += Number(o.total) || 0;
+      perDay.set(todayISTStr, { rev, count: todayOrders.length });
+    }
+
+    const sortedDates = [...perDay.keys()].sort();
+    let cumRev = 0;
+    let cumCount = 0;
+    return sortedDates.map((dateStr) => {
+      const { rev, count } = perDay.get(dateStr)!;
+      cumRev += rev;
+      cumCount += count;
+      return { dateStr, rev, count, cumRev, cumCount };
+    });
+  }, [
+    historicalOrdersByDate,
+    todayOrders,
+    todayISTStr,
+    dailySummaryMonthStart,
+    dailySummaryMonthEnd,
+    dailySummaryMonthOffset,
+  ]);
 
   function calculateSameTimeBaseline(
     filterFn?: (o: Order) => boolean
@@ -1873,7 +1940,7 @@ export function RestaurantIQDashboard({
   }, [activeCard, dimension, dateRange, customStart, customEnd, todayOrders, historicalOrders, now, todayISTStr]);
 
   // SVG Chart Geometry Calculations
-  const chartWidth = 500;
+  const BASE_CHART_WIDTH = 500;
   const chartHeight = 150;
   const startX = 42;
   const startY = 16;
@@ -1882,6 +1949,17 @@ export function RestaurantIQDashboard({
   const orderData = drilldownData?.orders || [];
   const maxRev = Math.max(100, ...revData, drilldownData?.baselineRev || 0) * 1.15;
   const maxOrders = Math.max(5, ...orderData, drilldownData?.baselineOrders || 0) * 1.25;
+  // Past ~15 columns, squeezing everything into a fixed 500-unit viewBox
+  // (which then scales down to fit the screen via width:100%) makes bars
+  // thinner than they can stay legible on a phone. Beyond that count, grow
+  // the chart's native width instead and let .svg-chart-wrapper's existing
+  // overflow-x: auto turn it into a horizontal swipe rather than a squish —
+  // short ranges (7/15 days) keep the original always-fits behavior.
+  const MIN_COL_WIDTH = 34;
+  const needsHorizontalScroll = days.length > 15;
+  const chartWidth = needsHorizontalScroll
+    ? startX + 20 + days.length * MIN_COL_WIDTH
+    : BASE_CHART_WIDTH;
   const colSpacing = (chartWidth - startX - 20) / Math.max(1, days.length);
   const barWidth = Math.max(12, Math.min(32, Math.floor(colSpacing * 0.55)));
 
@@ -2133,25 +2211,30 @@ export function RestaurantIQDashboard({
       monthlyDateMode === "custom" && monthlyRangeEnd && monthlyRangeEnd < todayISTStr
         ? monthlyRangeEnd
         : todayISTStr; // never fetch today itself from the summary table
-    supabase
-      .from("mv_orders_summary")
-      .select("order_date, order_hour, order_type, payment_mode, revenue, order_count")
-      .eq("restaurant_id", restaurantId)
-      .gte("order_date", rangeStart)
-      .lt("order_date", rangeEndExclusive) // up through YESTERDAY only — today is
-      // appended live below, never read from the summary table, since the
-      // view only refreshes on a schedule and could show today as
-      // incomplete or missing entirely depending on refresh timing.
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        if (error) {
-          console.warn("Could not load orders summary:", error.message || error);
-          setMonthlySummaryRows([]);
-        } else {
-          setMonthlySummaryRows(data || []);
-        }
-        setMonthlySummaryLoading(false);
-      });
+    // mv_orders_summary is grouped per (date, hour, order_type, payment_mode),
+    // so an active restaurant can easily produce tens of thousands of rows
+    // across a several-month window — well past PostgREST's default 1000-row
+    // cap per request. An unpaginated select() here silently truncates to
+    // that cap with no error, which is what made "Last 7"/"Last 12" collapse
+    // to only their first ~12 days of data. fetchAllPages (already used for
+    // the raw orders history fetch above) pages through with .range() until
+    // every matching row is retrieved.
+    (async () => {
+      const rows = await fetchAllPages(
+        supabase
+          .from("mv_orders_summary")
+          .select("order_date, order_hour, order_type, payment_mode, revenue, order_count")
+          .eq("restaurant_id", restaurantId)
+          .gte("order_date", rangeStart)
+          .lt("order_date", rangeEndExclusive) // up through YESTERDAY only — today is
+        // appended live below, never read from the summary table, since the
+        // view only refreshes on a schedule and could show today as
+        // incomplete or missing entirely depending on refresh timing.
+      );
+      if (cancelled) return;
+      setMonthlySummaryRows(rows);
+      setMonthlySummaryLoading(false);
+    })();
     return () => {
       cancelled = true;
     };
@@ -2197,22 +2280,22 @@ export function RestaurantIQDashboard({
     const rangeEndExclusiveMs = new Date(`${rangeEndDay}T00:00:00+05:30`).getTime() + 86400000;
     const rangeEndExclusiveIST = getFastISTParts(rangeEndExclusiveMs).dateStr;
 
-    supabase
-      .from("orders")
-      .select(MONTHLY_MENU_CATEGORY_SELECT)
-      .eq("restaurant_id", restaurantId)
-      .gte("created_at", `${rangeStart}T00:00:00+05:30`)
-      .lt("created_at", `${rangeEndExclusiveIST}T00:00:00+05:30`)
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        if (error) {
-          console.warn("Could not load menu category breakdown:", error.message || error);
-          setMonthlyMenuRows([]);
-        } else {
-          setMonthlyMenuRows(data || []);
-        }
-        setMonthlyMenuLoading(false);
-      });
+    // Same unpaginated-request cap risk as the mv_orders_summary fetch above
+    // — a several-month order window easily exceeds PostgREST's default
+    // 1000-row limit, so this pages through with fetchAllPages too.
+    (async () => {
+      const rows = await fetchAllPages(
+        supabase
+          .from("orders")
+          .select(MONTHLY_MENU_CATEGORY_SELECT)
+          .eq("restaurant_id", restaurantId)
+          .gte("created_at", `${rangeStart}T00:00:00+05:30`)
+          .lt("created_at", `${rangeEndExclusiveIST}T00:00:00+05:30`)
+      );
+      if (cancelled) return;
+      setMonthlyMenuRows(rows);
+      setMonthlyMenuLoading(false);
+    })();
     return () => {
       cancelled = true;
     };
@@ -2667,7 +2750,9 @@ export function RestaurantIQDashboard({
                   Total {isOrdersMetric ? "orders" : "revenue"} {revenueTrendView === "daily" ? "this week" : "this year"}
                 </span>
                 <span className="revenue-trend-total-value">
-                  {isOrdersMetric ? cumValue.toLocaleString("en-IN") : `₹${cumValue.toLocaleString("en-IN")}`}
+                  {isOrdersMetric
+                    ? Math.round(cumValue).toLocaleString("en-IN")
+                    : `₹${Math.round(cumValue).toLocaleString("en-IN")}`}
                 </span>
               </div>
 
@@ -3001,6 +3086,15 @@ export function RestaurantIQDashboard({
         </div>
 
         <div className="header-right">
+          <button
+            className="action-btn daily-summary-btn"
+            onClick={() => setShowDailySummary(true)}
+            title="Day-wise revenue, orders and running totals"
+          >
+            <Calendar size={15} />
+            <span>Daily Summary</span>
+          </button>
+
           <button
             className={`action-btn refresh-btn ${isRefreshing ? "spin" : ""}`}
             onClick={handleRefreshClick}
@@ -3577,6 +3671,11 @@ export function RestaurantIQDashboard({
                       key={`interactive-svg-${activeCard?.id || "card"}-${dateRange}-${customStart}-${customEnd}-${graphMetric}-${days.length}`}
                       viewBox={`0 0 ${chartWidth} ${chartHeight + 40}`}
                       className="interactive-svg"
+                      style={
+                        needsHorizontalScroll
+                          ? { width: `${chartWidth}px`, minWidth: `${chartWidth}px` }
+                          : undefined
+                      }
                     >
                       {/* Grid Lines */}
                       <line
@@ -3886,6 +3985,85 @@ export function RestaurantIQDashboard({
         </div>
       </footer>
 
+      {/* DAILY SUMMARY MODAL — day-wise revenue, orders and running totals */}
+      {showDailySummary && (
+        <div className="daily-summary-overlay" onClick={() => setShowDailySummary(false)}>
+          <div className="daily-summary-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="daily-summary-drag-handle" />
+            <div className="daily-summary-modal-header">
+              <h3>Daily Summary</h3>
+              <button
+                className="daily-summary-close-btn"
+                onClick={() => setShowDailySummary(false)}
+                aria-label="Close"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <p className="daily-summary-subtitle">
+              Day-wise revenue and orders, with running (cumulative) totals for {formatISTDate(dailySummaryMonthStart, { month: "long", year: "numeric" })} — starting from the 1st.
+            </p>
+            <div className="daily-summary-month-pills">
+              <button
+                className={`daily-summary-month-pill ${dailySummaryMonthOffset === 0 ? "active" : ""}`}
+                onClick={() => setDailySummaryMonthOffset(0)}
+              >
+                This Month
+              </button>
+              <button
+                className={`daily-summary-month-pill ${dailySummaryMonthOffset === 1 ? "active" : ""}`}
+                onClick={() => setDailySummaryMonthOffset(1)}
+              >
+                Last Month
+              </button>
+            </div>
+            <div className="daily-summary-table-wrap">
+              <table className="daily-summary-table">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Revenue</th>
+                    <th>Orders</th>
+                    <th>Cumulative revenue</th>
+                    <th>Cumulative orders</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {dailySummaryStillLoadingOlderMonth ? (
+                    <tr>
+                      <td colSpan={5} className="daily-summary-empty">
+                        Loading last month's data...
+                      </td>
+                    </tr>
+                  ) : dailySummaryRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="daily-summary-empty">
+                        No data for this period.
+                      </td>
+                    </tr>
+                  ) : (
+                    [...dailySummaryRows]
+                      .reverse()
+                      .map((row) => (
+                        <tr key={row.dateStr} className={row.dateStr === todayISTStr ? "is-today" : ""}>
+                          <td>
+                            {formatISTDate(row.dateStr, { day: "numeric", month: "short", year: "numeric" })}
+                            {row.dateStr === todayISTStr ? " (Today)" : ""}
+                          </td>
+                          <td>₹{Math.round(row.rev).toLocaleString("en-IN")}</td>
+                          <td>{row.count}</td>
+                          <td>₹{Math.round(row.cumRev).toLocaleString("en-IN")}</td>
+                          <td>{row.cumCount}</td>
+                        </tr>
+                      ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* STYLED-JSX FOR ROCK-SOLID, ZERO-DEPENDENCY STYLING */}
       <style jsx>{`
         .restaurant-iq-page {
@@ -4077,6 +4255,182 @@ export function RestaurantIQDashboard({
           background: #fef2f2;
           color: #ef4444;
           border-color: #fecaca;
+        }
+
+        .daily-summary-btn {
+          background: #ffffff;
+          border: 1px solid #e2e8f0;
+          color: #334155;
+        }
+
+        .daily-summary-btn:hover {
+          background: #eff6ff;
+          color: #1d4ed8;
+          border-color: #bfdbfe;
+        }
+
+        .daily-summary-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(15, 23, 42, 0.45);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 20px;
+          z-index: 1000;
+          animation: daily-summary-fade-in 0.18s ease;
+        }
+
+        @keyframes daily-summary-fade-in {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+
+        .daily-summary-modal {
+          background: #ffffff;
+          border-radius: 16px;
+          width: 100%;
+          max-width: 640px;
+          max-height: 82vh;
+          display: flex;
+          flex-direction: column;
+          box-shadow: 0 20px 60px rgba(0, 0, 0, 0.25);
+          overflow: hidden;
+          animation: daily-summary-pop-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        @keyframes daily-summary-pop-in {
+          from { opacity: 0; transform: translateY(8px) scale(0.98); }
+          to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        @keyframes daily-summary-slide-up {
+          from { transform: translateY(100%); }
+          to { transform: translateY(0); }
+        }
+
+        .daily-summary-drag-handle {
+          display: none;
+        }
+
+        .daily-summary-modal-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 18px 20px 4px;
+        }
+
+        .daily-summary-modal-header h3 {
+          margin: 0;
+          font-size: 17px;
+          font-weight: 800;
+          color: #0f172a;
+        }
+
+        .daily-summary-close-btn {
+          border: 0;
+          background: #f1f5f9;
+          color: #64748b;
+          border-radius: 8px;
+          width: 30px;
+          height: 30px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+        }
+
+        .daily-summary-close-btn:hover {
+          background: #e2e8f0;
+          color: #0f172a;
+        }
+
+        .daily-summary-subtitle {
+          margin: 0;
+          padding: 0 20px 10px;
+          font-size: 12.5px;
+          color: #64748b;
+        }
+
+        .daily-summary-month-pills {
+          display: flex;
+          gap: 8px;
+          padding: 0 20px 14px;
+        }
+
+        .daily-summary-month-pill {
+          border: 1px solid #e2e8f0;
+          background: #ffffff;
+          color: #475569;
+          font-size: 12px;
+          font-weight: 700;
+          padding: 6px 14px;
+          border-radius: 999px;
+          cursor: pointer;
+          transition: all 0.15s ease;
+        }
+
+        .daily-summary-month-pill:hover {
+          background: #f8fafc;
+        }
+
+        .daily-summary-month-pill.active {
+          background: #0f172a;
+          color: #ffffff;
+          border-color: #0f172a;
+        }
+
+        .daily-summary-table-wrap {
+          overflow-y: auto;
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+          padding: 0 20px 20px;
+        }
+
+        .daily-summary-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 12.5px;
+        }
+
+        .daily-summary-table thead th {
+          position: sticky;
+          top: 0;
+          background: #f8fafc;
+          text-align: right;
+          font-weight: 700;
+          color: #64748b;
+          padding: 8px 10px;
+          border-bottom: 1px solid #e2e8f0;
+          white-space: nowrap;
+        }
+
+        .daily-summary-table thead th:first-child {
+          text-align: left;
+        }
+
+        .daily-summary-table tbody td {
+          text-align: right;
+          padding: 8px 10px;
+          border-bottom: 1px solid #f1f5f9;
+          color: #0f172a;
+          white-space: nowrap;
+        }
+
+        .daily-summary-table tbody td:first-child {
+          text-align: left;
+          font-weight: 600;
+          color: #334155;
+        }
+
+        .daily-summary-table tbody tr.is-today td {
+          background: #eff6ff;
+        }
+
+        .daily-summary-empty {
+          text-align: center !important;
+          color: #94a3b8;
+          padding: 24px 0 !important;
         }
 
         /* 2. Master Benchmark Card (Revenue Left | Orders Right) */
@@ -5826,6 +6180,54 @@ export function RestaurantIQDashboard({
 
           .drilldown-title {
             font-size: 16px;
+          }
+
+          /* Three buttons (Daily Summary / Refresh / Logout) at equal
+             flex:1 squeeze "Daily Summary" onto an unreadable sliver on a
+             narrow phone — let them wrap onto a second row instead of
+             shrinking further. */
+          .header-right {
+            flex-wrap: wrap;
+          }
+
+          .header-right .action-btn {
+            flex: 1 1 auto;
+            min-width: 100px;
+          }
+
+          /* Bottom sheet on mobile: anchored to the bottom edge and slides
+             up, instead of popping into the center like on desktop — the
+             more familiar mobile pattern, with a drag-handle affordance
+             (visual only; tap outside or the X to close). */
+          .daily-summary-overlay {
+            align-items: flex-end;
+            padding: 0;
+          }
+
+          .daily-summary-modal {
+            max-width: 100%;
+            max-height: 85vh;
+            border-radius: 16px 16px 0 0;
+            animation: daily-summary-slide-up 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+          }
+
+          .daily-summary-drag-handle {
+            display: block;
+            width: 36px;
+            height: 4px;
+            border-radius: 999px;
+            background: #e2e8f0;
+            margin: 10px auto 0;
+            flex-shrink: 0;
+          }
+
+          .daily-summary-table {
+            font-size: 11.5px;
+          }
+
+          .daily-summary-table thead th,
+          .daily-summary-table tbody td {
+            padding: 7px 8px;
           }
         }
 

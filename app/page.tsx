@@ -1373,44 +1373,36 @@ function Orders({
           `${end}T23:59:59`
         );
 
-      const {
-        data,
-        error,
-      } = await supabase
-        .from("orders")
-        .select(
-          ORDER_SELECT
-        )
-        .eq(
-          "restaurant_id",
-          restaurantId
-        )
-        .gte(
-          "created_at",
-          startDate.toISOString()
-        )
-        .lte(
-          "created_at",
-          endDate.toISOString()
-        )
-        .neq(
-          "status",
-          "CANCELLED"
-        )
-        .order(
-          "created_at",
-          {
-            ascending:
-              false,
-          }
-        );
+      // A user-picked date range here can span months, and PostgREST caps an
+      // unpaginated select() at its default 1000-row limit with no error —
+      // it just silently drops everything past that. Page through with
+      // .range() so a wide range doesn't quietly lose orders.
+      const PAGE_SIZE = 1000;
+      const allRows: any[] = [];
+      for (let page = 0; ; page++) {
+        const from = page * PAGE_SIZE;
+        const to = from + PAGE_SIZE - 1;
+        const { data, error } = await supabase
+          .from("orders")
+          .select(ORDER_SELECT)
+          .eq("restaurant_id", restaurantId)
+          .gte("created_at", startDate.toISOString())
+          .lte("created_at", endDate.toISOString())
+          .neq("status", "CANCELLED")
+          .order("created_at", { ascending: false })
+          .range(from, to);
 
-      if (error) {
-        throw error;
+        if (error) {
+          throw error;
+        }
+
+        const batch = data || [];
+        allRows.push(...batch);
+        if (batch.length < PAGE_SIZE) break;
       }
 
       setOrders(
-        (data || []).map(
+        allRows.map(
           formatOrder
         )
       );
@@ -6582,46 +6574,39 @@ export default function HomePage() {
       0
     );
 
-    const {
-      data,
-      error,
-    } =
-      await supabase
+    // Paginated with .range() — an unpaginated select() is silently capped
+    // at PostgREST's default 1000-row limit, which a very high-volume day
+    // could exceed with no error surfaced.
+    const PAGE_SIZE = 1000;
+    const allRows: any[] = [];
+    for (let page = 0; ; page++) {
+      const from = page * PAGE_SIZE;
+      const to = from + PAGE_SIZE - 1;
+      const { data, error } = await supabase
         .from("orders")
-        .select(
-          ORDER_SELECT
-        )
-        .eq(
-          "restaurant_id",
-          restaurantId
-        )
-        .gte(
-          "created_at",
-          start.toISOString()
-        )
-        .neq(
-          "status",
-          "CANCELLED"
-        )
-        .order(
-          "created_at",
-          {
-            ascending:
-              false,
-          }
+        .select(ORDER_SELECT)
+        .eq("restaurant_id", restaurantId)
+        .gte("created_at", start.toISOString())
+        .neq("status", "CANCELLED")
+        .order("created_at", { ascending: false })
+        .range(from, to);
+
+      if (error) {
+        console.error(
+          "TODAY ORDERS ERROR:",
+          error
         );
 
-    if (error) {
-      console.error(
-        "TODAY ORDERS ERROR:",
-        error
-      );
+        return;
+      }
 
-      return;
+      const batch = data || [];
+      allRows.push(...batch);
+      if (batch.length < PAGE_SIZE) break;
     }
 
     setTodayOrders(
-      (data || []).map(
+      allRows.map(
         formatOrder
       )
     );
