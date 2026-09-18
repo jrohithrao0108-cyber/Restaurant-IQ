@@ -862,7 +862,7 @@ function Header({
 function printExistingBill(
   order: Order,
   restaurantName: string
-): boolean {
+): Promise<boolean> {
   const settings = getLocalSettings();
   return printCustomerBillReceipt({
     restaurantName,
@@ -875,13 +875,15 @@ function printExistingBill(
     timestamp: order.createdAt,
     isReprint: true,
     paperWidth: settings.paperWidth,
+    restaurantAddress: settings.restaurantAddress || undefined,
+    printerName: settings.billPrinterName,
   });
 }
 
 function printExistingKot(
   order: Order,
   restaurantName: string
-): boolean {
+): Promise<boolean> {
   const settings = getLocalSettings();
   return printKitchenOrderTicket({
     restaurantName,
@@ -891,6 +893,7 @@ function printExistingKot(
     items: order.items,
     timestamp: order.createdAt,
     paperWidth: settings.paperWidth,
+    printerName: settings.kotPrinterName,
   });
 }
 
