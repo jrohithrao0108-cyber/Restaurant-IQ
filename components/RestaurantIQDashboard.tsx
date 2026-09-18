@@ -391,6 +391,14 @@ export function RestaurantIQDashboard({
   });
   const [customEnd, setCustomEnd] = useState(todayISTStr);
 
+  // "Check a different day" lookup, shown right next to Today's
+  // Performance so an owner can glance at yesterday's (or any other
+  // day's) revenue/orders without leaving the today view. Deliberately
+  // independent of topMetrics/dateRange/timeframeMode below — it only
+  // reads from already-loaded data and never changes what "Today" means
+  // anywhere else on the dashboard, so it can't regress those numbers.
+  const [dayLookupDate, setDayLookupDate] = useState(todayISTStr);
+
   // Fast, clean, and reliable data loading from Supabase with Hyderabad IST boundaries
   //
   // Historical fetch used to be capped at a flat 3,000 rows (3 pages of
@@ -581,6 +589,17 @@ export function RestaurantIQDashboard({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dateRange, customStart, loadedHistoryStartStr]);
+
+  // Widen historical data backward if the "check a different day" picker
+  // is set further back than what's currently loaded in memory.
+  useEffect(() => {
+    if (dayLookupDate !== todayISTStr && loadedHistoryStartStr) {
+      if (dayLookupDate < loadedHistoryStartStr) {
+        loadOlderHistory(dayLookupDate);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dayLookupDate, todayISTStr, loadedHistoryStartStr]);
 
   useEffect(() => {
     loadData({ fullHistorical: true });
@@ -893,6 +912,92 @@ export function RestaurantIQDashboard({
     };
   }, [todayOrders, historicalOrders, nowIST.msIntoDay, todayISTStr, now]);
 
+  // Orders for whatever day is picked in the "check a different day"
+  // lookup. Today's own data lives separately (internalTodayOrders) from
+  // the historical map, so route to whichever source actually has it.
+  const dayLookupOrders = useMemo(() => {
+    if (dayLookupDate === todayISTStr) return todayOrders;
+    return historicalOrdersByDate.get(dayLookupDate) || [];
+  }, [dayLookupDate, todayISTStr, todayOrders, historicalOrdersByDate]);
+
+  const dayLookupMetrics = useMemo(() => {
+    const seen = new Set<string>();
+    let rev = 0;
+    let count = 0;
+    for (let i = 0; i < dayLookupOrders.length; i++) {
+      const o = dayLookupOrders[i];
+      const oid = String(o.databaseId || o.id);
+      if (oid) {
+        if (seen.has(oid)) continue;
+        seen.add(oid);
+      }
+      rev += Number(o.total) || 0;
+      count++;
+    }
+    return { rev: Math.round(rev), count, avg: count > 0 ? Math.round(rev / count) : 0 };
+  }, [dayLookupOrders]);
+
+  const isPastDaySelected = dayLookupDate !== todayISTStr;
+
+  // "Sept 18" style label for whatever day is picked, built straight off
+  // the IST date string (no Date-object timezone math needed for the day
+  // number, same approach the "Today (Sept 19)" tier tag already uses).
+  const dayLookupMonthShort = useMemo(() => {
+    if (!dayLookupDate) return "";
+    const d = new Date(`${dayLookupDate}T12:00:00+05:30`);
+    return d.toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", month: "short" });
+  }, [dayLookupDate]);
+  const dayLookupDayNum = dayLookupDate.slice(-2);
+
+  // Month-to-date totals AS OF the picked day, so the "Month-To-Date"
+  // tiles line up with whichever day the Revenue/Orders tiles above are
+  // showing — e.g. picking yesterday shows "Sept MTD" through yesterday
+  // (18 days), not through real today (19 days) with today's still-tiny
+  // partial total baked in. Real, unpicked "today" keeps using the
+  // realtime-subscribed topMetrics.mtd* values instead of this.
+  const dayLookupMtd = useMemo(() => {
+    const currentMonthPrefix = dayLookupDate.slice(0, 7);
+    const mtdDaysCount = parseInt(dayLookupDate.slice(8, 10), 10) || 1;
+    const seen = new Set<string>();
+    let rev = 0;
+    let count = 0;
+
+    if (dayLookupDate === todayISTStr) {
+      for (let i = 0; i < todayOrders.length; i++) {
+        const o = todayOrders[i];
+        const oid = String(o.databaseId || o.id);
+        if (oid) {
+          if (seen.has(oid)) continue;
+          seen.add(oid);
+        }
+        rev += Number(o.total) || 0;
+        count++;
+      }
+    }
+
+    for (let i = 0; i < historicalOrders.length; i++) {
+      const o = historicalOrders[i];
+      const dateStr = o.istDateStr || (o.createdAt ? getFastISTParts(o.createdAt).dateStr : "");
+      if (dateStr && dateStr.startsWith(currentMonthPrefix) && dateStr <= dayLookupDate) {
+        const oid = String(o.databaseId || o.id);
+        if (oid) {
+          if (seen.has(oid)) continue;
+          seen.add(oid);
+        }
+        rev += Number(o.total) || 0;
+        count++;
+      }
+    }
+
+    return {
+      rev: Math.round(rev),
+      orders: count,
+      days: mtdDaysCount,
+      avgDailyRev: Math.round(rev / Math.max(1, mtdDaysCount)),
+      avgDailyOrders: Math.round(count / Math.max(1, mtdDaysCount)),
+    };
+  }, [dayLookupDate, todayISTStr, todayOrders, historicalOrders]);
+
   // Full list of deduplicated MTD orders (from 1st of month to today)
   const mtdOrdersList = useMemo(() => {
     const currentMonthPrefix = todayISTStr.slice(0, 7);
@@ -920,14 +1025,20 @@ export function RestaurantIQDashboard({
     return list;
   }, [todayOrders, historicalOrders, todayISTStr]);
 
-  // Active orders for dimension breakdown (switches dynamically between Today and MTD)
+  // Active orders for dimension breakdown (switches dynamically between
+  // Today and MTD). "Today" here follows whatever day is picked in the
+  // "Check a different day" control, same as the KPI cards above — MTD
+  // stays a real running month-to-date regardless, since that's not
+  // meaningful for a single arbitrary day.
   const activePeriodOrders = useMemo(() => {
-    return timeframeMode === "mtd" ? mtdOrdersList : todayOrders;
-  }, [timeframeMode, mtdOrdersList, todayOrders]);
+    if (timeframeMode === "mtd") return mtdOrdersList;
+    return isPastDaySelected ? dayLookupOrders : todayOrders;
+  }, [timeframeMode, mtdOrdersList, todayOrders, isPastDaySelected, dayLookupOrders]);
 
   const activePeriodTotalRev = useMemo(() => {
-    return timeframeMode === "mtd" ? (topMetrics.mtdRev || 1) : (topMetrics.todayRev || 1);
-  }, [timeframeMode, topMetrics.mtdRev, topMetrics.todayRev]);
+    if (timeframeMode === "mtd") return topMetrics.mtdRev || 1;
+    return (isPastDaySelected ? dayLookupMetrics.rev : topMetrics.todayRev) || 1;
+  }, [timeframeMode, topMetrics.mtdRev, topMetrics.todayRev, isPastDaySelected, dayLookupMetrics.rev]);
 
   // Day-by-Day Revenue & Volume Boxes for previous days & MTD
   const dayBoxes = useMemo(() => {
@@ -3148,12 +3259,13 @@ export function RestaurantIQDashboard({
                 style={{ cursor: "pointer" }}
               >
                 <span className="box-title">
-                  <span>💰</span> Today's Revenue
+                  <span>💰</span> {isPastDaySelected ? "Day's Revenue" : "Today's Revenue"}
                 </span>
                 <span className="status-pill revenue-pill">REVENUE</span>
               </div>
 
-              {/* TOP: Today's Revenue */}
+              {/* TOP: Today's Revenue (or the picked day's, from the
+                  "Check a different day" control below) */}
               <div
                 className={`metric-tier-card ${timeframeMode === "today" ? "active-tier" : ""}`}
                 onClick={() => {
@@ -3164,17 +3276,31 @@ export function RestaurantIQDashboard({
                 title="Click to view the last 7 days' total daily revenue"
               >
                 <div className="metric-tier-header">
-                  <span className="tier-tag">Today ({topMetrics.monthShortName} {getFastISTParts(now).dateStr.slice(-2)})</span>
-                  <span className="tier-subtext">vs Usual {weekdayName} Pacing</span>
+                  <span className="tier-tag">
+                    {isPastDaySelected
+                      ? `${dayLookupMonthShort} ${dayLookupDayNum}`
+                      : `Today (${topMetrics.monthShortName} ${getFastISTParts(now).dateStr.slice(-2)})`}
+                  </span>
+                  <span className="tier-subtext">
+                    {isPastDaySelected ? "Full Day Total" : `vs Usual ${weekdayName} Pacing`}
+                  </span>
                 </div>
                 <div className="metric-val-wrap">
-                  <span className={`rev-number ${topMetrics.revUp ? "rev-up" : "rev-down"}`}>
-                    ₹{topMetrics.todayRev.toLocaleString("en-IN")}
-                  </span>
-                  <span className={`growth-pill ${topMetrics.revUp ? "positive" : "negative"}`}>
-                    {topMetrics.revUp ? <ArrowUpRight size={13} /> : <ArrowDownRight size={13} />}
-                    <span>{topMetrics.revGrowthPct}</span>
-                  </span>
+                  {isPastDaySelected ? (
+                    <span className="rev-number rev-up">
+                      ₹{dayLookupMetrics.rev.toLocaleString("en-IN")}
+                    </span>
+                  ) : (
+                    <>
+                      <span className={`rev-number ${topMetrics.revUp ? "rev-up" : "rev-down"}`}>
+                        ₹{topMetrics.todayRev.toLocaleString("en-IN")}
+                      </span>
+                      <span className={`growth-pill ${topMetrics.revUp ? "positive" : "negative"}`}>
+                        {topMetrics.revUp ? <ArrowUpRight size={13} /> : <ArrowDownRight size={13} />}
+                        <span>{topMetrics.revGrowthPct}</span>
+                      </span>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -3191,15 +3317,18 @@ export function RestaurantIQDashboard({
                 title="Click to view this year's total month-by-month revenue"
               >
                 <div className="metric-tier-header">
-                  <span className="tier-tag">{topMetrics.monthShortName} Month-To-Date</span>
-                  <span className="chip-neutral-days">{topMetrics.mtdDays} Days</span>
+                  <span className="tier-tag">
+                    {isPastDaySelected ? dayLookupMonthShort : topMetrics.monthShortName} Month-To-Date
+                    {isPastDaySelected && <span className="mtd-asof"> (as of {dayLookupMonthShort} {dayLookupDayNum})</span>}
+                  </span>
+                  <span className="chip-neutral-days">{isPastDaySelected ? dayLookupMtd.days : topMetrics.mtdDays} Days</span>
                 </div>
                 <div className="metric-val-wrap">
                   <span className="rev-number rev-mtd-green">
-                    ₹{topMetrics.mtdRev.toLocaleString("en-IN")}
+                    ₹{(isPastDaySelected ? dayLookupMtd.rev : topMetrics.mtdRev).toLocaleString("en-IN")}
                   </span>
                   <span className="mtd-runrate-text">
-                    Avg ₹{Math.round(topMetrics.mtdAvgDailyRev / 1000)}k/day
+                    Avg ₹{Math.round((isPastDaySelected ? dayLookupMtd.avgDailyRev : topMetrics.mtdAvgDailyRev) / 1000)}k/day
                   </span>
                 </div>
               </div>
@@ -3214,12 +3343,12 @@ export function RestaurantIQDashboard({
                 style={{ cursor: "pointer" }}
               >
                 <span className="box-title">
-                  <span>📦</span> Today's Orders
+                  <span>📦</span> {isPastDaySelected ? "Day's Orders" : "Today's Orders"}
                 </span>
                 <span className="status-pill orders-pill">ORDERS</span>
               </div>
 
-              {/* TOP: Today's Orders */}
+              {/* TOP: Today's Orders (or the picked day's) */}
               <div
                 className={`metric-tier-card ${timeframeMode === "today" ? "active-tier" : ""}`}
                 onClick={() => {
@@ -3230,20 +3359,35 @@ export function RestaurantIQDashboard({
                 title="Click to view the last 7 days' total daily orders"
               >
                 <div className="metric-tier-header">
-                  <span className="tier-tag">Today ({topMetrics.monthShortName} {getFastISTParts(now).dateStr.slice(-2)})</span>
-                  <span className="tier-subtext">vs Usual {weekdayName} Pacing</span>
+                  <span className="tier-tag">
+                    {isPastDaySelected
+                      ? `${dayLookupMonthShort} ${dayLookupDayNum}`
+                      : `Today (${topMetrics.monthShortName} ${getFastISTParts(now).dateStr.slice(-2)})`}
+                  </span>
+                  <span className="tier-subtext">
+                    {isPastDaySelected ? "Full Day Total" : `vs Usual ${weekdayName} Pacing`}
+                  </span>
                 </div>
                 <div className="metric-val-wrap">
-                  <div className="orders-count-group">
-                    <span className="orders-number blue-orders">{topMetrics.todayCount}</span>
-                    <span className="orders-unit-label">Orders</span>
-                  </div>
-                  <span className={`growth-pill ${topMetrics.ordersUp ? "positive" : "negative"}`}>
-                    {topMetrics.ordersUp ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}
-                    <span>
-                      {topMetrics.ordersGrowthPct} ({topMetrics.ordersDelta >= 0 ? "+" : ""}{topMetrics.ordersDelta})
-                    </span>
-                  </span>
+                  {isPastDaySelected ? (
+                    <div className="orders-count-group">
+                      <span className="orders-number blue-orders">{dayLookupMetrics.count}</span>
+                      <span className="orders-unit-label">Orders</span>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="orders-count-group">
+                        <span className="orders-number blue-orders">{topMetrics.todayCount}</span>
+                        <span className="orders-unit-label">Orders</span>
+                      </div>
+                      <span className={`growth-pill ${topMetrics.ordersUp ? "positive" : "negative"}`}>
+                        {topMetrics.ordersUp ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}
+                        <span>
+                          {topMetrics.ordersGrowthPct} ({topMetrics.ordersDelta >= 0 ? "+" : ""}{topMetrics.ordersDelta})
+                        </span>
+                      </span>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -3260,41 +3404,84 @@ export function RestaurantIQDashboard({
                 title="Click to view this year's total month-by-month orders"
               >
                 <div className="metric-tier-header">
-                  <span className="tier-tag">{topMetrics.monthShortName} Month-To-Date</span>
-                  <span className="chip-neutral-days">{topMetrics.mtdDays} Days</span>
+                  <span className="tier-tag">
+                    {isPastDaySelected ? dayLookupMonthShort : topMetrics.monthShortName} Month-To-Date
+                    {isPastDaySelected && <span className="mtd-asof"> (as of {dayLookupMonthShort} {dayLookupDayNum})</span>}
+                  </span>
+                  <span className="chip-neutral-days">{isPastDaySelected ? dayLookupMtd.days : topMetrics.mtdDays} Days</span>
                 </div>
                 <div className="metric-val-wrap">
                   <div className="orders-count-group">
-                    <span className="orders-number blue-orders">{topMetrics.mtdOrders.toLocaleString("en-IN")}</span>
+                    <span className="orders-number blue-orders">{(isPastDaySelected ? dayLookupMtd.orders : topMetrics.mtdOrders).toLocaleString("en-IN")}</span>
                     <span className="orders-unit-label">Orders MTD</span>
                   </div>
                   <span className="mtd-runrate-text blue">
-                    Avg {topMetrics.mtdAvgDailyOrders} ord/day
+                    Avg {isPastDaySelected ? dayLookupMtd.avgDailyOrders : topMetrics.mtdAvgDailyOrders} ord/day
                   </span>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* COMBINED BENCHMARK FOOTER STRIP */}
-          <div className="benchmark-combined-strip">
-            <div className="bench-info-left">
-              <span className="bench-label">Usual {weekdayName}:</span>
-              <strong className="bench-stat-bold">
-                ₹{Math.round(topMetrics.baselineRev).toLocaleString("en-IN")}
-              </strong>
-              <span className="bench-bullet">·</span>
-              <strong className="bench-stat-bold">
-                {topMetrics.baselineOrders} orders
-              </strong>
-            </div>
-            <div className={`bench-delta-tag ${topMetrics.revUp && topMetrics.ordersUp ? "positive" : "negative"}`}>
-              💡 {topMetrics.revDelta >= 0 ? "+" : "-"}₹{Math.abs(topMetrics.revDelta).toLocaleString("en-IN")} &amp; {topMetrics.ordersDelta >= 0 ? "+" : ""}{topMetrics.ordersDelta} Orders {topMetrics.revUp ? "UP" : "DOWN"}
-            </div>
+          {/* CHECK A DIFFERENT DAY — the boxes above switch to show
+              whatever day is picked here, e.g. "what did we do
+              yesterday?", without touching what "Today" means
+              anywhere else on the page (MTD, the chart below, etc. —
+              those stay on real today). */}
+          <div className="day-lookup-row">
+            <label className="day-lookup-label">
+              <span>📅</span> Check a different day
+            </label>
+            <input
+              type="date"
+              className="day-lookup-input"
+              value={dayLookupDate}
+              max={todayISTStr}
+              onChange={(e) => {
+                if (e.target.value) setDayLookupDate(e.target.value);
+              }}
+            />
+            {isPastDaySelected && (
+              <div className="day-lookup-result">
+                {localRefreshing && dayLookupOrders.length === 0 && (
+                  <span className="day-lookup-loading">Loading that day…</span>
+                )}
+                <button
+                  type="button"
+                  className="day-lookup-reset"
+                  onClick={() => setDayLookupDate(todayISTStr)}
+                >
+                  Back to Today
+                </button>
+              </div>
+            )}
           </div>
-          <p className="benchmark-footnote">
-            *Compared to historical average of last 3 {weekdayName}s at this exact same hour of day.
-          </p>
+
+          {/* COMBINED BENCHMARK FOOTER STRIP — this compares real TODAY
+              against usual same-weekday pacing, so it only makes sense
+              while the boxes above are actually showing today. */}
+          {!isPastDaySelected && (
+            <>
+              <div className="benchmark-combined-strip">
+                <div className="bench-info-left">
+                  <span className="bench-label">Usual {weekdayName}:</span>
+                  <strong className="bench-stat-bold">
+                    ₹{Math.round(topMetrics.baselineRev).toLocaleString("en-IN")}
+                  </strong>
+                  <span className="bench-bullet">·</span>
+                  <strong className="bench-stat-bold">
+                    {topMetrics.baselineOrders} orders
+                  </strong>
+                </div>
+                <div className={`bench-delta-tag ${topMetrics.revUp && topMetrics.ordersUp ? "positive" : "negative"}`}>
+                  💡 {topMetrics.revDelta >= 0 ? "+" : "-"}₹{Math.abs(topMetrics.revDelta).toLocaleString("en-IN")} &amp; {topMetrics.ordersDelta >= 0 ? "+" : ""}{topMetrics.ordersDelta} Orders {topMetrics.revUp ? "UP" : "DOWN"}
+                </div>
+              </div>
+              <p className="benchmark-footnote">
+                *Compared to historical average of last 3 {weekdayName}s at this exact same hour of day.
+              </p>
+            </>
+          )}
         </div>
       </section>
 
@@ -3307,7 +3494,11 @@ export function RestaurantIQDashboard({
               <div className="chart-title-badge">
                 <span className="live-dot" />
                 <span className="badge-text">
-                  {timeframeMode === "mtd" ? "MONTH-TO-DATE OVERVIEW" : "SAME-DAY OVERVIEW"}
+                  {timeframeMode === "mtd"
+                    ? "MONTH-TO-DATE OVERVIEW"
+                    : isPastDaySelected
+                    ? `${dayLookupMonthShort.toUpperCase()} ${dayLookupDayNum} OVERVIEW`
+                    : "SAME-DAY OVERVIEW"}
                 </span>
               </div>
               <h3 className="chart-main-title">
@@ -3320,10 +3511,10 @@ export function RestaurantIQDashboard({
                   </>
                 ) : (
                   <>
-                    {dimension === "order_type" && "Today's Orders & Revenue by Order Type"}
-                    {dimension === "menu_category" && "Today's Items & Revenue by Menu Category"}
-                    {dimension === "payment_mode" && "Today's Collections & Volume by Payment Mode"}
-                    {dimension === "hours" && "Today's Flow & Revenue by Shift & Hours"}
+                    {dimension === "order_type" && `${isPastDaySelected ? `${dayLookupMonthShort} ${dayLookupDayNum}` : "Today"}'s Orders & Revenue by Order Type`}
+                    {dimension === "menu_category" && `${isPastDaySelected ? `${dayLookupMonthShort} ${dayLookupDayNum}` : "Today"}'s Items & Revenue by Menu Category`}
+                    {dimension === "payment_mode" && `${isPastDaySelected ? `${dayLookupMonthShort} ${dayLookupDayNum}` : "Today"}'s Collections & Volume by Payment Mode`}
+                    {dimension === "hours" && `${isPastDaySelected ? `${dayLookupMonthShort} ${dayLookupDayNum}` : "Today"}'s Flow & Revenue by Shift & Hours`}
                   </>
                 )}
               </h3>
@@ -4581,6 +4772,13 @@ export function RestaurantIQDashboard({
           color: #0f172a;
         }
 
+        .mtd-asof {
+          font-weight: 600;
+          color: #94a3b8;
+          text-transform: none;
+          letter-spacing: 0;
+        }
+
         .tier-subtext {
           font-size: 10.5px;
           color: #64748b;
@@ -4735,6 +4933,75 @@ export function RestaurantIQDashboard({
           font-size: 10.5px;
           color: #94a3b8;
           margin: -4px 0 0 2px;
+        }
+
+        .day-lookup-row {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 10px;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          padding: 8px 14px;
+          border-radius: 10px;
+        }
+
+        .day-lookup-label {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 12px;
+          font-weight: 700;
+          color: #475569;
+          white-space: nowrap;
+        }
+
+        .day-lookup-input {
+          border: 1px solid #e2e8f0;
+          border-radius: 6px;
+          padding: 5px 8px;
+          font-size: 12px;
+          background: #ffffff;
+          color: #0f172a;
+        }
+
+        .day-lookup-result {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 8px;
+          margin-left: auto;
+        }
+
+        .day-lookup-chip {
+          font-size: 12px;
+          font-weight: 700;
+          color: #0f172a;
+          background: #ffffff;
+          border: 1px solid #e2e8f0;
+          padding: 4px 10px;
+          border-radius: 999px;
+        }
+
+        .day-lookup-loading {
+          font-size: 12px;
+          font-weight: 600;
+          color: #94a3b8;
+        }
+
+        .day-lookup-reset {
+          font-size: 11.5px;
+          font-weight: 700;
+          color: #64748b;
+          background: #ffffff;
+          border: 1px solid #e2e8f0;
+          padding: 4px 10px;
+          border-radius: 999px;
+          cursor: pointer;
+        }
+
+        .day-lookup-reset:hover {
+          background: #f1f5f9;
         }
 
         /* 3. SAME-DAY VERTICAL BAR CHART & 4-DIMENSION EXPLORER */
@@ -6107,6 +6374,20 @@ export function RestaurantIQDashboard({
             align-items: flex-start;
             gap: 8px;
             padding: 10px 12px;
+          }
+
+          .day-lookup-row {
+            flex-direction: column;
+            align-items: stretch;
+            padding: 10px 12px;
+          }
+
+          .day-lookup-result {
+            margin-left: 0;
+          }
+
+          .day-lookup-input {
+            width: 100%;
           }
 
           .dimension-selector-section {

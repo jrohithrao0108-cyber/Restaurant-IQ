@@ -6520,10 +6520,25 @@ export default function HomePage() {
         restaurantId
       );
     } catch (err: any) {
-      console.error(
-        "DATABASE ERROR:",
-        err
-      );
+      // Supabase/PostgREST errors and network-layer rejections don't
+      // always carry own enumerable properties that a plain
+      // `console.error(err)` renders usefully — some show up as "{}"
+      // even though the failure is real, which makes this catch
+      // impossible to diagnose from the console alone. Pull out every
+      // field that's actually likely to be populated, plus context
+      // about the network state at the moment it failed.
+      console.error("DATABASE ERROR:", {
+        message: err?.message,
+        code: err?.code,
+        details: err?.details,
+        hint: err?.hint,
+        name: err?.name,
+        status: err?.status ?? err?.statusCode,
+        restaurantId,
+        online: typeof navigator !== "undefined" ? navigator.onLine : "unknown",
+        raw: err,
+        stack: err?.stack,
+      });
 
       // Offline fallback: load cached menu & tables if available. Menu
       // intentionally does NOT fall back to DEMO_PRODUCTS — those are fake
