@@ -29,6 +29,11 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   userScalable: false,
+  // Lets content extend under the notch/status bar (needed since
+  // appleWebApp.statusBarStyle is "black-translucent") while still
+  // reporting real env(safe-area-inset-*) values so screens can pad
+  // around it instead of drawing under it.
+  viewportFit: "cover",
 };
 
 export default function RootLayout({children}:{children:React.ReactNode}) {

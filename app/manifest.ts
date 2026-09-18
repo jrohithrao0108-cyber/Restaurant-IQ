@@ -8,10 +8,13 @@ export default function manifest(): MetadataRoute.Manifest {
     description: "Intelligent POS, KOT Printing & Restaurant Analytics Platform",
     start_url: "/",
     display: "standalone",
-    // A POS terminal is a fixed, landscape screen — locks the installed
-    // window/orientation instead of leaving it to whatever the device
-    // defaults to.
-    orientation: "landscape",
+    // No sitewide lock: the manifest orientation applies to the whole
+    // installed PWA, but only the admin analytics dashboard should be
+    // forced to portrait on phones — POC/POS is always used on a PC, so
+    // it doesn't need one. That per-view lock is done at runtime instead
+    // (see the screen.orientation.lock("portrait") effect in
+    // RestaurantIQDashboard).
+    orientation: "any",
     background_color: "#faf7f2",
     theme_color: "#d99726",
     icons: [

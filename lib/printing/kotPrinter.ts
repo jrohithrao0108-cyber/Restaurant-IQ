@@ -15,6 +15,11 @@ export type KotPrintOptions = {
   serverName?: string;
   timestamp?: string | Date;
   paperWidth?: "80mm" | "58mm";
+  // Named printer (from Settings > Thermal Printer Settings) to send this
+  // ticket to silently via QZ Tray, with no print dialog. Left unset/empty
+  // -> falls back to the original popup + window.print() flow below, exactly
+  // like before this option existed.
+  printerName?: string;
 };
 
 function escapeHtml(value: string): string {
@@ -26,22 +31,9 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#039;");
 }
 
-export function printKitchenOrderTicket(options: KotPrintOptions): boolean {
-  if (!options.items || options.items.length === 0) {
-    console.warn("No items to send to kitchen.");
-    return false;
-  }
-
+function buildKotHtml(options: KotPrintOptions): string {
   const paperWidth = options.paperWidth || "80mm";
   const is58mm = paperWidth === "58mm";
-
-  const winName = `kot_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-  const printWindow = window.open("", winName, "width=420,height=600");
-
-  if (!printWindow) {
-    console.warn("Pop-up blocked for printing KOT.");
-    return false;
-  }
 
   const dateObj = options.timestamp
     ? new Date(options.timestamp)
@@ -92,7 +84,7 @@ export function printKitchenOrderTicket(options: KotPrintOptions): boolean {
     ? `KOT #${options.kotNumber}`
     : "KITCHEN ORDER TICKET";
 
-  printWindow.document.write(`
+  return `
     <!doctype html>
     <html>
       <head>
@@ -243,9 +235,21 @@ export function printKitchenOrderTicket(options: KotPrintOptions): boolean {
         </div>
       </body>
     </html>
-  `);
+  `;
+}
+
+/** Original behavior: opens a popup and drives the browser's own print dialog. */
+function printKotViaPopup(html: string): boolean {
+  const winName = `kot_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const printWindow = window.open("", winName, "width=420,height=600");
+
+  if (!printWindow) {
+    console.warn("Pop-up blocked for printing KOT.");
+    return false;
+  }
 
   try {
+    printWindow.document.write(html);
     printWindow.document.close();
     printWindow.focus();
     printWindow.onafterprint = () => {
@@ -260,7 +264,40 @@ export function printKitchenOrderTicket(options: KotPrintOptions): boolean {
     }, 250);
   } catch (err) {
     console.error("Failed to print KOT:", err);
+    return false;
   }
 
   return true;
+}
+
+/**
+ * Prints the kitchen ticket. If `options.printerName` is set (configured in
+ * Settings > Thermal Printer Settings), sends it silently to that exact
+ * printer via QZ Tray — no popup, no dialog. Otherwise, and as an automatic
+ * fallback if the QZ Tray attempt fails for any reason (not installed, not
+ * running, printer not found), falls back to the original popup +
+ * window.print() flow so a KOT is never just silently lost.
+ */
+export async function printKitchenOrderTicket(options: KotPrintOptions): Promise<boolean> {
+  if (!options.items || options.items.length === 0) {
+    console.warn("No items to send to kitchen.");
+    return false;
+  }
+
+  const html = buildKotHtml(options);
+
+  if (options.printerName && options.printerName.trim()) {
+    try {
+      const { printHtmlToPrinter } = await import("./qzPrinter");
+      await printHtmlToPrinter(options.printerName, html);
+      return true;
+    } catch (err) {
+      console.warn(
+        `Could not print KOT to "${options.printerName}" via QZ Tray, falling back to the print dialog:`,
+        err
+      );
+    }
+  }
+
+  return printKotViaPopup(html);
 }

@@ -142,51 +142,11 @@ const SUGGESTED_CATEGORIES = [
   "Beverages",
 ];
 
-const CATEGORY_ICONS: Record<string, string> = {
-  "All Dishes": "🍽️",
-  "Starters": "🍢",
-  "Mains": "🍲",
-  "Breads": "🫓",
-  "Rice & Biryani": "🍚",
-  "Desserts": "🍨",
-  "Beverages": "🥤",
-  "Soups": "🍜",
-  "Salads": "🥗",
-  "Snacks": "🍟",
-  "Chinese": "🥡",
-  "Pizza": "🍕",
-  "Combos": "🍱",
-  "Burgers": "🍔",
-  "Coffee": "☕",
-  "Tea": "🍵",
-  "Chai": "🍵",
-  "Juices": "🧃",
-  "Lassi": "🥛",
-  "Ice Cream": "🍦",
-  "Mocktails": "🍹",
-  "Sandwiches": "🥪",
-  "Chaat": "🥙",
-  "Rolls": "🌯",
-  "Tiffins": "🥘",
-  "Idly": "🥟",
-  "Idli": "🥟",
-  "Dosa": "🫓",
-  "Bonda": "🧆",
-  "Vada": "🍩",
-  "Wada": "🍩",
-  "Uttapam": "🥞",
-  "Upma": "🥣",
-  "Pongal": "🥣",
-  "Sambar": "🍲",
-  "Rasam": "🍲",
-  "Uncategorized": "🍴",
-};
-
-const ORDER_CHANNELS: Array<{ id: OrderSource; label: string; icon: string }> = [
-  { id: "DINE_IN", label: "Dine In", icon: "🍽️" },
-  { id: "TAKEAWAY", label: "Takeaway", icon: "🛍️" },
-  { id: "SWIGGY", label: "Swiggy", icon: "🛵" },
-  { id: "ZOMATO", label: "Zomato", icon: "🛵" },
+const ORDER_CHANNELS: Array<{ id: OrderSource; label: string }> = [
+  { id: "DINE_IN", label: "Dine In" },
+  { id: "TAKEAWAY", label: "Takeaway" },
+  { id: "SWIGGY", label: "Swiggy" },
+  { id: "ZOMATO", label: "Zomato" },
 ];
 
 const PAYMENT_MODES = [
@@ -194,6 +154,95 @@ const PAYMENT_MODES = [
   { id: "CASH", label: "Cash", icon: "💵" },
   { id: "CARD", label: "Card", icon: "💳" },
 ] as const;
+
+// A cart quantity that can be typed directly (e.g. "10" for a bulk Butter
+// Naan order) instead of tapping + ten times. Keeps its own draft text
+// while focused so a mid-edit empty field doesn't get read as 0 and wipe
+// the cart line — commits (and clamps to >=1) on blur/Enter, and reverts
+// to the last valid quantity otherwise.
+function QtyInput({
+  value,
+  onCommit,
+  variant,
+}: {
+  value: number;
+  onCommit: (n: number) => void;
+  variant: "card" | "cart";
+}) {
+  const [text, setText] = useState(String(value));
+
+  useEffect(() => {
+    setText(String(value));
+  }, [value]);
+
+  function commit() {
+    const n = Math.round(Number(text));
+    if (Number.isFinite(n) && n > 0) {
+      onCommit(n);
+    } else {
+      setText(String(value));
+    }
+  }
+
+  return (
+    <>
+      <input
+        type="text"
+        inputMode="numeric"
+        pattern="[0-9]*"
+        className={`qty-input qty-input-${variant}`}
+        value={text}
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => setText(e.target.value.replace(/[^0-9]/g, ""))}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        }}
+        title="Type a quantity directly"
+      />
+      {/* Scoped to this component on purpose — styled-jsx in the parent
+          can't reach into a separately-defined child component, so these
+          rules have to live where the <input> actually renders. Plain
+          text input (not type="number") so no native up/down spinner
+          ever shows up next to the custom −/+ buttons. */}
+      <style jsx>{`
+        .qty-input {
+          text-align: center;
+          font-family: inherit;
+          border: none;
+          border-radius: 3px;
+          outline: none;
+          padding: 0;
+          line-height: 1;
+        }
+
+        .qty-input-card {
+          font-size: 11.5px;
+          font-weight: 800;
+          width: 16px;
+          background: transparent;
+          color: #ffffff;
+        }
+
+        .qty-input-card:focus {
+          background: rgba(255, 255, 255, 0.2);
+        }
+
+        .qty-input-cart {
+          font-size: 12px;
+          font-weight: 700;
+          width: 16px;
+          background: transparent;
+          color: #1c1917;
+        }
+
+        .qty-input-cart:focus {
+          background: #faf7f2;
+        }
+      `}</style>
+    </>
+  );
+}
 
 function money(n: number) {
   return `₹${Math.round(Number(n) || 0).toLocaleString("en-IN")}`;
@@ -384,8 +433,8 @@ export function RestaurantPOS({
   const [cart, setCart] = useState<Item[]>([]);
   const [discountPercent, setDiscountPercent] = useState<number>(0);
   const [discountFlat, setDiscountFlat] = useState<number>(0);
-  const [applyGst, setApplyGst] = useState(true);
-  const [gstPercent, setGstPercent] = useState<number>(() => getLocalSettings().gstPercent ?? 5);
+  const [applyGst, setApplyGst] = useState<boolean>(() => getLocalSettings().applyGst !== false);
+  const [gstPercent, setGstPercent] = useState<number>(() => getLocalSettings().gstPercent ?? 0);
   const [paymentMode, setPaymentMode] = useState<string>("UPI");
   const [cashTendered, setCashTendered] = useState<string>("");
 
@@ -400,6 +449,19 @@ export function RestaurantPOS({
   const [pendingSaveOnTableSelect, setPendingSaveOnTableSelect] = useState(false);
   const [showRecentBillsModal, setShowRecentBillsModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+
+  // --- Printer settings (Settings > Thermal Printer Settings) ---
+  // "checking" while a connection attempt is in flight, "connected" once QZ
+  // Tray answers, "unavailable" if it's not installed/running/reachable —
+  // in which case the KOT/Bill printer pickers fall back to free-text so a
+  // restaurant can still type an exact printer name even before QZ Tray is
+  // set up on this PC.
+  const [qzStatus, setQzStatus] = useState<"checking" | "connected" | "unavailable">("checking");
+  const [qzPrinterList, setQzPrinterList] = useState<string[]>([]);
+  const [kotPrinterNameDraft, setKotPrinterNameDraft] = useState("");
+  const [billPrinterNameDraft, setBillPrinterNameDraft] = useState("");
+  const [testPrintingKot, setTestPrintingKot] = useState(false);
+  const [testPrintingBill, setTestPrintingBill] = useState(false);
 
   // --- Table sections (Outside/Family/AC etc.) ---
   const [showSectionsModal, setShowSectionsModal] = useState(false);
@@ -994,6 +1056,105 @@ export function RestaurantPOS({
     } catch (e) {}
   }, []);
 
+  // Load current saved printer names into the editable drafts and probe QZ
+  // Tray for its installed-printer list every time the settings modal
+  // opens — not on every render, since a connection attempt has a real
+  // (if short) timeout and there's no reason to repeat it while the modal
+  // is closed.
+  useEffect(() => {
+    if (!showSettingsModal) return;
+    let cancelled = false;
+
+    const settings = getLocalSettings();
+    setKotPrinterNameDraft(settings.kotPrinterName || "");
+    setBillPrinterNameDraft(settings.billPrinterName || "");
+    setQzStatus("checking");
+
+    import("@/lib/printing/qzPrinter")
+      .then(async ({ isQzTrayConnected, listQzPrinters }) => {
+        const connected = await isQzTrayConnected();
+        if (cancelled) return;
+        if (!connected) {
+          setQzStatus("unavailable");
+          setQzPrinterList([]);
+          return;
+        }
+        setQzStatus("connected");
+        try {
+          const printers = await listQzPrinters();
+          if (!cancelled) setQzPrinterList(printers);
+        } catch {
+          if (!cancelled) setQzPrinterList([]);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setQzStatus("unavailable");
+          setQzPrinterList([]);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [showSettingsModal]);
+
+  function saveKotPrinterName(name: string) {
+    setKotPrinterNameDraft(name);
+    saveLocalSettings({ kotPrinterName: name });
+  }
+
+  function saveBillPrinterName(name: string) {
+    setBillPrinterNameDraft(name);
+    saveLocalSettings({ billPrinterName: name });
+  }
+
+  async function handleTestPrintKot() {
+    setTestPrintingKot(true);
+    try {
+      const ok = await printKitchenOrderTicket({
+        restaurantName: restaurantName || "RestaurantIQ",
+        orderNumber: "TEST",
+        table: "TEST",
+        source: "DINE_IN",
+        items: [{ name: "Test Item — KOT Printer Check", qty: 1 }],
+        kotNumber: "TEST",
+        paperWidth: getLocalSettings().paperWidth,
+        printerName: kotPrinterNameDraft,
+      });
+      showToast(
+        ok ? "Test KOT sent." : "Could not send test KOT — check the printer name and QZ Tray.",
+        ok ? "success" : "error"
+      );
+    } finally {
+      setTestPrintingKot(false);
+    }
+  }
+
+  async function handleTestPrintBill() {
+    setTestPrintingBill(true);
+    try {
+      const ok = await printCustomerBillReceipt({
+        restaurantName: restaurantName || "RestaurantIQ",
+        orderNumber: "TEST",
+        billNo: "TEST",
+        source: "DINE_IN",
+        table: "TEST",
+        paymentMode: "CASH",
+        items: [{ name: "Test Item — Bill Printer Check", qty: 1, price: 0 }],
+        total: 0,
+        paperWidth: getLocalSettings().paperWidth,
+        printerName: billPrinterNameDraft,
+      });
+      showToast(
+        ok ? "Test bill sent." : "Could not send test bill — check the printer name and QZ Tray.",
+        ok ? "success" : "error"
+      );
+    } finally {
+      setTestPrintingBill(false);
+    }
+  }
+
   function persistHeldOrders(updated: HeldOrder[]) {
     setHeldOrders(updated);
     try {
@@ -1030,6 +1191,18 @@ export function RestaurantPOS({
     setCart((prev) => prev.filter((item) => item.id !== productId));
   }
 
+  // Typing a quantity directly (e.g. "10" for a bulk Butter Naan order)
+  // instead of tapping + ten times.
+  function setCartQty(productId: string, qty: number) {
+    if (!Number.isFinite(qty) || qty <= 0) {
+      removeFromCart(productId);
+      return;
+    }
+    setCart((prev) =>
+      prev.map((item) => (item.id === productId ? { ...item, qty } : item))
+    );
+  }
+
   function saveItemNote(productId: string, noteText: string) {
     setCart((prev) =>
       prev.map((item) =>
@@ -1053,6 +1226,21 @@ export function RestaurantPOS({
   const taxableAmount = Math.max(0, subtotal - discountAmount);
   const gstAmount = applyGst ? Math.round(taxableAmount * (gstPercent / 100)) : 0;
   const grandTotal = Math.round(taxableAmount + gstAmount);
+
+  // Zomato/Swiggy collect payment themselves and settle to the restaurant
+  // via their escrow — there's no Cash/UPI/Card choice to make at the
+  // counter for these, so the picker is replaced with a fixed note and
+  // `payment` is forced to a real value instead of whatever button was
+  // last clicked (previously defaulted to "UPI" and never changed).
+  const isAggregatorOrder = source === "SWIGGY" || source === "ZOMATO";
+
+  useEffect(() => {
+    if (isAggregatorOrder) {
+      setPaymentMode("AGGREGATOR");
+    } else {
+      setPaymentMode((prev) => (prev === "AGGREGATOR" ? "UPI" : prev));
+    }
+  }, [isAggregatorOrder]);
 
   const tenderNumber = Number(cashTendered) || 0;
   const changeDue = tenderNumber > grandTotal ? tenderNumber - grandTotal : 0;
@@ -1160,6 +1348,10 @@ export function RestaurantPOS({
     setDiscountFlat(0);
     noTableOrderRef.current = null;
     setTable(null);
+    // Opening Menu & Billing this way (not via a table) should land on a
+    // clean slate — back to "All Dishes" instead of whatever category was
+    // left selected from browsing a table's order.
+    setSelectedCat("All Dishes");
 
     if (chId === "DINE_IN") {
       setSource("DINE_IN");
@@ -1234,8 +1426,10 @@ export function RestaurantPOS({
         return;
       }
       const billNo = order.billNo ?? getDailyBillNumber(order.id, order.databaseId);
+      const printSettings = getLocalSettings();
       printCustomerBillReceipt({
         restaurantName: restaurantName || "RestaurantIQ",
+        restaurantAddress: printSettings.restaurantAddress || undefined,
         orderNumber: order.id,
         billNo,
         tokenNo: billNo,
@@ -1251,6 +1445,7 @@ export function RestaurantPOS({
         taxSgstPercent: applyGst ? gstPercent / 2 : 0,
         total: order.total,
         paperWidth: "80mm",
+        printerName: printSettings.billPrinterName,
       });
       showToast(`Bill #${billNo} printed for Table${order.table || ""}`, "success");
     } catch (e) {
@@ -1557,6 +1752,7 @@ export function RestaurantPOS({
                 items: diffItems,
                 serverName: serverName.trim() || undefined,
                 paperWidth: settings.paperWidth,
+                printerName: settings.kotPrinterName,
               });
             } catch (e) {
               console.warn("KOT print skipped or dialog closed:", e);
@@ -1593,6 +1789,7 @@ export function RestaurantPOS({
                 items: lastRound.items,
                 serverName: serverName.trim() || undefined,
                 paperWidth: settings.paperWidth,
+                printerName: settings.kotPrinterName,
               });
               showToast(`Reprinted KOT #${kotNumberForReprint} (Round ${lastRound.round}).`, "success");
             } catch (e) {
@@ -1717,6 +1914,7 @@ export function RestaurantPOS({
               items: savedItems,
               serverName: serverName.trim() || undefined,
               paperWidth: settings.paperWidth,
+              printerName: settings.kotPrinterName,
             });
             showToast(`KOT #${globalKotNumber} printed. Remember to Settle to save this order.`, "success");
           } catch (e) {
@@ -1739,6 +1937,7 @@ export function RestaurantPOS({
               items: savedItems,
               serverName: serverName.trim() || undefined,
               paperWidth: settings.paperWidth,
+              printerName: settings.kotPrinterName,
             });
             showToast(`KOT #${globalKotNumber} printed.`, "success");
           } catch (e) {
@@ -1872,6 +2071,7 @@ export function RestaurantPOS({
     try {
       printCustomerBillReceipt({
         restaurantName,
+        restaurantAddress: settings.restaurantAddress || undefined,
         orderNumber,
         billNo,
         tokenNo: billNo,
@@ -1887,6 +2087,7 @@ export function RestaurantPOS({
         taxSgstPercent: applyGst ? gstPercent / 2 : 0,
         total: grandTotal,
         paperWidth: settings.paperWidth,
+        printerName: settings.billPrinterName,
       });
       showToast(`Bill #${billNo} printed.`, "success");
     } catch (e) {
@@ -2033,6 +2234,7 @@ export function RestaurantPOS({
           try {
             printCustomerBillReceipt({
               restaurantName,
+              restaurantAddress: settings.restaurantAddress || undefined,
               orderNumber,
               billNo,
               tokenNo: billNo,
@@ -2048,6 +2250,7 @@ export function RestaurantPOS({
               taxSgstPercent: applyGst ? gstPercent / 2 : 0,
               total: savedGrandTotal,
               paperWidth: settings.paperWidth,
+              printerName: settings.billPrinterName,
             });
           } catch (e) {}
         }
@@ -2063,6 +2266,7 @@ export function RestaurantPOS({
               items: savedItems,
               serverName,
               paperWidth: settings.paperWidth,
+              printerName: settings.kotPrinterName,
             });
           } catch (e) {}
         }
@@ -2353,37 +2557,33 @@ export function RestaurantPOS({
               className={`pos-channel-btn channel-${ch.id.toLowerCase()} ${source === ch.id ? "active" : ""}`}
               onClick={() => handleSelectChannel(ch.id)}
             >
-              <span className="channel-icon">{ch.icon}</span>
+              <span className="channel-dot" />
               <span className="channel-label">{ch.label}</span>
             </button>
           ))}
         </div>
 
-        {source === "DINE_IN" && (
+        {/* Only shown once a table is actually assigned — the "no table"
+            state already reads clearly from the billing panel's own
+            "Dine-In (No Table)" badge, so repeating a "No Table (Direct)"
+            prompt up here too was just redundant clutter. */}
+        {source === "DINE_IN" && table && (
           <div className="pos-table-selector-container">
             <button
               type="button"
-              className={`pos-table-selector-trigger ${!table ? "no-table" : "has-table"}`}
+              className="pos-table-selector-trigger has-table"
               onClick={() => setShowTablePickerModal(true)}
-              title={table ? `Table ${table} assigned (Click to change or clear)` : "Dine-In without table (Click to assign table)"}
+              title={`Table ${table} assigned (Click to change or clear)`}
             >
               <TableIcon size={14} />
               <span className="table-current-label">
-                {table ? (
-                  <>Table <b>{table}</b></>
-                ) : (
-                  <span className="no-table-prompt">No Table (Direct)</span>
-                )}
+                Table <b>{table}</b>
               </span>
-              {table ? (
-                <span
-                  className={`table-status-dot ${
-                    occupiedTableNumbers.has(table) ? "occupied" : "vacant"
-                  }`}
-                />
-              ) : (
-                <span className="table-optional-hint">Tables</span>
-              )}
+              <span
+                className={`table-status-dot ${
+                  occupiedTableNumbers.has(table) ? "occupied" : "vacant"
+                }`}
+              />
               <ChevronDown size={13} className="chev-icon" />
             </button>
             {table && (
@@ -2417,6 +2617,15 @@ export function RestaurantPOS({
         <div className="top-spacer" />
 
         <div className="pos-top-actions">
+          <button
+            type="button"
+            className="pos-tool-btn printer-settings-btn"
+            onClick={() => setShowSettingsModal(true)}
+            title="Set which printer KOT tickets and bills print to"
+          >
+            <span>🖨️</span>
+            <span>Printers</span>
+          </button>
           <button
             type="button"
             className={`pos-tool-btn debug-panel-btn ${showDebugPanel ? "active" : ""}`}
@@ -2842,14 +3051,11 @@ export function RestaurantPOS({
                   className={`vertical-cat-btn favorites-cat-btn ${selectedCat === "Favorites" ? "active" : ""}`}
                   onClick={() => setSelectedCat("Favorites")}
                 >
-                  <span className="cat-icon">❤️</span>
                   <span className="cat-name">Favorites</span>
                   <span className="cat-badge">{favoriteIds.size}</span>
-                  {selectedCat === "Favorites" && <div className="cat-active-indicator" />}
                 </button>
 
                 {categoriesWithCounts.map((cat) => {
-                  const icon = CATEGORY_ICONS[cat.name] || "🍴";
                   const isSelected = selectedCat === cat.name;
 
                   return (
@@ -2859,25 +3065,14 @@ export function RestaurantPOS({
                       className={`vertical-cat-btn ${isSelected ? "active" : ""}`}
                       onClick={() => setSelectedCat(cat.name)}
                     >
-                      <span className="cat-icon">{icon}</span>
                       <span className="cat-name">{cat.name}</span>
                       <span className="cat-badge">{cat.count}</span>
-                      {isSelected && <div className="cat-active-indicator" />}
                     </button>
                   );
                 })}
               </div>
 
               <div className="vertical-cat-footer">
-                <button
-                  type="button"
-                  className="quick-add-dish-btn"
-                  onClick={() => setShowAddModal(true)}
-                >
-                  <Plus size={13} />
-                  <span>+ Add Dish</span>
-                </button>
-
                 <div className="terminal-shift-pill">
                   <div className="shift-dot-row">
                     <span className="live-dot" />
@@ -2911,14 +3106,6 @@ export function RestaurantPOS({
                   </button>
                   <button
                     type="button"
-                    className={`veg-pill veg ${vegFilter === "VEG" ? "active" : ""}`}
-                    onClick={() => setVegFilter("VEG")}
-                  >
-                    <span className="veg-dot" />
-                    Veg
-                  </button>
-                  <button
-                    type="button"
                     className={`veg-pill non-veg ${
                       vegFilter === "NON_VEG" ? "active" : ""
                     }`}
@@ -2926,6 +3113,14 @@ export function RestaurantPOS({
                   >
                     <span className="non-veg-triangle" />
                     Non-Veg
+                  </button>
+                  <button
+                    type="button"
+                    className={`veg-pill veg ${vegFilter === "VEG" ? "active" : ""}`}
+                    onClick={() => setVegFilter("VEG")}
+                  >
+                    <span className="veg-dot" />
+                    Veg
                   </button>
                 </div>
 
@@ -2947,15 +3142,26 @@ export function RestaurantPOS({
                   )}
                 </div>
 
-                <button
-                  type="button"
-                  className="toolbar-bulk-btn"
-                  onClick={() => setShowBulkModal(true)}
-                  title="Bulk create dishes with category, name and cost"
-                >
-                  <Plus size={12} />
-                  <span>⚡ Bulk Menu</span>
-                </button>
+                <div className="catalog-toolbar-actions">
+                  <button
+                    type="button"
+                    className="quick-add-dish-btn"
+                    onClick={() => setShowAddModal(true)}
+                  >
+                    <Plus size={13} />
+                    <span>Add Dish</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    className="toolbar-bulk-btn"
+                    onClick={() => setShowBulkModal(true)}
+                    title="Bulk create dishes with category, name and cost"
+                  >
+                    <Plus size={12} />
+                    <span>⚡ Bulk Menu</span>
+                  </button>
+                </div>
               </div>
 
               <div className="dishes-grid">
@@ -2982,57 +3188,24 @@ export function RestaurantPOS({
                         <Heart size={13} fill={isFav ? "#ef4444" : "none"} />
                       </button>
 
+                      {qtyInCart > 0 && (
+                        <span className="card-qty-badge">{qtyInCart}</span>
+                      )}
+
                       <div className="dish-card-top">
                         <div className={`fssai-symbol ${veg ? "veg" : "non-veg"}`}>
                           <div className="symbol-inner" />
                         </div>
-                        <span className="dish-price">{money(p.price)}</span>
                       </div>
 
                       <div className="dish-info">
                         <h3 className="dish-name" title={cleanDishDisplayName(p.name, p.category)}>
                           {cleanDishDisplayName(p.name, p.category)}
                         </h3>
+                        <span className="dish-price">{money(p.price)}</span>
                       </div>
 
                       <div className="dish-card-bottom">
-                        {qtyInCart > 0 ? (
-                          <div
-                            className="card-stepper"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <button
-                              type="button"
-                              className="card-step-btn minus"
-                              onClick={() => decrementCart(p.id)}
-                              title="Decrease"
-                            >
-                              <Minus size={11} />
-                            </button>
-                            <span className="card-qty">{qtyInCart}</span>
-                            <button
-                              type="button"
-                              className="card-step-btn plus"
-                              onClick={() => addToCart(p)}
-                              title="Increase"
-                            >
-                              <Plus size={11} />
-                            </button>
-                          </div>
-                        ) : (
-                          <button
-                            type="button"
-                            className="card-add-btn"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              addToCart(p);
-                            }}
-                          >
-                            <Plus size={11} />
-                            <span>Add</span>
-                          </button>
-                        )}
-
                         <button
                           type="button"
                           className="edit-dish-price-btn"
@@ -3074,8 +3247,9 @@ export function RestaurantPOS({
             <aside className="pos-checkout-panel">
               <div className="ticket-header">
                 <div className="ticket-channel-info">
+                  <span className="billing-title">Billing</span>
                   <span
-                    className="ticket-channel-badge clickable"
+                    className={`ticket-channel-badge clickable channel-${source.toLowerCase()}`}
                     onClick={() => {
                       if (source === "DINE_IN") {
                         setShowTablePickerModal(true);
@@ -3173,6 +3347,14 @@ export function RestaurantPOS({
                   </div>
                 ) : (
                   <div className="cart-items-list">
+                    <div className="billing-section-heading">
+                      <span>Item</span>
+                      <div className="billing-heading-right">
+                        <span className="billing-qty-label">Quantity</span>
+                        <span className="billing-price-spacer" />
+                        <span className="billing-trash-spacer" />
+                      </div>
+                    </div>
                     {cart.map((item) => {
                       const veg = isVeg(item.name, item.category);
                       const displayName = cleanDishDisplayName(item.name, item.category);
@@ -3227,7 +3409,11 @@ export function RestaurantPOS({
                               >
                                 <Minus size={10} />
                               </button>
-                              <span>{item.qty}</span>
+                              <QtyInput
+                                value={item.qty}
+                                onCommit={(n) => setCartQty(item.id, n)}
+                                variant="cart"
+                              />
                               <button
                                 type="button"
                                 onClick={() => addToCart(item)}
@@ -3333,7 +3519,10 @@ export function RestaurantPOS({
                     <input
                       type="checkbox"
                       checked={applyGst}
-                      onChange={(e) => setApplyGst(e.target.checked)}
+                      onChange={(e) => {
+                        setApplyGst(e.target.checked);
+                        saveLocalSettings({ applyGst: e.target.checked });
+                      }}
                     />
                     <span>Apply GST:</span>
                     <input
@@ -3366,19 +3555,29 @@ export function RestaurantPOS({
                 </div>
 
                 <div className="payment-modes-grid">
-                  {PAYMENT_MODES.map((mode) => (
-                    <button
-                      key={mode.id}
-                      type="button"
-                      className={`payment-mode-btn ${
-                        paymentMode === mode.id ? "active" : ""
-                      }`}
-                      onClick={() => setPaymentMode(mode.id)}
+                  {isAggregatorOrder ? (
+                    <div
+                      className="payment-mode-btn aggregator-mode-note"
+                      title="Zomato/Swiggy collect payment directly — settled to the restaurant via the aggregator's escrow, not chosen at the counter"
                     >
-                      <span className="pay-icon">{mode.icon}</span>
-                      <span className="pay-label">{mode.label}</span>
-                    </button>
-                  ))}
+                      <span className="pay-icon">🛵</span>
+                      <span className="pay-label">Aggregator Escrow</span>
+                    </div>
+                  ) : (
+                    PAYMENT_MODES.map((mode) => (
+                      <button
+                        key={mode.id}
+                        type="button"
+                        className={`payment-mode-btn ${
+                          paymentMode === mode.id ? "active" : ""
+                        }`}
+                        onClick={() => setPaymentMode(mode.id)}
+                      >
+                        <span className="pay-icon">{mode.icon}</span>
+                        <span className="pay-label">{mode.label}</span>
+                      </button>
+                    ))
+                  )}
 
                   <button
                     key="SAVE_TABLE_BTN"
@@ -3649,6 +3848,7 @@ export function RestaurantPOS({
                           const billNo = o.billNo ?? getDailyBillNumber(o.id, o.databaseId);
                           printCustomerBillReceipt({
                             restaurantName,
+                            restaurantAddress: settings.restaurantAddress || undefined,
                             orderNumber: o.id,
                             billNo,
                             tokenNo: billNo,
@@ -3664,6 +3864,7 @@ export function RestaurantPOS({
                             taxSgstPercent: applyGst ? gstPercent / 2 : 0,
                             total: o.total,
                             paperWidth: settings.paperWidth,
+                            printerName: settings.billPrinterName,
                           });
                         }}
                       >
@@ -4160,10 +4361,117 @@ export function RestaurantPOS({
                   <option value="80mm">80mm (3-inch / Standard)</option>
                 </select>
               </label>
+
+              <label className="settings-row">
+                <span>Restaurant Address (prints below name on bill):</span>
+                <input
+                  type="text"
+                  placeholder="e.g. 12 MG Road, Bengaluru"
+                  defaultValue={getLocalSettings().restaurantAddress}
+                  onBlur={(e) => saveLocalSettings({ restaurantAddress: e.target.value })}
+                />
+              </label>
               {/* Print-on-Settle toggles (bill + KOT) live at the bottom of
                   the cart panel now, next to the Settle button — visible
                   where they're actually used, instead of buried here where
                   a KOT could fire on Settle with no visible sign why. */}
+
+              <div className="divider" />
+
+              <div className="settings-row printer-routing-head">
+                <span>Printer Routing</span>
+              </div>
+
+              {qzStatus === "checking" && (
+                <p className="sections-modal-hint small">Looking for QZ Tray on this PC…</p>
+              )}
+              {qzStatus === "unavailable" && (
+                <p className="sections-modal-hint">
+                  QZ Tray isn't running on this PC, so KOT and Bill printing still use the regular
+                  print dialog where you pick a printer yourself. To send KOT and Bill to two
+                  different printers automatically with no dialog, install{" "}
+                  <a href="https://qz.io/download/" target="_blank" rel="noreferrer">
+                    QZ Tray
+                  </a>{" "}
+                  and reopen this panel — or type an exact Windows printer name below now, it'll
+                  start working once QZ Tray is running.
+                </p>
+              )}
+              {qzStatus === "connected" && (
+                <p className="sections-modal-hint small">
+                  QZ Tray connected — {qzPrinterList.length} printer(s) found.
+                </p>
+              )}
+
+              <label className="settings-row">
+                <span>KOT (Kitchen) Printer:</span>
+                {qzPrinterList.length > 0 ? (
+                  <select
+                    value={kotPrinterNameDraft}
+                    onChange={(e) => saveKotPrinterName(e.target.value)}
+                  >
+                    <option value="">Use print dialog (ask each time)</option>
+                    {qzPrinterList.map((p) => (
+                      <option key={p} value={p}>{p}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="text"
+                    placeholder="Exact printer name (leave blank for print dialog)"
+                    value={kotPrinterNameDraft}
+                    onChange={(e) => saveKotPrinterName(e.target.value)}
+                  />
+                )}
+              </label>
+              <div className="printer-test-row">
+                <button
+                  type="button"
+                  className="section-add-table-btn"
+                  disabled={!kotPrinterNameDraft.trim() || testPrintingKot}
+                  onClick={handleTestPrintKot}
+                >
+                  {testPrintingKot ? "Sending…" : "Test Print KOT"}
+                </button>
+              </div>
+
+              <label className="settings-row">
+                <span>Bill (Counter) Printer:</span>
+                {qzPrinterList.length > 0 ? (
+                  <select
+                    value={billPrinterNameDraft}
+                    onChange={(e) => saveBillPrinterName(e.target.value)}
+                  >
+                    <option value="">Use print dialog (ask each time)</option>
+                    {qzPrinterList.map((p) => (
+                      <option key={p} value={p}>{p}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="text"
+                    placeholder="Exact printer name (leave blank for print dialog)"
+                    value={billPrinterNameDraft}
+                    onChange={(e) => saveBillPrinterName(e.target.value)}
+                  />
+                )}
+              </label>
+              <div className="printer-test-row">
+                <button
+                  type="button"
+                  className="section-add-table-btn"
+                  disabled={!billPrinterNameDraft.trim() || testPrintingBill}
+                  onClick={handleTestPrintBill}
+                >
+                  {testPrintingBill ? "Sending…" : "Test Print Bill"}
+                </button>
+              </div>
+
+              <p className="sections-modal-hint small">
+                KOT and Bill can point at the same printer if you only have one — just pick it for
+                both. Leaving either one blank keeps today's behavior: the regular print dialog
+                opens and you choose a printer by hand.
+              </p>
             </div>
             <div className="modal-footer">
               <button
@@ -4312,15 +4620,79 @@ export function RestaurantPOS({
       {/* STYLES PRESERVED EXACTLY AS PROVIDED */}
       <style jsx>{`
         .restaurant-iq-pos {
+          /* ---- Design tokens: one shared scale so every control in the
+             POS screen reads as one system instead of many one-off sizes.
+             Existing hex values are kept as the *source* of each token
+             (nothing about the palette changes), just centralized. ---- */
+          --pos-radius-sm: 6px;
+          --pos-radius-md: 8px;
+          --pos-radius-lg: 12px;
+          --pos-radius-pill: 999px;
+
+          --pos-control-h: 36px;
+          --pos-control-h-sm: 28px;
+          /* The three column headers ("Categories", the dish-catalog
+             toolbar, "Billing") sit side by side and need to end at the
+             exact same pixel so their bottom borders form one straight
+             line across the screen instead of a staircase. */
+          --pos-header-h: 42px;
+
+          --pos-fs-2xs: 10px;
+          --pos-fs-xs: 11px;
+          --pos-fs-sm: 12px;
+          --pos-fs-base: 13px;
+          --pos-fs-md: 14px;
+          --pos-fs-lg: 16px;
+          --pos-fs-xl: 18px;
+          --pos-fs-2xl: 20px;
+
+          --pos-ink: #1c1917;
+          --pos-ink-2: #44403c;
+          --pos-ink-3: #57534e;
+          --pos-muted: #78716c;
+          --pos-faint: #a8a29e;
+          --pos-border: #ede7dc;
+          --pos-border-strong: #e7e0d3;
+          --pos-bg: #faf7f2;
+          --pos-surface: #ffffff;
+          --pos-disabled-bg: #f4f2ee;
+
+          --pos-primary: #d99726;
+          --pos-primary-dark: #b47814;
+          --pos-primary-tint: #fef9ee;
+          --pos-primary-shadow: rgba(217, 151, 38, 0.3);
+          --pos-primary-light: #f0cb8a;
+
+          --pos-success: #16a34a;
+          --pos-success-dark: #15803d;
+          --pos-success-accent: #10b981;
+          --pos-success-tint: #ecfdf5;
+          --pos-success-border: #bbf7d0;
+
+          --pos-danger: #dc2626;
+          --pos-danger-dark: #b91c1c;
+          --pos-danger-accent: #ef4444;
+          --pos-danger-tint: #fef2f2;
+          --pos-danger-border: #fecaca;
+
+          --pos-info: #1d4ed8;
+          --pos-info-tint: #eff6ff;
+          --pos-info-border: #dbeafe;
+
+          --pos-swiggy: #c2410c;
+          --pos-swiggy-tint: #fff7ed;
+          --pos-zomato: #b91c1c;
+          --pos-zomato-tint: #fef2f2;
+
           display: flex;
           flex-direction: column;
           height: 100vh;
           max-height: 100vh;
           width: 100vw;
           max-width: 100vw;
-          background: #faf7f2;
+          background: var(--pos-bg);
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          color: #1c1917;
+          color: var(--pos-ink);
           overflow: hidden;
           margin: 0;
           padding: 0;
@@ -4350,32 +4722,36 @@ export function RestaurantPOS({
           transform-origin: bottom left !important;
         }
 
-        /* 1. TOP BAR */
+        /* 1. TOP BAR — every interactive control in this row (view switch,
+           channel tabs, table selector, tool buttons) now shares one
+           height (--pos-control-h) and one radius scale, so the bar reads
+           as a single toolbar instead of several differently-sized pill
+           shapes stacked next to each other. */
         .pos-top-bar {
           display: flex;
           align-items: center;
           gap: 10px;
-          padding: 0 12px;
-          height: 46px;
-          min-height: 46px;
-          background: #ffffff;
-          color: #1c1917;
-          border-bottom: 1px solid #ede7dc;
+          padding: 0 14px;
+          height: 58px;
+          min-height: 58px;
+          background: var(--pos-surface);
+          color: var(--pos-ink);
+          border-bottom: 1px solid var(--pos-border);
           flex-shrink: 0;
         }
 
         .pos-brand-cluster {
           display: flex;
           align-items: center;
-          gap: 8px;
+          gap: 10px;
         }
 
         .pos-brand-logo {
-          width: 28px;
-          height: 28px;
-          border-radius: 7px;
-          background: #faf7f2;
-          border: 1px solid #ede7dc;
+          width: 38px;
+          height: 38px;
+          border-radius: var(--pos-radius-md);
+          background: var(--pos-bg);
+          border: 1px solid var(--pos-border);
           display: flex;
           align-items: center;
           justify-content: center;
@@ -4389,108 +4765,139 @@ export function RestaurantPOS({
           display: block;
         }
 
+        /* Back to dark ink: the amber price-accent color read oddly on a
+           static brand name — amber is reserved for money/price cues
+           (dish prices, totals), and reusing it here blurred that
+           meaning rather than reading as "brand". */
         .pos-brand-meta b {
-          font-size: 13px;
+          font-size: var(--pos-fs-lg);
           font-weight: 800;
           letter-spacing: -0.01em;
           display: block;
           line-height: 1.1;
-          color: #1c1917;
+          color: var(--pos-primary-dark);
         }
 
         .pos-brand-meta span {
-          font-size: 10px;
-          color: #78716c;
+          font-size: var(--pos-fs-xs);
+          color: var(--pos-muted);
           display: block;
           line-height: 1.1;
         }
 
         .top-divider {
           width: 1px;
-          height: 22px;
-          background: #ede7dc;
+          height: 24px;
+          background: var(--pos-border);
         }
 
         .pos-channel-group {
           display: flex;
+          align-items: center;
+          height: var(--pos-control-h);
           gap: 2px;
-          background: #faf7f2;
-          padding: 2px;
-          border-radius: 7px;
-          border: 1px solid #ede7dc;
+          background: var(--pos-bg);
+          padding: 3px;
+          border-radius: var(--pos-radius-md);
+          border: 1px solid var(--pos-border);
+          box-sizing: border-box;
         }
 
         .pos-channel-btn {
           display: flex;
           align-items: center;
+          justify-content: center;
           gap: 6px;
-          padding: 7px 14px;
+          height: 100%;
+          padding: 0 14px;
           border-radius: 6px;
           border: none;
           background: transparent;
-          color: #78716c;
-          font-size: 13px;
-          font-weight: 600;
+          color: var(--pos-muted);
+          font-size: var(--pos-fs-base);
+          font-weight: 700;
           cursor: pointer;
           transition: all 0.15s ease;
           white-space: nowrap;
         }
 
         .pos-channel-btn:hover {
-          color: #1c1917;
-          background: #ffffff;
+          color: var(--pos-ink);
+          background: var(--pos-surface);
         }
 
         .pos-channel-btn.active {
-          background: #d99726;
+          background: var(--pos-primary);
           color: #ffffff;
           font-weight: 700;
-          box-shadow: 0 1px 4px rgba(217, 151, 38, 0.3);
+          box-shadow: 0 1px 4px var(--pos-primary-shadow);
+        }
+
+        /* A plain colored dot instead of an emoji — emoji glyphs render at
+           inconsistent visual sizes/weights across channels (a plate icon
+           reads much "heavier" than a scooter), which made the row look
+           uneven even though the buttons themselves are identical boxes. */
+        .channel-dot {
+          width: 7px;
+          height: 7px;
+          border-radius: 50%;
+          flex-shrink: 0;
+          background: currentColor;
+        }
+
+        .pos-channel-btn.active .channel-dot {
+          background: #ffffff;
         }
 
         /* Subtle brand tint even when NOT selected, so the group reads
            as distinct channels at a glance, not just "one highlighted
            button among identical gray ones." */
         .pos-channel-btn.channel-dine_in:not(.active) {
-          background: rgba(217, 151, 38, 0.08);
-          color: #b47814;
+          background: var(--pos-primary-tint);
+          color: var(--pos-primary-dark);
         }
 
         .pos-channel-btn.channel-takeaway:not(.active) {
-          background: rgba(59, 130, 246, 0.08);
-          color: #1d4ed8;
+          background: var(--pos-info-tint);
+          color: var(--pos-info);
         }
 
         .pos-channel-btn.channel-swiggy:not(.active) {
-          background: rgba(249, 115, 22, 0.1);
-          color: #c2410c;
+          background: var(--pos-swiggy-tint);
+          color: var(--pos-swiggy);
         }
 
         .pos-channel-btn.channel-zomato:not(.active) {
-          background: rgba(239, 68, 68, 0.1);
-          color: #b91c1c;
+          background: var(--pos-zomato-tint);
+          color: var(--pos-zomato);
         }
 
-        /* VIEW SWITCHER IN TOP BAR */
+        /* VIEW SWITCHER IN TOP BAR — identical box model to
+           .pos-channel-group so the two switchers in this row match. */
         .pos-view-switcher {
           display: flex;
-          background: #faf7f2;
-          border: 1px solid #ede7dc;
-          border-radius: 7px;
-          padding: 2px;
+          align-items: center;
+          height: var(--pos-control-h);
+          background: var(--pos-bg);
+          border: 1px solid var(--pos-border);
+          border-radius: var(--pos-radius-md);
+          padding: 3px;
           gap: 2px;
+          box-sizing: border-box;
         }
 
         .pos-view-btn {
           display: flex;
           align-items: center;
+          justify-content: center;
           gap: 5px;
-          padding: 4px 10px;
-          border-radius: 5px;
+          height: 100%;
+          padding: 0 14px;
+          border-radius: 6px;
           border: none;
           background: transparent;
-          color: #78716c;
-          font-size: 12px;
+          color: var(--pos-muted);
+          font-size: var(--pos-fs-base);
           font-weight: 700;
           cursor: pointer;
           transition: all 0.15s ease;
@@ -4498,108 +4905,96 @@ export function RestaurantPOS({
         }
 
         .pos-view-btn:hover {
-          color: #1c1917;
-          background: #ffffff;
+          color: var(--pos-ink);
+          background: var(--pos-surface);
         }
 
         .pos-view-btn.active {
-          background: #d99726;
+          background: var(--pos-primary);
           color: #ffffff;
-          box-shadow: 0 1px 4px rgba(217, 151, 38, 0.3);
+          box-shadow: 0 1px 4px var(--pos-primary-shadow);
         }
 
         .pos-dinein-nav-btn {
           display: flex;
           align-items: center;
+          justify-content: center;
           gap: 6px;
-          padding: 4px 11px;
-          border-radius: 6px;
-          border: 1px solid #ede7dc;
-          background: #faf7f2;
-          color: #44403c;
-          font-size: 12px;
+          height: var(--pos-control-h);
+          padding: 0 14px;
+          border-radius: var(--pos-radius-md);
+          border: 1px solid var(--pos-border);
+          background: var(--pos-bg);
+          color: var(--pos-ink-2);
+          font-size: var(--pos-fs-sm);
           font-weight: 700;
           cursor: pointer;
           transition: all 0.15s ease;
           white-space: nowrap;
+          box-sizing: border-box;
         }
 
         .pos-dinein-nav-btn:hover {
-          background: #d99726;
-          border-color: #d99726;
+          background: var(--pos-primary);
+          border-color: var(--pos-primary);
           color: #ffffff;
-          box-shadow: 0 2px 6px rgba(217, 151, 38, 0.3);
+          box-shadow: 0 2px 6px var(--pos-primary-shadow);
         }
 
         .pos-table-selector-container {
           display: flex;
           align-items: center;
+          height: var(--pos-control-h);
           gap: 4px;
         }
 
         .pos-table-selector-trigger {
           display: flex;
           align-items: center;
+          justify-content: center;
           gap: 6px;
-          padding: 4px 10px;
-          background: #faf7f2;
-          border: 1px solid #ede7dc;
-          border-radius: 6px;
-          color: #1c1917;
-          font-size: 12px;
+          height: 100%;
+          padding: 0 12px;
+          background: var(--pos-bg);
+          border: 1px solid var(--pos-border);
+          border-radius: var(--pos-radius-md);
+          color: var(--pos-ink);
+          font-size: var(--pos-fs-sm);
+          font-weight: 600;
           cursor: pointer;
           transition: all 0.15s ease;
           white-space: nowrap;
-        }
-
-        .pos-table-selector-trigger.no-table {
-          border-color: #fde68a;
-          background: #fef9ee;
-          color: #b45309;
+          box-sizing: border-box;
         }
 
         .pos-table-selector-trigger.has-table {
-          border-color: #bbf7d0;
-          background: #ecfdf5;
-          color: #15803d;
-        }
-
-        .no-table-prompt {
-          font-weight: 700;
-          color: #44403c;
-        }
-
-        .table-optional-hint {
-          font-size: 10px;
-          font-weight: 700;
-          background: #ede7dc;
-          padding: 1px 5px;
-          border-radius: 4px;
-          color: #57534e;
-          margin-left: 2px;
+          border-color: var(--pos-success-border);
+          background: var(--pos-success-tint);
+          color: var(--pos-success-dark);
         }
 
         .pos-table-clear-btn {
           display: flex;
           align-items: center;
           justify-content: center;
-          width: 22px;
-          height: 22px;
-          border-radius: 5px;
-          background: #fef2f2;
-          border: 1px solid #fecaca;
-          color: #dc2626;
+          width: var(--pos-control-h);
+          height: var(--pos-control-h);
+          border-radius: var(--pos-radius-md);
+          background: var(--pos-danger-tint);
+          border: 1px solid var(--pos-danger-border);
+          color: var(--pos-danger);
           cursor: pointer;
           transition: all 0.15s ease;
+          box-sizing: border-box;
         }
 
         .pos-table-clear-btn:hover {
-          background: #ef4444;
+          background: var(--pos-danger-accent);
           color: #ffffff;
         }
 
         .pos-table-selector-trigger:hover {
-          background: #ffffff;
+          background: var(--pos-surface);
         }
 
         .table-status-dot {
@@ -4609,47 +5004,49 @@ export function RestaurantPOS({
         }
 
         .table-status-dot.vacant {
-          background: #10b981;
+          background: var(--pos-success-accent);
         }
 
         .table-status-dot.occupied {
-          background: #ef4444;
+          background: var(--pos-danger-accent);
         }
 
         .table-status-text {
-          font-size: 10px;
+          font-size: var(--pos-fs-2xs);
           font-weight: 700;
-          color: #78716c;
+          color: var(--pos-muted);
           text-transform: uppercase;
         }
 
         .chev-icon {
-          color: #78716c;
+          color: var(--pos-muted);
         }
 
         .server-input {
           display: flex;
           align-items: center;
-          gap: 5px;
-          background: #faf7f2;
-          border: 1px solid #ede7dc;
-          border-radius: 6px;
-          padding: 3px 8px;
-          color: #78716c;
-          width: 105px;
+          height: var(--pos-control-h);
+          gap: 6px;
+          background: var(--pos-bg);
+          border: 1px solid var(--pos-border);
+          border-radius: var(--pos-radius-md);
+          padding: 0 10px;
+          color: var(--pos-muted);
+          width: 110px;
+          box-sizing: border-box;
         }
 
         .server-input input {
           border: none;
           background: transparent;
-          color: #1c1917;
-          font-size: 11px;
+          color: var(--pos-ink);
+          font-size: var(--pos-fs-xs);
           width: 100%;
           outline: none;
         }
 
         .server-input input::placeholder {
-          color: #a8a29e;
+          color: var(--pos-faint);
         }
 
         .top-spacer {
@@ -4659,46 +5056,50 @@ export function RestaurantPOS({
         .pos-top-actions {
           display: flex;
           align-items: center;
+          height: var(--pos-control-h);
           gap: 6px;
         }
 
         .pos-tool-btn {
           display: flex;
           align-items: center;
+          justify-content: center;
           gap: 5px;
-          padding: 4px 9px;
-          border-radius: 6px;
-          border: 1px solid #ede7dc;
-          background: #faf7f2;
-          color: #44403c;
-          font-size: 11.5px;
+          height: 100%;
+          padding: 0 12px;
+          border-radius: var(--pos-radius-md);
+          border: 1px solid var(--pos-border);
+          background: var(--pos-bg);
+          color: var(--pos-ink-2);
+          font-size: var(--pos-fs-sm);
           font-weight: 600;
           cursor: pointer;
           transition: all 0.15s ease;
           white-space: nowrap;
+          box-sizing: border-box;
         }
 
         .pos-tool-btn:hover {
-          background: #ffffff;
-          border-color: #d99726;
-          color: #1c1917;
+          background: var(--pos-surface);
+          border-color: var(--pos-primary);
+          color: var(--pos-ink);
         }
 
         .pos-tool-btn.icon-only {
-          padding: 4px 7px;
+          padding: 0 10px;
         }
 
         .pos-tool-btn.has-held {
-          background: #d97706;
+          background: var(--pos-primary-dark);
           color: #ffffff;
-          border-color: #f59e0b;
+          border-color: var(--pos-primary);
           font-weight: 700;
         }
 
         .logout-btn:hover {
-          background: #fef2f2;
-          color: #dc2626;
-          border-color: #fecaca;
+          background: var(--pos-danger-tint);
+          color: var(--pos-danger);
+          border-color: var(--pos-danger-border);
         }
 
         .debug-panel-btn.active {
@@ -4709,7 +5110,7 @@ export function RestaurantPOS({
 
         .debug-storage-panel {
           position: fixed;
-          top: 46px;
+          top: 58px;
           right: 0;
           bottom: 0;
           width: 380px;
@@ -4866,8 +5267,8 @@ export function RestaurantPOS({
           flex: 1;
           width: 100%;
           max-width: 100vw;
-          height: calc(100vh - 46px);
-          max-height: calc(100vh - 46px);
+          height: calc(100vh - 58px);
+          max-height: calc(100vh - 58px);
           overflow: hidden;
           background: #ffffff;
           margin: 0;
@@ -5628,7 +6029,7 @@ export function RestaurantPOS({
         .tile-new-order-btn {
           border: none;
           background: transparent;
-          color: #d99726;
+          color: #1c1917;
           font-size: 10px;
           font-weight: 700;
           cursor: pointer;
@@ -5644,8 +6045,8 @@ export function RestaurantPOS({
           width: 175px;
           min-width: 175px;
           max-width: 175px;
-          background: #ffffff;
-          border-right: 1px solid #ede7dc;
+          background: var(--pos-surface);
+          border-right: 1px solid var(--pos-border);
           display: flex;
           flex-direction: column;
           height: 100%;
@@ -5655,40 +6056,60 @@ export function RestaurantPOS({
           box-sizing: border-box;
         }
 
+        /* The three column headers — Categories, the dish-catalog toolbar,
+           and Billing — sit side by side. They all share --pos-header-h,
+           the same var(--pos-surface) background, and the same
+           var(--pos-border) bottom border, so their edges line up into
+           one continuous, identically-styled bar across the screen
+           instead of three different heights/colors next to each other. */
         .vertical-cat-header {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          padding: 0 10px;
-          height: 40px;
-          border-bottom: 1px solid #faf7f2;
+          /* Matches the category list's effective left/right inset (8px
+             list padding + 11px button padding = 19px) so "Categories"
+             lines up with the category names directly below it instead
+             of sitting further left. */
+          padding: 0 19px;
+          height: var(--pos-header-h);
+          background: var(--pos-surface);
+          border-bottom: 1px solid var(--pos-border);
+          box-sizing: border-box;
           flex-shrink: 0;
         }
 
+        /* Matches .catalog-title-wrap h2 and .billing-title exactly (same
+           size/weight/color) so the three column headings — Categories,
+           All Dishes, Billing — read as one consistent heading style
+           instead of "Categories" being a small muted uppercase label
+           next to two large dark titles. */
+        /* The shared column-heading style: also applied, unchanged, to
+           .catalog-title-wrap h2 ("All Dishes") and .billing-title
+           ("Billing") so all three column headers match exactly. */
         .rail-title {
-          font-size: 11px;
+          font-size: var(--pos-fs-xs);
           font-weight: 800;
           text-transform: uppercase;
           letter-spacing: 0.05em;
-          color: #78716c;
+          color: var(--pos-muted);
         }
 
         .rail-count {
-          font-size: 10.5px;
+          font-size: var(--pos-fs-2xs);
           font-weight: 700;
-          background: #faf7f2;
-          color: #78716c;
-          padding: 1px 6px;
-          border-radius: 999px;
+          background: var(--pos-bg);
+          color: var(--pos-muted);
+          padding: 1px 7px;
+          border-radius: var(--pos-radius-pill);
         }
 
         .vertical-cat-list {
           flex: 1;
           overflow-y: auto;
-          padding: 5px 6px;
+          padding: 8px;
           display: flex;
           flex-direction: column;
-          gap: 2px;
+          gap: 8px;
         }
 
         .vertical-cat-btn {
@@ -5696,126 +6117,96 @@ export function RestaurantPOS({
           display: flex;
           align-items: center;
           gap: 10px;
-          height: 48px;
-          padding: 0 10px;
-          border-radius: 6px;
-          border: 1px solid transparent;
-          background: transparent;
-          color: #44403c;
+          min-height: 48px;
+          padding: 10px 12px;
+          border-radius: var(--pos-radius-lg);
+          border: 1.5px solid var(--pos-border);
+          background: var(--pos-surface);
+          color: var(--pos-ink-2);
           text-align: left;
           cursor: pointer;
-          transition: all 0.15s ease;
+          transition: transform 0.15s ease, box-shadow 0.15s ease,
+            border-color 0.15s ease, background-color 0.15s ease;
           width: 100%;
+          box-shadow: 0 1px 2px rgba(28, 25, 23, 0.05);
         }
 
         .vertical-cat-btn:hover {
-          background: #faf7f2;
-          color: #1c1917;
+          border-color: var(--pos-primary-light);
+          color: var(--pos-ink);
+          transform: translateY(-1px);
+          box-shadow: 0 8px 16px -10px rgba(217, 151, 38, 0.35);
         }
 
         .vertical-cat-btn.active {
-          background: #fef9ee;
-          color: #c88719;
-          border-color: #fde68a;
+          background: linear-gradient(180deg, var(--pos-primary-tint) 0%, var(--pos-surface) 65%);
+          color: var(--pos-ink);
+          border-color: var(--pos-primary);
           font-weight: 700;
+          box-shadow: 0 1px 2px rgba(28, 25, 23, 0.04), 0 6px 14px -8px var(--pos-primary-shadow);
         }
 
         .favorites-cat-btn {
-          margin-bottom: 6px;
-          padding-bottom: 6px;
-          border-bottom: 1px dashed #ede7dc;
+          margin-bottom: 2px;
         }
 
         .favorites-cat-btn.active {
-          background: #fef2f2;
-          color: #dc2626;
-          border-color: #fecaca;
+          background: linear-gradient(180deg, var(--pos-danger-tint) 0%, var(--pos-surface) 65%);
+          color: var(--pos-danger);
+          border-color: var(--pos-danger-accent);
+          box-shadow: 0 0 0 1.5px var(--pos-danger-accent), 0 6px 14px -6px rgba(239, 68, 68, 0.3);
         }
 
         .favorites-cat-btn.active .cat-badge {
-          background: #fecaca;
-          color: #b91c1c;
+          background: var(--pos-danger-border);
+          color: var(--pos-danger-dark);
         }
 
-        .cat-icon {
-          font-size: 20px;
-          line-height: 1;
-          flex-shrink: 0;
-        }
-
+        /* Stepped down from the dish names on purpose: category names are
+           secondary navigation (glanced at once to pick a section), while
+           dish names are the primary content people scan repeatedly to
+           decide what to order — so dishes now carry the larger size. */
         .cat-name {
           flex: 1;
-          font-size: 14.5px;
+          text-align: left;
+          font-size: var(--pos-fs-base);
           font-weight: 600;
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
+          white-space: normal;
+          word-break: break-word;
+          line-height: 1.25;
         }
 
         .cat-badge {
-          font-size: 12px;
+          font-size: var(--pos-fs-sm);
           font-weight: 700;
-          background: #faf7f2;
-          color: #78716c;
-          padding: 2px 6px;
-          border-radius: 4px;
+          background: var(--pos-bg);
+          color: var(--pos-muted);
+          padding: 2px 7px;
+          border-radius: var(--pos-radius-pill);
         }
 
         .vertical-cat-btn.active .cat-badge {
-          background: #fde68a;
-          color: #c88719;
-        }
-
-        .cat-active-indicator {
-          position: absolute;
-          left: 0;
-          top: 6px;
-          bottom: 6px;
-          width: 4px;
-          background: #d99726;
-          border-radius: 0 3px 3px 0;
+          background: linear-gradient(135deg, var(--pos-primary), var(--pos-primary-dark));
+          color: #ffffff;
         }
 
         .vertical-cat-footer {
-          padding: 8px 8px 24px 8px;
-          border-top: 1px solid #faf7f2;
+          padding: 8px 8px 16px 8px;
+          border-top: 1px solid var(--pos-bg);
           flex-shrink: 0;
           display: flex;
           flex-direction: column;
           gap: 6px;
         }
 
-        .quick-add-dish-btn {
-          width: 100%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 4px;
-          height: 32px;
-          background: #faf7f2;
-          border: 1px dashed #e7e0d3;
-          border-radius: 6px;
-          color: #44403c;
-          font-size: 11px;
-          font-weight: 700;
-          cursor: pointer;
-          transition: all 0.15s ease;
-        }
-
-        .quick-add-dish-btn:hover {
-          background: #fef9ee;
-          border-color: #e2a034;
-          color: #d99726;
-        }
-
         .terminal-shift-pill {
-          background: #faf7f2;
-          border: 1px solid #ede7dc;
-          border-radius: 6px;
-          padding: 6px 8px;
+          background: var(--pos-bg);
+          border: 1px solid var(--pos-border);
+          border-radius: var(--pos-radius-md);
+          padding: 8px;
           display: flex;
           flex-direction: column;
-          gap: 3px;
+          gap: 4px;
         }
 
         .shift-dot-row {
@@ -5823,22 +6214,22 @@ export function RestaurantPOS({
           align-items: center;
           gap: 5px;
           font-weight: 700;
-          color: #10b981;
-          font-size: 10.5px;
+          color: var(--pos-success-accent);
+          font-size: var(--pos-fs-xs);
         }
 
         .shift-dot-row .live-dot {
           width: 6px;
           height: 6px;
           border-radius: 50%;
-          background: #10b981;
+          background: var(--pos-success-accent);
         }
 
         .shift-info-row {
           display: flex;
           justify-content: space-between;
-          font-size: 9.5px;
-          color: #78716c;
+          font-size: var(--pos-fs-2xs);
+          color: var(--pos-muted);
         }
 
         /* COLUMN 2: DISH CATALOG PANEL */
@@ -5859,12 +6250,56 @@ export function RestaurantPOS({
         .catalog-toolbar {
           display: flex;
           align-items: center;
-          justify-content: space-between;
-          padding: 0 12px;
-          height: 42px;
-          background: #ffffff;
-          border-bottom: 1px solid #ede7dc;
-          gap: 10px;
+          justify-content: flex-start;
+          flex-wrap: wrap;
+          padding: 7px 12px;
+          min-height: var(--pos-header-h);
+          background: var(--pos-surface);
+          border-bottom: 1px solid var(--pos-border);
+          box-sizing: border-box;
+          gap: 8px 10px;
+          flex-shrink: 0;
+          overflow: hidden;
+        }
+
+        .catalog-title-wrap {
+          flex-shrink: 0;
+        }
+
+        .veg-filter-pills {
+          flex-shrink: 0;
+        }
+
+        .pos-search-box {
+          flex: 1 1 140px;
+          min-width: 0;
+          max-width: 220px;
+        }
+
+        /* Used to be forced onto its own full-width row every time
+           (flex-basis: 100%), which made this toolbar much taller than
+           the Categories and Billing headers next to it — the three
+           column headers no longer lined up. It now sits at the end of
+           the same row as the title/filters/search (margin-left: auto
+           pushes it there) and never shrinks itself, so it can't get
+           clipped; .pos-search-box already shrinks first to make room.
+           flex-wrap on the parent is kept as a safety net only for a
+           window too narrow to fit everything, where this still wraps
+           to its own line rather than overflowing. */
+        .catalog-toolbar-actions {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 8px;
+          flex-shrink: 0;
+          margin-left: auto;
+        }
+
+        .quick-add-dish-btn {
+          flex-shrink: 0;
+        }
+
+        .toolbar-bulk-btn {
           flex-shrink: 0;
         }
 
@@ -5874,45 +6309,54 @@ export function RestaurantPOS({
           gap: 6px;
         }
 
+        /* Matches .rail-title exactly (same size/weight/case/color as
+           "CATEGORIES"). */
         .catalog-title-wrap h2 {
           margin: 0;
-          font-size: 14px;
+          font-size: var(--pos-fs-xs);
           font-weight: 800;
-          color: #1c1917;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          color: var(--pos-muted);
         }
 
         .item-count-sub {
-          font-size: 11px;
-          color: #78716c;
+          font-size: var(--pos-fs-xs);
+          color: var(--pos-muted);
           font-weight: 600;
         }
 
         .veg-filter-pills {
           display: flex;
+          align-items: center;
+          height: var(--pos-control-h-sm);
           gap: 2px;
-          background: #faf7f2;
-          padding: 2px;
-          border-radius: 6px;
+          background: var(--pos-bg);
+          padding: 3px;
+          border-radius: var(--pos-radius-sm);
+          box-sizing: border-box;
         }
 
         .veg-pill {
           display: flex;
           align-items: center;
+          justify-content: center;
           gap: 4px;
-          padding: 3px 8px;
+          height: 100%;
+          padding: 0 10px;
           border-radius: 4px;
           border: none;
           background: transparent;
-          color: #78716c;
-          font-size: 11px;
+          color: var(--pos-muted);
+          font-size: var(--pos-fs-xs);
           font-weight: 600;
           cursor: pointer;
           transition: all 0.15s ease;
         }
 
         .veg-pill.active {
-          background: #ffffff;
-          color: #1c1917;
+          background: var(--pos-surface);
+          color: var(--pos-ink);
           box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
           font-weight: 700;
         }
@@ -5921,7 +6365,7 @@ export function RestaurantPOS({
           width: 7px;
           height: 7px;
           border-radius: 50%;
-          background: #16a34a;
+          background: var(--pos-success);
         }
 
         .non-veg-triangle {
@@ -5929,34 +6373,35 @@ export function RestaurantPOS({
           height: 0;
           border-left: 3.5px solid transparent;
           border-right: 3.5px solid transparent;
-          border-bottom: 7px solid #dc2626;
+          border-bottom: 7px solid var(--pos-danger);
         }
 
         .pos-search-box {
           display: flex;
           align-items: center;
           gap: 6px;
-          background: #faf7f2;
-          border: 1px solid #ede7dc;
-          border-radius: 6px;
-          padding: 0 8px;
-          height: 28px;
-          width: 170px;
+          background: var(--pos-bg);
+          border: 1px solid var(--pos-border);
+          border-radius: var(--pos-radius-sm);
+          padding: 0 10px;
+          height: var(--pos-control-h-sm);
+          width: 180px;
+          box-sizing: border-box;
         }
 
         .pos-search-box input {
           border: none;
           background: transparent;
-          font-size: 11.5px;
+          font-size: var(--pos-fs-sm);
           width: 100%;
           outline: none;
-          color: #1c1917;
+          color: var(--pos-ink);
         }
 
         .clear-search {
           border: none;
           background: transparent;
-          color: #a8a29e;
+          color: var(--pos-faint);
           cursor: pointer;
           padding: 0;
         }
@@ -5964,10 +6409,10 @@ export function RestaurantPOS({
         .dishes-grid {
           flex: 1;
           overflow-y: auto;
-          padding: 8px 10px 16px 10px;
+          padding: 10px 12px 20px 12px;
           display: grid;
-          grid-template-columns: repeat(4, minmax(0, 1fr));
-          gap: 8px;
+          grid-template-columns: repeat(5, minmax(0, 1fr));
+          gap: 10px;
           align-content: start;
         }
 
@@ -5978,66 +6423,70 @@ export function RestaurantPOS({
         }
 
         .dish-card {
-          background: #ffffff;
-          border: 1.5px solid #ede7dc;
-          border-radius: 7px;
-          padding: 5px 7px;
+          background: var(--pos-surface);
+          border: 1px solid var(--pos-border);
+          border-radius: var(--pos-radius-lg);
+          padding: 10px 11px 9px;
           display: flex;
           flex-direction: column;
           justify-content: space-between;
           cursor: pointer;
-          transition: all 0.12s ease;
-          min-height: 80px;
-          box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+          transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+          min-height: 96px;
+          box-shadow: 0 1px 2px rgba(28, 25, 23, 0.04);
           position: relative;
-          overflow: hidden;
+          user-select: none;
+          -webkit-user-select: none;
+          -webkit-tap-highlight-color: transparent;
         }
 
         .dish-fav-btn {
           position: absolute;
-          top: 3px;
-          right: 3px;
+          top: 7px;
+          right: 7px;
           z-index: 2;
           display: flex;
           align-items: center;
           justify-content: center;
-          width: 18px;
-          height: 18px;
+          width: 22px;
+          height: 22px;
           padding: 0;
           border: none;
-          background: transparent;
+          border-radius: var(--pos-radius-pill);
+          background: rgba(250, 247, 242, 0.9);
           color: #d6d3d1;
           cursor: pointer;
-          transition: all 0.12s ease;
+          transition: all 0.15s ease;
         }
 
         .dish-fav-btn:hover {
-          color: #ef4444;
-          transform: scale(1.15);
+          color: var(--pos-danger-accent);
+          background: #fff1f1;
+          transform: scale(1.1);
         }
 
         .dish-fav-btn.active {
-          color: #ef4444;
+          color: var(--pos-danger-accent);
         }
 
         .dish-card:hover {
-          border-color: #93c5fd;
-          transform: translateY(-1px);
-          box-shadow: 0 3px 6px rgba(217, 151, 38, 0.07);
+          border-color: var(--pos-primary-light);
+          transform: translateY(-2px);
+          box-shadow: 0 10px 20px -8px var(--pos-primary-shadow);
         }
 
         .dish-card.in-cart {
-          border-color: #d99726;
-          background: #fef9ee;
-          box-shadow: 0 0 0 1px #d99726;
+          border-color: var(--pos-primary);
+          background: linear-gradient(180deg, var(--pos-primary-tint) 0%, var(--pos-surface) 65%);
+          box-shadow: 0 0 0 1.5px var(--pos-primary), 0 8px 16px -8px rgba(217, 151, 38, 0.35);
         }
 
         .dish-card-top {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          margin-bottom: 2px;
-          padding-right: 16px;
+          margin-bottom: 6px;
+          padding-right: 22px;
         }
 
         .dish-indicator-group {
@@ -6048,68 +6497,70 @@ export function RestaurantPOS({
 
         /* FSSAI Standard Indicator */
         .fssai-symbol {
-          width: 12px;
-          height: 12px;
-          border: 1.2px solid;
+          width: 13px;
+          height: 13px;
+          border: 1.3px solid;
           display: flex;
           align-items: center;
           justify-content: center;
-          border-radius: 2px;
+          border-radius: 3px;
           flex-shrink: 0;
         }
 
         .fssai-symbol.veg {
-          border-color: #16a34a;
+          border-color: var(--pos-success);
         }
 
         .fssai-symbol.veg .symbol-inner {
-          width: 6px;
-          height: 6px;
+          width: 6.5px;
+          height: 6.5px;
           border-radius: 50%;
-          background: #16a34a;
+          background: var(--pos-success);
         }
 
         .fssai-symbol.non-veg {
-          border-color: #dc2626;
+          border-color: var(--pos-danger);
         }
 
         .fssai-symbol.non-veg .symbol-inner {
           width: 0;
           height: 0;
-          border-left: 3px solid transparent;
-          border-right: 3px solid transparent;
-          border-bottom: 6px solid #dc2626;
+          border-left: 3.5px solid transparent;
+          border-right: 3.5px solid transparent;
+          border-bottom: 6.5px solid var(--pos-danger);
         }
 
         .dish-cat-tag {
-          font-size: 9.5px;
+          font-size: var(--pos-fs-2xs);
           font-weight: 600;
-          color: #a8a29e;
+          color: var(--pos-faint);
           text-transform: capitalize;
         }
 
+        /* Was the same faint gray as disabled/placeholder text, which made
+           every price look dimmed-out. Prices are core information on a
+           POS screen, so they get the same ink weight as the dish name. */
         .dish-price {
-          font-size: 13.5px;
+          display: block;
+          margin-top: 3px;
+          font-size: var(--pos-fs-base);
           font-weight: 800;
-          color: #1c1917;
+          color: var(--pos-muted);
           font-variant-numeric: tabular-nums;
-        }
-
-        .dish-card.in-cart .dish-price {
-          color: #c88719;
+          letter-spacing: -0.01em;
         }
 
         .dish-info {
-          margin-bottom: 3px;
+          margin-bottom: 8px;
           flex: 1;
         }
 
         .dish-name {
           margin: 0;
-          font-size: 13px;
+          font-size: var(--pos-fs-md);
           font-weight: 700;
-          color: #1c1917;
-          line-height: 1.28;
+          color: var(--pos-primary-dark);
+          line-height: 1.32;
           display: -webkit-box;
           -webkit-line-clamp: 2;
           -webkit-box-orient: vertical;
@@ -6122,71 +6573,35 @@ export function RestaurantPOS({
           justify-content: space-between;
           align-items: center;
           margin-top: auto;
-          height: 22px;
+          height: 26px;
         }
 
-        .card-add-btn {
-          display: flex;
-          align-items: center;
-          gap: 2px;
-          padding: 0 7px;
-          height: 22px;
-          background: #faf7f2;
-          border: 1px solid #e7e0d3;
-          border-radius: 5px;
-          color: #44403c;
-          font-size: 10px;
-          font-weight: 700;
-          cursor: pointer;
-          transition: all 0.12s ease;
-        }
 
-        .dish-card:hover .card-add-btn {
-          background: #d99726;
-          border-color: #d99726;
-          color: #ffffff;
-        }
-
-        .card-stepper {
-          display: flex;
-          align-items: center;
-          gap: 1px;
-          background: #d99726;
-          border-radius: 6px;
-          padding: 1px 2px;
-          color: #ffffff;
-          height: 28px;
-        }
-
-        .card-step-btn {
-          border: none;
-          background: transparent;
-          color: #ffffff;
+        .card-qty-badge {
+          position: absolute;
+          top: 7px;
+          right: 33px;
+          z-index: 2;
+          min-width: 20px;
+          height: 20px;
+          padding: 0 5px;
           display: flex;
           align-items: center;
           justify-content: center;
-          width: 26px;
-          height: 26px;
-          cursor: pointer;
-          border-radius: 4px;
-        }
-
-        .card-step-btn:hover {
-          background: rgba(255, 255, 255, 0.25);
-        }
-
-        .card-qty {
-          font-size: 12.5px;
+          background: linear-gradient(135deg, var(--pos-primary), var(--pos-primary-dark));
+          color: #ffffff;
+          font-size: var(--pos-fs-xs);
           font-weight: 800;
-          min-width: 20px;
-          text-align: center;
+          border-radius: var(--pos-radius-pill);
+          box-shadow: 0 3px 8px -2px rgba(217, 151, 38, 0.4);
         }
 
         .edit-dish-price-btn {
           border: none;
           background: transparent;
-          color: #e7e0d3;
+          color: var(--pos-border-strong);
           padding: 1px;
+          margin-left: auto;
           cursor: pointer;
           opacity: 0;
           transition: all 0.12s ease;
@@ -6198,7 +6613,7 @@ export function RestaurantPOS({
 
         .edit-dish-price-btn:hover {
           opacity: 1 !important;
-          color: #d99726;
+          color: var(--pos-ink);
         }
 
         .empty-catalog-state {
@@ -6208,18 +6623,18 @@ export function RestaurantPOS({
           align-items: center;
           justify-content: center;
           padding: 30px 10px;
-          color: #a8a29e;
+          color: var(--pos-faint);
           text-align: center;
           gap: 6px;
         }
 
         .reset-filters-btn {
-          padding: 5px 12px;
-          background: #d99726;
+          padding: 6px 14px;
+          background: var(--pos-primary);
           color: #ffffff;
           border: none;
-          border-radius: 5px;
-          font-size: 11px;
+          border-radius: var(--pos-radius-sm);
+          font-size: var(--pos-fs-xs);
           font-weight: 600;
           cursor: pointer;
         }
@@ -6242,46 +6657,79 @@ export function RestaurantPOS({
           box-sizing: border-box;
         }
 
+        /* min-height (not a hard height) keeps this lined up with the
+           Categories/toolbar headers in the common case, but still lets
+           it grow instead of clipping/overlapping on a busy order (table
+           + round + clock all present) that doesn't fit on one line at
+           the panel's narrowest allowed width — same wrap-instead-of-
+           overflow approach used for the discount row. */
         .ticket-header {
           display: flex;
+          flex-wrap: wrap;
+          row-gap: 4px;
           justify-content: space-between;
           align-items: center;
-          padding: 0 10px;
-          height: 38px;
-          border-bottom: 1px solid #ede7dc;
-          background: #faf7f2;
+          padding: 6px 10px;
+          min-height: var(--pos-header-h);
+          border-bottom: 1px solid var(--pos-border);
+          background: var(--pos-surface);
+          box-sizing: border-box;
           flex-shrink: 0;
         }
 
         .ticket-channel-info {
           display: flex;
+          flex-wrap: wrap;
           align-items: center;
+          row-gap: 4px;
           gap: 6px;
+          min-width: 0;
         }
 
+        /* Same brand tint per channel as the top-bar tabs, instead of a
+           single hardcoded amber-background/blue-text combo that didn't
+           match any channel (including Dine-In, the default state). */
         .ticket-channel-badge {
-          font-size: 11px;
+          font-size: var(--pos-fs-xs);
           font-weight: 800;
-          background: #fde68a;
-          color: #1e40af;
-          padding: 2px 7px;
-          border-radius: 4px;
+          padding: 3px 8px;
+          border-radius: var(--pos-radius-sm);
+          background: var(--pos-primary-tint);
+          color: var(--pos-primary-dark);
+          white-space: nowrap;
+        }
+
+        .ticket-channel-badge.channel-takeaway {
+          background: var(--pos-info-tint);
+          color: var(--pos-info);
+        }
+
+        .ticket-channel-badge.channel-swiggy {
+          background: var(--pos-swiggy-tint);
+          color: var(--pos-swiggy);
+        }
+
+        .ticket-channel-badge.channel-zomato {
+          background: var(--pos-zomato-tint);
+          color: var(--pos-zomato);
         }
 
         .ticket-clear-table-pill {
-          font-size: 10px;
+          font-size: var(--pos-fs-2xs);
           font-weight: 700;
-          color: #ef4444;
-          background: #fee2e2;
-          border: 1px solid #fca5a5;
-          border-radius: 4px;
-          padding: 2px 6px;
+          color: var(--pos-danger);
+          background: var(--pos-danger-tint);
+          border: 1px solid var(--pos-danger-border);
+          border-radius: var(--pos-radius-sm);
+          padding: 3px 7px;
           cursor: pointer;
           transition: all 0.15s ease;
+          white-space: nowrap;
+          flex-shrink: 0;
         }
 
         .ticket-clear-table-pill:hover {
-          background: #ef4444;
+          background: var(--pos-danger-accent);
           color: #ffffff;
         }
 
@@ -6289,17 +6737,70 @@ export function RestaurantPOS({
           display: flex;
           align-items: center;
           gap: 3px;
-          font-size: 10.5px;
-          color: #78716c;
+          font-size: var(--pos-fs-xs);
+          color: var(--pos-muted);
+          white-space: nowrap;
+          flex-shrink: 0;
         }
 
         .clear-cart-btn {
           border: none;
           background: transparent;
-          color: #ef4444;
-          font-size: 11.5px;
+          color: var(--pos-danger);
+          font-size: var(--pos-fs-sm);
           font-weight: 600;
           cursor: pointer;
+          white-space: nowrap;
+          flex-shrink: 0;
+        }
+
+        /* Matches .rail-title exactly (same size/weight/case/color as
+           "CATEGORIES"). */
+        .billing-title {
+          font-size: var(--pos-fs-xs);
+          font-weight: 800;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          color: var(--pos-muted);
+          padding-right: 8px;
+          margin-right: 2px;
+          border-right: 1px solid var(--pos-border-strong);
+        }
+
+        .billing-section-heading {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 6px 6px;
+          background: var(--pos-bg);
+          border-bottom: 1px solid var(--pos-border);
+          font-size: var(--pos-fs-2xs);
+          font-weight: 800;
+          color: var(--pos-faint);
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+        }
+
+        .billing-heading-right {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+
+        /* Widths mirror .cart-stepper / .cart-item-price / .remove-item-btn
+           below, so "Quantity" lands over the actual stepper column
+           instead of drifting to the row's far-right edge. */
+        .billing-qty-label {
+          width: 58px;
+          text-align: center;
+        }
+
+        .billing-price-spacer {
+          width: 52px;
+        }
+
+        .billing-trash-spacer {
+          width: 16px;
         }
 
         .cart-items-container {
@@ -6315,18 +6816,22 @@ export function RestaurantPOS({
           align-items: center;
           justify-content: center;
           padding: 24px;
-          color: #a8a29e;
+          color: var(--pos-faint);
           text-align: center;
-          gap: 4px;
+          gap: 6px;
+        }
+
+        .empty-cart-message svg {
+          opacity: 0.5;
         }
 
         .empty-cart-message b {
-          color: #57534e;
-          font-size: 13px;
+          color: var(--pos-ink-3);
+          font-size: var(--pos-fs-base);
         }
 
         .empty-cart-message span {
-          font-size: 11px;
+          font-size: var(--pos-fs-xs);
         }
 
         .cart-items-list {
@@ -6343,14 +6848,14 @@ export function RestaurantPOS({
           min-height: 32px;
           max-height: 32px;
           padding: 0 6px;
-          border-bottom: 1px solid #faf7f2;
-          background: #ffffff;
+          border-bottom: 1px solid var(--pos-bg);
+          background: var(--pos-surface);
           box-sizing: border-box;
           transition: background 0.1s ease;
         }
 
         .cart-item-row:hover {
-          background: #faf7f2;
+          background: var(--pos-bg);
         }
 
         .cart-item-left {
@@ -6371,17 +6876,17 @@ export function RestaurantPOS({
         }
 
         .cart-veg-dot.veg {
-          background: #16a34a;
+          background: var(--pos-success);
         }
 
         .cart-veg-dot.non-veg {
-          background: #dc2626;
+          background: var(--pos-danger);
         }
 
         .cart-item-name {
-          font-size: 13.5px;
+          font-size: var(--pos-fs-base);
           font-weight: 600;
-          color: #1c1917;
+          color: var(--pos-ink);
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
@@ -6391,8 +6896,8 @@ export function RestaurantPOS({
         .add-note-btn.inline {
           border: none;
           background: transparent;
-          color: #e2a034;
-          font-size: 10px;
+          color: var(--pos-primary-dark);
+          font-size: var(--pos-fs-2xs);
           font-weight: 600;
           padding: 0 2px;
           margin: 0;
@@ -6410,12 +6915,12 @@ export function RestaurantPOS({
           display: inline-flex;
           align-items: center;
           gap: 2px;
-          padding: 0 3px;
+          padding: 0 4px;
           background: #fef3c7;
           color: #92400e;
-          font-size: 9.5px;
+          font-size: var(--pos-fs-2xs);
           font-weight: 600;
-          border-radius: 3px;
+          border-radius: 4px;
           max-width: 70px;
           overflow: hidden;
           text-overflow: ellipsis;
@@ -6434,17 +6939,17 @@ export function RestaurantPOS({
         .cart-stepper {
           display: flex;
           align-items: center;
-          border: 1px solid #e7e0d3;
-          border-radius: 4px;
+          border: 1px solid var(--pos-border-strong);
+          border-radius: var(--pos-radius-sm);
           padding: 0;
-          background: #ffffff;
+          background: var(--pos-surface);
           height: 24px;
         }
 
         .cart-stepper button {
           border: none;
           background: transparent;
-          color: #57534e;
+          color: var(--pos-ink-3);
           padding: 0 5px;
           cursor: pointer;
           display: flex;
@@ -6454,21 +6959,13 @@ export function RestaurantPOS({
         }
 
         .cart-stepper button:hover {
-          background: #faf7f2;
-        }
-
-        .cart-stepper span {
-          font-size: 13px;
-          font-weight: 700;
-          color: #1c1917;
-          min-width: 18px;
-          text-align: center;
+          background: var(--pos-bg);
         }
 
         .cart-item-price {
-          font-size: 14px;
+          font-size: var(--pos-fs-md);
           font-weight: 700;
-          color: #1c1917;
+          color: var(--pos-ink);
           font-variant-numeric: tabular-nums;
           min-width: 52px;
           text-align: right;
@@ -6478,7 +6975,7 @@ export function RestaurantPOS({
         .remove-item-btn {
           border: none;
           background: transparent;
-          color: #e7e0d3;
+          color: var(--pos-border-strong);
           cursor: pointer;
           padding: 2px;
           display: flex;
@@ -6488,14 +6985,17 @@ export function RestaurantPOS({
         }
 
         .remove-item-btn:hover {
-          color: #ef4444;
+          color: var(--pos-danger-accent);
         }
 
-        /* BILL CALCULATIONS */
+        /* BILL CALCULATIONS — one 8px vertical rhythm between rows, and
+           the discount/GST mini-controls bumped from an 18px cramped row
+           up to 22px so they sit between the 24px cart stepper and the
+           28px payment buttons instead of looking like an afterthought. */
         .bill-calculations-section {
-          padding: 6px 10px 10px 10px;
-          background: #faf7f2;
-          border-top: 1px solid #ede7dc;
+          padding: 8px 10px 10px 10px;
+          background: var(--pos-bg);
+          border-top: 1px solid var(--pos-border);
           flex-shrink: 0;
         }
 
@@ -6503,161 +7003,183 @@ export function RestaurantPOS({
           display: flex;
           justify-content: space-between;
           align-items: center;
-          font-size: 11px;
-          margin-bottom: 3px;
-          color: #57534e;
+          font-size: var(--pos-fs-xs);
+          margin-bottom: 8px;
+          color: var(--pos-ink-3);
         }
 
+        /* This row was the worst offender for overflow: "Discount:" plus
+           4 pills plus 2 custom-value boxes is more content than the
+           panel is ever guaranteed to be wide enough for, and the old
+           single-line flex layout just let the last box run past the
+           panel edge and get clipped instead of wrapping. Now the label
+           always gets its own full-width line, so the controls below it
+           always have the whole row to lay out in and wrap cleanly
+           instead of overflowing. */
         .discount-row {
+          flex-wrap: wrap;
+          row-gap: 6px;
           align-items: center;
         }
 
         .discount-label-group {
           display: flex;
+          flex-wrap: wrap;
           align-items: center;
-          gap: 4px;
+          row-gap: 6px;
+          gap: 6px;
+          flex: 1 1 100%;
+          min-width: 0;
         }
 
         .discount-pills {
           display: flex;
-          gap: 2px;
+          align-items: center;
+          gap: 4px;
           flex-wrap: wrap;
+          flex: 1 1 auto;
+          min-width: 0;
         }
 
         .disc-pill {
-          padding: 1px 4px;
-          height: 18px;
-          border: 1px solid #e7e0d3;
-          border-radius: 3px;
-          background: #ffffff;
-          color: #57534e;
-          font-size: 9.5px;
+          flex-shrink: 0;
+          padding: 0 6px;
+          height: 22px;
+          border: 1px solid var(--pos-border-strong);
+          border-radius: var(--pos-radius-sm);
+          background: var(--pos-surface);
+          color: var(--pos-ink-3);
+          font-size: var(--pos-fs-2xs);
           font-weight: 700;
           cursor: pointer;
         }
 
         .disc-pill.active {
-          background: #d99726;
+          background: var(--pos-primary);
           color: #ffffff;
-          border-color: #d99726;
+          border-color: var(--pos-primary);
         }
 
         .disc-custom-input-group {
           display: flex;
           align-items: center;
+          flex-shrink: 0;
           gap: 2px;
-          height: 18px;
-          padding: 0 3px;
-          border: 1px solid #e7e0d3;
-          border-radius: 3px;
-          background: #ffffff;
+          height: 22px;
+          padding: 0 5px;
+          border: 1px solid var(--pos-border-strong);
+          border-radius: var(--pos-radius-sm);
+          background: var(--pos-surface);
         }
 
         .disc-custom-input {
           width: 30px;
           border: none;
           outline: none;
-          font-size: 9.5px;
+          font-size: var(--pos-fs-2xs);
           font-weight: 700;
-          color: #57534e;
+          color: var(--pos-ink-3);
           background: transparent;
         }
 
         .disc-custom-suffix,
         .disc-custom-prefix {
-          font-size: 9px;
-          color: #a8a29e;
+          font-size: var(--pos-fs-2xs);
+          color: var(--pos-faint);
           font-weight: 700;
         }
 
         .discount-applied-val {
-          color: #16a34a;
+          color: var(--pos-success);
           font-weight: 700;
+          margin-left: auto;
+          flex-shrink: 0;
         }
 
         .gst-percent-input {
-          width: 34px;
-          height: 18px;
-          padding: 0 3px;
-          border: 1px solid #e7e0d3;
-          border-radius: 3px;
-          font-size: 10.5px;
+          width: 36px;
+          height: 22px;
+          padding: 0 4px;
+          border: 1px solid var(--pos-border-strong);
+          border-radius: var(--pos-radius-sm);
+          font-size: var(--pos-fs-xs);
           font-weight: 700;
-          color: #1c1917;
+          color: var(--pos-ink);
           text-align: center;
         }
 
         .gst-percent-input:disabled {
-          background: #f4f2ee;
-          color: #a8a29e;
+          background: var(--pos-disabled-bg);
+          color: var(--pos-faint);
         }
 
         .gst-percent-suffix {
-          font-size: 10.5px;
-          color: #78716c;
+          font-size: var(--pos-fs-xs);
+          color: var(--pos-muted);
         }
 
         .tax-row {
-          border-top: 1px dashed #ede7dc;
-          padding-top: 4px;
+          border-top: 1px dashed var(--pos-border);
+          padding-top: 8px;
         }
 
         .gst-toggle-label {
           display: flex;
           align-items: center;
-          gap: 4px;
-          font-size: 10.5px;
+          gap: 6px;
+          font-size: var(--pos-fs-xs);
           cursor: pointer;
         }
 
         .grand-total-row {
-          border-top: 1.5px solid #ede7dc;
-          padding-top: 6px;
+          border-top: 1.5px solid var(--pos-border);
+          padding-top: 10px;
           margin-top: 2px;
-          font-size: 12px;
+          margin-bottom: 0;
+          font-size: var(--pos-fs-sm);
           font-weight: 800;
-          color: #1c1917;
+          color: var(--pos-ink);
         }
 
         .grand-total-amount {
-          font-size: 18px;
+          font-size: var(--pos-fs-xl);
           font-weight: 900;
-          color: #16a34a;
+          color: var(--pos-success);
         }
 
         .payment-modes-grid {
           display: grid;
           grid-template-columns: repeat(4, 1fr);
-          gap: 3px;
-          margin: 6px 0;
+          gap: 6px;
+          margin: 10px 0 6px;
         }
 
         .payment-mode-btn {
           display: flex;
           align-items: center;
           justify-content: center;
-          gap: 3px;
-          height: 28px;
-          border: 1px solid #e7e0d3;
-          background: #ffffff;
-          border-radius: 5px;
+          gap: 4px;
+          height: var(--pos-control-h-sm);
+          border: 1px solid var(--pos-border-strong);
+          background: var(--pos-surface);
+          border-radius: var(--pos-radius-sm);
           cursor: pointer;
           transition: all 0.15s ease;
         }
 
         .payment-mode-btn.active {
-          border-color: #d99726;
-          background: #d99726;
+          border-color: var(--pos-primary);
+          background: var(--pos-primary);
         }
 
         .pay-icon {
-          font-size: 12px;
+          font-size: var(--pos-fs-sm);
         }
 
         .pay-label {
-          font-size: 11px;
+          font-size: var(--pos-fs-xs);
           font-weight: 700;
-          color: #44403c;
+          color: var(--pos-ink-2);
         }
 
         .payment-mode-btn.active .pay-label {
@@ -6672,6 +7194,17 @@ export function RestaurantPOS({
         .payment-mode-btn.save-table-mode-btn .pay-label {
           color: #047857;
           font-weight: 800;
+        }
+
+        .aggregator-mode-note {
+          grid-column: span 3;
+          cursor: default;
+          border-color: #ea580c;
+          background: #fff7ed;
+        }
+
+        .aggregator-mode-note .pay-label {
+          color: #ea580c;
         }
 
         .payment-mode-btn.save-table-mode-btn:hover:not(:disabled) {
@@ -6816,7 +7349,7 @@ export function RestaurantPOS({
 
         .bill-btn {
           background: #fef9ee;
-          color: #c88719;
+          color: #1c1917;
           border: 1px solid #fde68a;
         }
 
@@ -7280,7 +7813,7 @@ export function RestaurantPOS({
         .quick-instruction-pills button:hover {
           background: #fef9ee;
           border-color: #fde68a;
-          color: #c88719;
+          color: #1c1917;
         }
 
         /* ADD DISH FORM */
@@ -7325,10 +7858,37 @@ export function RestaurantPOS({
           font-weight: 600;
         }
 
-        .settings-row select {
+        .settings-row select,
+        .settings-row input[type="text"] {
           padding: 4px 6px;
           border: 1px solid #e7e0d3;
           border-radius: 5px;
+          font-size: 12px;
+          min-width: 180px;
+        }
+
+        .settings-body .divider {
+          border-top: 1px dashed var(--pos-border);
+          margin: 2px 0;
+        }
+
+        .printer-routing-head span {
+          font-weight: 800;
+          color: var(--pos-ink);
+          font-size: 12.5px;
+          text-transform: uppercase;
+          letter-spacing: 0.03em;
+        }
+
+        .printer-test-row {
+          display: flex;
+          justify-content: flex-end;
+          margin-top: -4px;
+        }
+
+        .settings-body a {
+          color: var(--pos-primary-dark);
+          font-weight: 700;
         }
 
         /* TOAST BANNER NOTIFICATION */
@@ -7580,7 +8140,7 @@ export function RestaurantPOS({
         .add-row-btn:hover {
           background: #fef9ee;
           border-color: #e2a034;
-          color: #d99726;
+          color: #1c1917;
         }
 
         .clear-rows-btn {
@@ -7656,26 +8216,55 @@ export function RestaurantPOS({
           font-size: 13px;
         }
 
-        .toolbar-bulk-btn {
+        .quick-add-dish-btn {
           display: flex;
           align-items: center;
+          justify-content: center;
           gap: 4px;
-          height: 28px;
-          padding: 0 9px;
-          background: #fef9ee;
-          border: 1px solid #fde68a;
-          border-radius: 6px;
-          color: #c88719;
-          font-size: 11px;
+          height: var(--pos-control-h-sm);
+          padding: 0 8px;
+          background: var(--pos-bg);
+          border: 1px solid var(--pos-border-strong);
+          border-radius: var(--pos-radius-sm);
+          color: var(--pos-ink-2);
+          font-size: var(--pos-fs-xs);
           font-weight: 700;
           cursor: pointer;
           white-space: nowrap;
+          flex-shrink: 0;
           transition: all 0.15s ease;
+          box-sizing: border-box;
+        }
+
+        .quick-add-dish-btn:hover {
+          background: var(--pos-primary-tint);
+          border-color: var(--pos-primary);
+          color: var(--pos-ink);
+        }
+
+        .toolbar-bulk-btn {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 4px;
+          height: var(--pos-control-h-sm);
+          padding: 0 8px;
+          background: var(--pos-primary-tint);
+          border: 1px solid var(--pos-primary);
+          border-radius: var(--pos-radius-sm);
+          color: var(--pos-primary-dark);
+          font-size: var(--pos-fs-xs);
+          font-weight: 700;
+          cursor: pointer;
+          white-space: nowrap;
+          flex-shrink: 0;
+          transition: all 0.15s ease;
+          box-sizing: border-box;
         }
 
         .toolbar-bulk-btn:hover {
-          background: #d99726;
-          border-color: #d99726;
+          background: var(--pos-primary);
+          border-color: var(--pos-primary);
           color: #ffffff;
         }
       `}</style>

@@ -20,7 +20,7 @@
 // deploy. Better option if you want it fully automatic: read Next.js's
 // own generated .next/BUILD_ID at build time and inline it here via a
 // small prebuild script — ask if you want that wired up.
-const CACHE_VERSION = "pos-shell-2026-09-17-01"; // <-- CHANGE THIS EVERY DEPLOY
+const CACHE_VERSION = "pos-shell-2026-09-18-01"; // <-- CHANGE THIS EVERY DEPLOY
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 
 // Update this to the real path(s) staff actually open the POS from, so the

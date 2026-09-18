@@ -361,6 +361,25 @@ export function RestaurantIQDashboard({
     return () => clearInterval(timer);
   }, []);
 
+  // Admin analytics is the one screen meant to be used on a phone, so lock
+  // it to portrait there. The manifest can't do this alone — its
+  // "orientation" field applies to the whole installed PWA, and POS
+  // (used on a fixed PC terminal) needs to stay unlocked — so it's done
+  // here at runtime instead. The Screen Orientation API only works in
+  // fullscreen/installed contexts on some browsers and isn't supported at
+  // all on iOS, so failing silently just leaves rotation unlocked there.
+  useEffect(() => {
+    const orientation = (screen as any)?.orientation;
+    if (orientation?.lock) {
+      orientation.lock("portrait").catch(() => {});
+    }
+    return () => {
+      try {
+        orientation?.unlock?.();
+      } catch {}
+    };
+  }, []);
+
   const now = currentTime;
   const todayISTStr = getISTDateStr(now);
   const nowIST = getISTTimeParts(now);
@@ -2530,7 +2549,8 @@ export function RestaurantIQDashboard({
           .restaurant-iq-page {
             min-height: 100vh;
             background: #faf7f2;
-            padding: 20px 24px;
+            padding: max(20px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right))
+              max(20px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
             display: flex;
             flex-direction: column;
             gap: 18px;
@@ -2558,7 +2578,8 @@ export function RestaurantIQDashboard({
           .skel-chart-box { width: 100%; height: 200px; border-radius: 12px; }
           @media (max-width: 640px) {
             .restaurant-iq-page {
-              padding: 10px;
+              padding: max(10px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right))
+                max(10px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
               overflow-x: hidden;
             }
           }
@@ -2835,7 +2856,8 @@ export function RestaurantIQDashboard({
           .revenue-trend-page {
             max-width: 640px;
             margin: 0 auto;
-            padding: 24px 20px;
+            padding: max(24px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right))
+              max(24px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
             display: flex;
             flex-direction: column;
             gap: 16px;
@@ -4071,7 +4093,8 @@ export function RestaurantIQDashboard({
           background: #f8fafc;
           color: #0f172a;
           font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
-          padding: 20px 24px;
+          padding: max(20px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right))
+            max(20px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
           display: flex;
           flex-direction: column;
           gap: 18px;
@@ -6001,7 +6024,8 @@ export function RestaurantIQDashboard({
         ========================================================= */
         @media (max-width: 640px) {
           .restaurant-iq-page {
-            padding: 8px;
+            padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right))
+              max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
             gap: 10px;
             overflow-x: hidden;
           }

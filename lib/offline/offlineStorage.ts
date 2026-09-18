@@ -267,9 +267,29 @@ type LocalSettings = {
   // prints either way; "Bill" is a separate, explicit button there.
   autoPrintBillOnSettle: boolean;
   // Combined GST %, split evenly into CGST/SGST halves for the receipt
-  // (e.g. 5 -> 2.5% + 2.5%). Editable per restaurant now — defaults to 5
-  // so behavior doesn't change for anyone until they explicitly edit it.
+  // (e.g. 5 -> 2.5% + 2.5%). Defaults to 0 — GST is off until a restaurant
+  // explicitly sets its actual rate, instead of silently assuming 5%.
   gstPercent: number;
+  // Whether GST is applied by default on a new order. Defaults to true —
+  // was previously only kept in component state, so unchecking "Apply
+  // GST" never stuck past a reload/new order like gstPercent does.
+  applyGst: boolean;
+  // Named printer (as QZ Tray/Windows sees it) that KOT tickets are sent to
+  // silently, with no print dialog. Empty string = not configured, so KOT
+  // printing falls back to the original popup + browser print-dialog flow
+  // (see lib/printing/qzPrinter.ts / kotPrinter.ts). Can be set to the same
+  // printer as billPrinterName — one physical printer for both is fine.
+  kotPrinterName: string;
+  // Same idea as kotPrinterName, for the customer bill/receipt. Independent
+  // of kotPrinterName on purpose, so KOT and Bill can go to two different
+  // physical printers (kitchen vs counter) — or the same one, either way.
+  billPrinterName: string;
+  // Printed on the customer bill directly below the restaurant name (see
+  // receiptPrinter.ts's .header block). Empty string = omitted, exactly
+  // like before this field existed. Kept as a local device setting (not a
+  // database column) so it works immediately with no backend/schema change
+  // — every terminal for this restaurant should set it the same way once.
+  restaurantAddress: string;
 };
 
 export function getLocalSettings(): LocalSettings {
@@ -277,7 +297,11 @@ export function getLocalSettings(): LocalSettings {
     paperWidth: "80mm",
     autoPrintKot: false,
     autoPrintBillOnSettle: false,
-    gstPercent: 5,
+    gstPercent: 0,
+    applyGst: true,
+    kotPrinterName: "",
+    billPrinterName: "",
+    restaurantAddress: "",
   };
   if (typeof window === "undefined") return defaults;
   try {

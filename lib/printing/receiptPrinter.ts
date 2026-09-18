@@ -28,6 +28,11 @@ export type ReceiptPrintOptions = {
   timestamp?: string | Date;
   isReprint?: boolean;
   paperWidth?: "80mm" | "58mm";
+  // Named printer (from Settings > Thermal Printer Settings) to send this
+  // bill to silently via QZ Tray, with no print dialog. Left unset/empty ->
+  // falls back to the original popup + window.print() flow, exactly like
+  // before this option existed.
+  printerName?: string;
 };
 
 function escapeHtml(value: string): string {
@@ -43,24 +48,9 @@ function formatDecimal(amount: number): string {
   return Number(amount || 0).toFixed(2);
 }
 
-export function printCustomerBillReceipt(
-  options: ReceiptPrintOptions
-): boolean {
-  if (!options.items || options.items.length === 0) {
-    console.warn("Please select at least one item before printing.");
-    return false;
-  }
-
+function buildReceiptHtml(options: ReceiptPrintOptions): string {
   const paperWidth = options.paperWidth || "80mm";
   const is58mm = paperWidth === "58mm";
-
-  const winName = `bill_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-  const billWindow = window.open("", winName, "width=420,height=720");
-
-  if (!billWindow) {
-    console.warn("Pop-up blocked for printing bill receipt.");
-    return false;
-  }
 
   const dateObj = options.timestamp
     ? new Date(options.timestamp)
@@ -136,7 +126,7 @@ export function printCustomerBillReceipt(
     )
     .join("");
 
-  billWindow.document.write(`
+  return `
     <!doctype html>
     <html>
       <head>
@@ -348,9 +338,21 @@ export function printCustomerBillReceipt(
         </main>
       </body>
     </html>
-  `);
+  `;
+}
+
+/** Original behavior: opens a popup and drives the browser's own print dialog. */
+function printReceiptViaPopup(html: string): boolean {
+  const winName = `bill_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const billWindow = window.open("", winName, "width=420,height=720");
+
+  if (!billWindow) {
+    console.warn("Pop-up blocked for printing bill receipt.");
+    return false;
+  }
 
   try {
+    billWindow.document.write(html);
     billWindow.document.close();
     billWindow.focus();
     billWindow.onafterprint = () => {
@@ -365,7 +367,42 @@ export function printCustomerBillReceipt(
     }, 250);
   } catch (err) {
     console.error("Failed to print receipt:", err);
+    return false;
   }
 
   return true;
+}
+
+/**
+ * Prints the customer bill. If `options.printerName` is set (configured in
+ * Settings > Thermal Printer Settings), sends it silently to that exact
+ * printer via QZ Tray — no popup, no dialog. Otherwise, and as an automatic
+ * fallback if the QZ Tray attempt fails for any reason (not installed, not
+ * running, printer not found), falls back to the original popup +
+ * window.print() flow so a bill is never just silently lost.
+ */
+export async function printCustomerBillReceipt(
+  options: ReceiptPrintOptions
+): Promise<boolean> {
+  if (!options.items || options.items.length === 0) {
+    console.warn("Please select at least one item before printing.");
+    return false;
+  }
+
+  const html = buildReceiptHtml(options);
+
+  if (options.printerName && options.printerName.trim()) {
+    try {
+      const { printHtmlToPrinter } = await import("./qzPrinter");
+      await printHtmlToPrinter(options.printerName, html);
+      return true;
+    } catch (err) {
+      console.warn(
+        `Could not print bill to "${options.printerName}" via QZ Tray, falling back to the print dialog:`,
+        err
+      );
+    }
+  }
+
+  return printReceiptViaPopup(html);
 }

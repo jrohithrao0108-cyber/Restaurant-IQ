@@ -12,6 +12,7 @@
     "@supabase/supabase-js": "^2.112.4",
     "lucide-react": "latest",
     "next": "latest",
+    "qz-tray": "^2.2.5",
     "react": "latest",
     "react-dom": "latest",
     "recharts": "latest"

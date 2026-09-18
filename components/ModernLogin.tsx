@@ -250,7 +250,8 @@ export function ModernLogin({
           display: flex;
           align-items: center;
           justify-content: center;
-          padding: 24px;
+          padding: max(24px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right))
+            max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
           font-family: Inter, ui-sans-serif, system-ui, sans-serif;
         }
 
@@ -452,6 +453,29 @@ export function ModernLogin({
           color: #a8a29e;
           border-top: 1px solid #ede7dc;
           padding-top: 14px;
+        }
+
+        @media (max-width: 380px) {
+          .modern-login-wrapper {
+            padding-left: max(16px, env(safe-area-inset-left));
+            padding-right: max(16px, env(safe-area-inset-right));
+          }
+
+          .login-card {
+            padding: 28px 20px 22px;
+            border-radius: 16px;
+            gap: 18px;
+          }
+
+          .logo-badge {
+            width: 52px;
+            height: 52px;
+            border-radius: 14px;
+          }
+
+          .brand-name {
+            font-size: 20px;
+          }
         }
       `}</style>
     </div>
